@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use fracture_core::{
     ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FxActorId, FxFamily,
     FxFamilyId, MergeActorsResult, SplitEvent, StressSettings, StressSolver2D, Vec2,
-    apply_fracture_commands, split_dirty_actors,
+    apply_fracture_commands,
+    snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
+    split_dirty_actors,
 };
 use fracture_voxel::AuthoredVoxelAsset;
 use rapier2d::prelude::*;
@@ -21,6 +23,15 @@ use crate::hooks::{ContactMaterialProperties, FxContactHooks, HookObservation};
 use crate::impulse_readback::collect_contact_impulse_inputs;
 use crate::joint_feedback::collect_joint_feedback_stress;
 use crate::pipeline::FxStepReport;
+use crate::replay::{FxRapierReplayCommand, FxRapierReplayTickReport, sort_replay_commands};
+use crate::snapshot::{
+    ActorPhysicsSnapshot, AppliedStaticAnchorPolicySnapshot, BodyActorSnapshot,
+    BodyBaselineSnapshot, BodyTypeSnapshot, ColliderActorSnapshot, ColliderVoxelSnapshot,
+    FxRapierFamilySnapshot, FxRapierSnapshotError, FxRapierWorldSnapshot,
+    StaticAnchorPolicySnapshot, StressSettingsSnapshot, VoxelContactSnapshot,
+    decode_rapier_owned_state, decode_world_snapshot, encode_rapier_owned_state,
+    encode_world_snapshot,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum FxRapierError {
@@ -45,41 +56,50 @@ pub enum FxRapierError {
     Connection(#[from] ConnectionError),
     #[error("connection policy {0:?} is reserved for a future Rapier adapter implementation")]
     UnsupportedConnectionPolicy(DynamicConnectionPolicy),
+    #[error("deterministic replay API requires deterministic snapshot mode")]
+    ReplayRequiresDeterministicMode,
+    #[error("replay command references unknown family {0:?}")]
+    UnknownReplayFamily(FxFamilyId),
+    #[error("duplicate ambiguous replay key at tick {tick} stable_order {stable_order}")]
+    DuplicateReplayKey { tick: u64, stable_order: u64 },
+    #[error(transparent)]
+    Snapshot(#[from] FxRapierSnapshotError),
 }
 
 #[derive(Clone, Debug)]
-struct DestructibleFamily {
-    asset: AuthoredVoxelAsset,
-    family: FxFamily,
-    physics: BTreeMap<FxActorId, ActorPhysicsState>,
+pub(crate) struct DestructibleFamily {
+    pub(crate) asset: AuthoredVoxelAsset,
+    pub(crate) family: FxFamily,
+    pub(crate) physics: BTreeMap<FxActorId, ActorPhysicsState>,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ActorPhysicsState {
-    handles: ActorPhysicsHandles,
-    body_local_origin_in_asset: Vec2,
+pub(crate) struct ActorPhysicsState {
+    pub(crate) handles: ActorPhysicsHandles,
+    pub(crate) body_local_origin_in_asset: Vec2,
 }
 
 pub struct FxRapierWorld2D {
-    gravity: Vector,
-    integration_parameters: IntegrationParameters,
+    pub(crate) gravity: Vector,
+    pub(crate) integration_parameters: IntegrationParameters,
     pipeline: PhysicsPipeline,
     islands: IslandManager,
     broad_phase: BroadPhaseBvh,
     narrow_phase: NarrowPhase,
-    bodies: RigidBodySet,
-    colliders: ColliderSet,
+    pub(crate) bodies: RigidBodySet,
+    pub(crate) colliders: ColliderSet,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     hooks: FxContactHooks,
     stress_solver: StressSolver2D,
-    families: BTreeMap<FxFamilyId, DestructibleFamily>,
+    pub(crate) families: BTreeMap<FxFamilyId, DestructibleFamily>,
     body_actors: BTreeMap<(u32, u32), DestructibleActorRef>,
     static_anchor_policies: BTreeMap<(FxFamilyId, ExternalBondId), StaticAnchorBodyPolicy>,
     applied_static_anchor_policies: BTreeMap<(FxFamilyId, FxActorId), StaticAnchorBodyPolicy>,
     static_anchor_body_baselines: BTreeMap<(FxFamilyId, FxActorId), RigidBodyType>,
-    tick: u64,
+    pub(crate) snapshot_mode: SnapshotMode,
+    pub(crate) tick: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -121,12 +141,17 @@ impl FxRapierWorld2D {
             static_anchor_policies: BTreeMap::new(),
             applied_static_anchor_policies: BTreeMap::new(),
             static_anchor_body_baselines: BTreeMap::new(),
+            snapshot_mode: SnapshotMode::Normal,
             tick: 0,
         }
     }
 
     pub fn set_stress_settings(&mut self, settings: StressSettings) {
         self.stress_solver = StressSolver2D::new(settings);
+    }
+
+    pub fn stress_settings(&self) -> StressSettings {
+        self.stress_solver.settings
     }
 
     pub fn gravity(&self) -> Vector {
@@ -143,6 +168,29 @@ impl FxRapierWorld2D {
 
     pub fn integration_parameters_mut(&mut self) -> &mut IntegrationParameters {
         &mut self.integration_parameters
+    }
+
+    pub fn snapshot_mode(&self) -> SnapshotMode {
+        self.snapshot_mode
+    }
+
+    pub fn set_snapshot_mode(&mut self, mode: SnapshotMode) {
+        self.snapshot_mode = mode;
+    }
+
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    pub fn snapshot(&self) -> Result<Vec<u8>, FxRapierError> {
+        ensure_snapshot_mode_available(self.snapshot_mode)?;
+        Ok(encode_world_snapshot(&self.capture_snapshot()?))
+    }
+
+    pub fn restore_snapshot(bytes: &[u8]) -> Result<Self, FxRapierError> {
+        let (_, snapshot) = decode_world_snapshot(bytes)?;
+        ensure_snapshot_mode_available(snapshot.mode)?;
+        Self::from_snapshot(snapshot)
     }
 
     pub fn rigid_bodies(&self) -> &RigidBodySet {
@@ -487,6 +535,63 @@ impl FxRapierWorld2D {
         Ok(report)
     }
 
+    pub fn apply_replay_tick(
+        &mut self,
+        tick: u64,
+        commands: &[FxRapierReplayCommand],
+    ) -> Result<FxRapierReplayTickReport, FxRapierError> {
+        if self.snapshot_mode != SnapshotMode::Deterministic {
+            return Err(FxRapierError::ReplayRequiresDeterministicMode);
+        }
+        ensure_snapshot_mode_available(self.snapshot_mode)?;
+        crate::replay::validate_replay_commands(commands)?;
+        for family_id in self.family_ids() {
+            self.sync_family_actors(family_id)?;
+        }
+
+        let mut selected = commands
+            .iter()
+            .filter(|entry| entry.tick == tick)
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_replay_commands(&mut selected);
+        let mut commands_by_family =
+            BTreeMap::<FxFamilyId, Vec<fracture_core::FractureCommand>>::new();
+        for entry in selected {
+            if !self.families.contains_key(&entry.family) {
+                return Err(FxRapierError::UnknownReplayFamily(entry.family));
+            }
+            commands_by_family
+                .entry(entry.family)
+                .or_default()
+                .push(entry.command);
+        }
+
+        let mut report = FxRapierReplayTickReport::default();
+        for family_id in self.family_ids() {
+            let Some(commands) = commands_by_family.get(&family_id) else {
+                continue;
+            };
+            let parent_snapshots = self.snapshot_family_bodies(family_id);
+            let split_events = {
+                let Some(entry) = self.families.get_mut(&family_id) else {
+                    return Err(FxRapierError::UnknownFamily(family_id));
+                };
+                report
+                    .fracture_events
+                    .extend(apply_fracture_commands(&mut entry.family, commands));
+                split_dirty_actors(&mut entry.family)
+            };
+            if !split_events.is_empty() {
+                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            } else {
+                self.reconcile_static_anchor_body_policies(family_id)?;
+            }
+            report.split_events.extend(split_events);
+        }
+        Ok(report)
+    }
+
     #[cfg(test)]
     pub(crate) fn fracture_and_sync_for_test(
         &mut self,
@@ -574,6 +679,582 @@ impl FxRapierWorld2D {
             out.extend(split_events);
         }
         Ok(out)
+    }
+
+    fn family_ids(&self) -> Vec<FxFamilyId> {
+        self.families.keys().copied().collect()
+    }
+
+    fn capture_snapshot(&self) -> Result<FxRapierWorldSnapshot, FxRapierError> {
+        let registry = self
+            .hooks
+            .registry()
+            .read()
+            .expect("contact material registry poisoned")
+            .clone();
+        self.validate_checkpoint_state(&registry)?;
+        let mut families = Vec::new();
+        let mut actor_physics = Vec::new();
+        for (family_id, entry) in &self.families {
+            for (actor_id, state) in &entry.physics {
+                if entry.family.actor(*actor_id).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor physics unknown actor",
+                    )
+                    .into());
+                }
+                if self.bodies.get(state.handles.body).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing body",
+                    )
+                    .into());
+                }
+                if self.colliders.get(state.handles.collider).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing collider",
+                    )
+                    .into());
+                }
+                let body_key = rigid_body_key(state.handles.body);
+                let collider_key = collider_key(state.handles.collider);
+                let actor_ref = DestructibleActorRef {
+                    family: *family_id,
+                    actor: *actor_id,
+                };
+                if self.body_actors.get(&body_key) != Some(&actor_ref)
+                    || registry.collider_actors.get(&collider_key) != Some(&actor_ref)
+                    || !registry.collider_voxels.contains_key(&collider_key)
+                {
+                    return Err(
+                        FxRapierSnapshotError::StateMismatch("actor registry mismatch").into(),
+                    );
+                }
+                actor_physics.push(ActorPhysicsSnapshot {
+                    family: *family_id,
+                    actor: *actor_id,
+                    body_handle: state.handles.body.into_raw_parts(),
+                    collider_handle: state.handles.collider.into_raw_parts(),
+                    body_local_origin_in_asset: [
+                        state.body_local_origin_in_asset.x,
+                        state.body_local_origin_in_asset.y,
+                    ],
+                });
+            }
+            families.push(FxRapierFamilySnapshot {
+                family: *family_id,
+                asset: fracture_voxel::AuthoredVoxelAssetSnapshot {
+                    bytes: entry
+                        .asset
+                        .to_snapshot_bytes()
+                        .map_err(FxRapierSnapshotError::Voxel)?,
+                },
+                core_family: encode_family_snapshot(&entry.family, self.snapshot_mode)
+                    .map_err(FxRapierSnapshotError::Core)?,
+            });
+        }
+        families.sort_by_key(|entry| entry.family);
+        actor_physics.sort_by_key(|item| (item.family, item.actor));
+        let rapier_owned_state = encode_rapier_owned_state(
+            &self.bodies,
+            &self.colliders,
+            &self.impulse_joints,
+            &self.multibody_joints,
+            &self.islands,
+            &self.broad_phase,
+            &self.narrow_phase,
+            &self.ccd_solver,
+        )
+        .map_err(FxRapierSnapshotError::from)?;
+
+        Ok(FxRapierWorldSnapshot {
+            mode: self.snapshot_mode,
+            tick: self.tick,
+            gravity: [self.gravity.x, self.gravity.y],
+            integration: integration_to_snapshot(&self.integration_parameters),
+            stress: stress_to_snapshot(self.stress_solver.settings),
+            rapier_owned_state,
+            contact_materials: registry
+                .material_properties
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            families,
+            actor_physics,
+            body_actors: self
+                .body_actors
+                .iter()
+                .map(|(body_handle, actor)| BodyActorSnapshot {
+                    body_handle: *body_handle,
+                    actor: *actor,
+                })
+                .collect(),
+            collider_actors: registry
+                .collider_actors
+                .iter()
+                .map(|(collider_handle, actor)| ColliderActorSnapshot {
+                    collider_handle: *collider_handle,
+                    actor: *actor,
+                })
+                .collect(),
+            collider_voxels: registry
+                .collider_voxels
+                .iter()
+                .map(|(collider_handle, voxels)| ColliderVoxelSnapshot {
+                    collider_handle: *collider_handle,
+                    voxels: voxels
+                        .iter()
+                        .copied()
+                        .map(VoxelContactSnapshot::from)
+                        .collect(),
+                })
+                .collect(),
+            static_anchor_policies: self
+                .static_anchor_policies
+                .iter()
+                .map(|((family, bond), policy)| StaticAnchorPolicySnapshot {
+                    family: *family,
+                    bond: *bond,
+                    policy: *policy,
+                })
+                .collect(),
+            applied_static_anchor_policies: self
+                .applied_static_anchor_policies
+                .iter()
+                .map(
+                    |((family, actor), policy)| AppliedStaticAnchorPolicySnapshot {
+                        family: *family,
+                        actor: *actor,
+                        policy: *policy,
+                    },
+                )
+                .collect(),
+            static_anchor_body_baselines: self
+                .static_anchor_body_baselines
+                .iter()
+                .map(|((family, actor), body_type)| BodyBaselineSnapshot {
+                    family: *family,
+                    actor: *actor,
+                    body_type: BodyTypeSnapshot::from_body_type(*body_type),
+                })
+                .collect(),
+        })
+    }
+
+    fn from_snapshot(snapshot: FxRapierWorldSnapshot) -> Result<Self, FxRapierError> {
+        validate_snapshot_metadata(&snapshot)?;
+        let mut world = Self::new();
+        world.snapshot_mode = snapshot.mode;
+        world.tick = snapshot.tick;
+        world.gravity = Vector::new(snapshot.gravity[0], snapshot.gravity[1]);
+        apply_integration_snapshot(&mut world.integration_parameters, snapshot.integration);
+        world.stress_solver = StressSolver2D::new(stress_from_snapshot(snapshot.stress));
+        let rapier = decode_rapier_owned_state(&snapshot.rapier_owned_state)?;
+        world.bodies = rapier.bodies;
+        world.colliders = rapier.colliders;
+        world.impulse_joints = rapier.impulse_joints;
+        world.multibody_joints = rapier.multibody_joints;
+        world.islands = rapier.islands;
+        world.broad_phase = rapier.broad_phase;
+        world.narrow_phase = rapier.narrow_phase;
+        world.ccd_solver = rapier.ccd_solver;
+        for (material, properties) in snapshot.contact_materials {
+            world.set_contact_material_properties(material, properties);
+        }
+
+        let mut families = snapshot.families;
+        families.sort_by_key(|entry| entry.family);
+        for family_snapshot in families {
+            let asset = AuthoredVoxelAsset::from_snapshot_bytes(&family_snapshot.asset.bytes)
+                .map_err(FxRapierSnapshotError::Voxel)?;
+            let family = restore_family_snapshot(&family_snapshot.core_family)
+                .map_err(FxRapierSnapshotError::Core)?;
+            if family_snapshot.family != family.id {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("family snapshot id mismatch").into(),
+                );
+            }
+            if family.asset() != asset.core() {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("family asset/core mismatch").into(),
+                );
+            }
+            world.families.insert(
+                family_snapshot.family,
+                DestructibleFamily {
+                    asset,
+                    family,
+                    physics: BTreeMap::new(),
+                },
+            );
+        }
+
+        let expected_actors = world
+            .families
+            .iter()
+            .flat_map(|(family_id, entry)| {
+                entry
+                    .family
+                    .actors()
+                    .map(move |(actor_id, _)| (*family_id, *actor_id))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut actor_physics = snapshot.actor_physics;
+        actor_physics.sort_by_key(|item| (item.family, item.actor));
+        let actual_actors = actor_physics
+            .iter()
+            .map(|item| {
+                let Some(entry) = world.families.get(&item.family) else {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor physics unknown family",
+                    ));
+                };
+                if entry.family.actor(item.actor).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor physics unknown actor",
+                    ));
+                }
+                if world
+                    .bodies
+                    .get(RigidBodyHandle::from_raw_parts(
+                        item.body_handle.0,
+                        item.body_handle.1,
+                    ))
+                    .is_none()
+                {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing body",
+                    ));
+                }
+                if world
+                    .colliders
+                    .get(ColliderHandle::from_raw_parts(
+                        item.collider_handle.0,
+                        item.collider_handle.1,
+                    ))
+                    .is_none()
+                {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing collider",
+                    ));
+                }
+                Ok((item.family, item.actor))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if actual_actors != expected_actors {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "actor physics does not match restored family actors",
+            )
+            .into());
+        }
+        for item in actor_physics {
+            world
+                .families
+                .get_mut(&item.family)
+                .ok_or(FxRapierError::UnknownFamily(item.family))?
+                .physics
+                .insert(
+                    item.actor,
+                    ActorPhysicsState {
+                        handles: ActorPhysicsHandles {
+                            body: RigidBodyHandle::from_raw_parts(
+                                item.body_handle.0,
+                                item.body_handle.1,
+                            ),
+                            collider: ColliderHandle::from_raw_parts(
+                                item.collider_handle.0,
+                                item.collider_handle.1,
+                            ),
+                        },
+                        body_local_origin_in_asset: Vec2::new(
+                            item.body_local_origin_in_asset[0],
+                            item.body_local_origin_in_asset[1],
+                        ),
+                    },
+                );
+        }
+        world.body_actors = snapshot
+            .body_actors
+            .into_iter()
+            .map(|entry| (entry.body_handle, entry.actor))
+            .collect();
+        {
+            let registry = world.hooks.registry();
+            let mut registry = registry
+                .write()
+                .expect("contact material registry poisoned");
+            registry.collider_actors = snapshot
+                .collider_actors
+                .into_iter()
+                .map(|entry| (entry.collider_handle, entry.actor))
+                .collect();
+            registry.collider_voxels = snapshot
+                .collider_voxels
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.collider_handle,
+                        entry.voxels.into_iter().map(Into::into).collect(),
+                    )
+                })
+                .collect();
+        }
+
+        world.static_anchor_policies = snapshot
+            .static_anchor_policies
+            .into_iter()
+            .map(|entry| ((entry.family, entry.bond), entry.policy))
+            .collect();
+        world.applied_static_anchor_policies = snapshot
+            .applied_static_anchor_policies
+            .into_iter()
+            .map(|entry| ((entry.family, entry.actor), entry.policy))
+            .collect();
+        world.static_anchor_body_baselines = snapshot
+            .static_anchor_body_baselines
+            .into_iter()
+            .map(|entry| ((entry.family, entry.actor), entry.body_type.to_body_type()))
+            .collect();
+
+        {
+            let registry = world.hooks.registry();
+            let registry = registry.read().expect("contact material registry poisoned");
+            world.validate_checkpoint_state(&registry)?;
+        }
+        Ok(world)
+    }
+
+    fn validate_checkpoint_state(
+        &self,
+        registry: &crate::hooks::ContactMaterialRegistry,
+    ) -> Result<(), FxRapierError> {
+        let mut managed_body_keys = BTreeSet::new();
+        let mut managed_collider_keys = BTreeSet::new();
+
+        for (family_id, entry) in &self.families {
+            let actor_ids = entry
+                .family
+                .actors()
+                .map(|(actor, _)| *actor)
+                .collect::<BTreeSet<_>>();
+            if entry.physics.keys().copied().collect::<BTreeSet<_>>() != actor_ids {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "actor physics map does not match live family actors",
+                )
+                .into());
+            }
+            for (actor_id, state) in &entry.physics {
+                if self.bodies.get(state.handles.body).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing body",
+                    )
+                    .into());
+                }
+                if self.colliders.get(state.handles.collider).is_none() {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor references missing collider",
+                    )
+                    .into());
+                }
+                let collider = self.colliders.get(state.handles.collider).ok_or(
+                    FxRapierSnapshotError::StateMismatch("actor references missing collider"),
+                )?;
+                if collider.parent() != Some(state.handles.body) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "actor collider parent mismatch",
+                    )
+                    .into());
+                }
+                if !managed_body_keys.insert(rigid_body_key(state.handles.body)) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "duplicate managed body handle",
+                    )
+                    .into());
+                }
+                if !managed_collider_keys.insert(collider_key(state.handles.collider)) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "duplicate managed collider handle",
+                    )
+                    .into());
+                }
+                let actor_ref = DestructibleActorRef {
+                    family: *family_id,
+                    actor: *actor_id,
+                };
+                if self.body_actors.get(&rigid_body_key(state.handles.body)) != Some(&actor_ref) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "body actor registry mismatch",
+                    )
+                    .into());
+                }
+                if registry
+                    .collider_actors
+                    .get(&collider_key(state.handles.collider))
+                    != Some(&actor_ref)
+                {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "collider actor registry mismatch",
+                    )
+                    .into());
+                }
+                let actor =
+                    entry
+                        .family
+                        .actor(*actor_id)
+                        .ok_or(FxRapierSnapshotError::StateMismatch(
+                            "actor physics unknown actor",
+                        ))?;
+                let material_id =
+                    actor_default_contact_material(actor, &entry.asset).unwrap_or_default();
+                let properties = registry
+                    .material_properties
+                    .get(&material_id)
+                    .copied()
+                    .unwrap_or_default();
+                let expected_voxels = actor_collider_build(
+                    actor,
+                    &entry.asset,
+                    state.body_local_origin_in_asset,
+                    properties,
+                )
+                .ok_or(FxRapierSnapshotError::StateMismatch(
+                    "actor collider metadata missing",
+                ))?
+                .voxels;
+                if registry
+                    .collider_voxels
+                    .get(&collider_key(state.handles.collider))
+                    .map(Vec::as_slice)
+                    != Some(expected_voxels.as_slice())
+                {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "collider voxel metadata mismatch",
+                    )
+                    .into());
+                }
+            }
+        }
+        if self.body_actors.keys().copied().collect::<BTreeSet<_>>() != managed_body_keys {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "body actor registry is not bijective",
+            )
+            .into());
+        }
+        if registry
+            .collider_actors
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != managed_collider_keys
+        {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "collider actor registry is not bijective",
+            )
+            .into());
+        }
+        if registry
+            .collider_voxels
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != managed_collider_keys
+        {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "collider voxel registry is not bijective",
+            )
+            .into());
+        }
+        for (body, actor) in &self.body_actors {
+            let handle = RigidBodyHandle::from_raw_parts(body.0, body.1);
+            if self.bodies.get(handle).is_none() {
+                return Err(FxRapierSnapshotError::StateMismatch("stale body actor handle").into());
+            }
+            self.require_actor_ref(*actor)?;
+        }
+        for (collider, actor) in &registry.collider_actors {
+            let handle = ColliderHandle::from_raw_parts(collider.0, collider.1);
+            if self.colliders.get(handle).is_none() {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("stale collider actor handle").into(),
+                );
+            }
+            self.require_actor_ref(*actor)?;
+        }
+        for collider in registry.collider_voxels.keys() {
+            let handle = ColliderHandle::from_raw_parts(collider.0, collider.1);
+            if self.colliders.get(handle).is_none() {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("stale collider voxel handle").into(),
+                );
+            }
+        }
+        for ((family, bond), _) in &self.static_anchor_policies {
+            let Some(entry) = self.families.get(family) else {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("static policy unknown family").into(),
+                );
+            };
+            if entry.family.external_bond(*bond).is_none() {
+                return Err(
+                    FxRapierSnapshotError::StateMismatch("static policy unknown bond").into(),
+                );
+            }
+        }
+        for ((family, actor), _) in &self.applied_static_anchor_policies {
+            self.require_actor_ref(DestructibleActorRef {
+                family: *family,
+                actor: *actor,
+            })?;
+        }
+        for ((family, actor), _) in &self.static_anchor_body_baselines {
+            self.require_actor_ref(DestructibleActorRef {
+                family: *family,
+                actor: *actor,
+            })?;
+        }
+        let applied_policy_keys = self
+            .applied_static_anchor_policies
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let baseline_keys = self
+            .static_anchor_body_baselines
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if applied_policy_keys != baseline_keys {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "static anchor applied policy/baseline key mismatch",
+            )
+            .into());
+        }
+        for ((family, actor), policy) in &self.applied_static_anchor_policies {
+            let handles = self.actor_handles_result(*family, *actor)?;
+            let Some(body) = self.bodies.get(handles.body) else {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "static anchor applied policy missing body",
+                )
+                .into());
+            };
+            if body.body_type() != rigid_body_type_for_anchor_policy(*policy) {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "static anchor applied body type mismatch",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn require_actor_ref(&self, actor: DestructibleActorRef) -> Result<(), FxRapierError> {
+        if self
+            .families
+            .get(&actor.family)
+            .is_some_and(|entry| entry.family.actor(actor.actor).is_some())
+        {
+            Ok(())
+        } else {
+            Err(FxRapierSnapshotError::StateMismatch("actor reference is stale").into())
+        }
     }
 
     fn sync_family_actors(&mut self, family_id: FxFamilyId) -> Result<(), FxRapierError> {
@@ -1072,6 +1753,174 @@ fn apply_body_dynamic_state(body: &mut RigidBody, snapshot: BodySnapshot) {
     if snapshot.was_sleeping {
         body.sleep();
     }
+}
+
+fn integration_to_snapshot(params: &IntegrationParameters) -> crate::snapshot::IntegrationSnapshot {
+    crate::snapshot::IntegrationSnapshot {
+        dt: params.dt,
+        min_ccd_dt: params.min_ccd_dt,
+        contact_softness_natural_frequency: params.contact_softness.natural_frequency,
+        contact_softness_damping_ratio: params.contact_softness.damping_ratio,
+        warmstart_coefficient: params.warmstart_coefficient,
+        length_unit: params.length_unit,
+        normalized_allowed_linear_error: params.normalized_allowed_linear_error,
+        normalized_max_corrective_velocity: params.normalized_max_corrective_velocity,
+        normalized_prediction_distance: params.normalized_prediction_distance,
+        num_solver_iterations: params.num_solver_iterations,
+        num_internal_pgs_iterations: params.num_internal_pgs_iterations,
+        num_internal_stabilization_iterations: params.num_internal_stabilization_iterations,
+        min_island_size: params.min_island_size,
+        max_ccd_substeps: params.max_ccd_substeps,
+    }
+}
+
+fn apply_integration_snapshot(
+    params: &mut IntegrationParameters,
+    snapshot: crate::snapshot::IntegrationSnapshot,
+) {
+    params.dt = snapshot.dt;
+    params.min_ccd_dt = snapshot.min_ccd_dt;
+    params.contact_softness.natural_frequency = snapshot.contact_softness_natural_frequency;
+    params.contact_softness.damping_ratio = snapshot.contact_softness_damping_ratio;
+    params.warmstart_coefficient = snapshot.warmstart_coefficient;
+    params.length_unit = snapshot.length_unit;
+    params.normalized_allowed_linear_error = snapshot.normalized_allowed_linear_error;
+    params.normalized_max_corrective_velocity = snapshot.normalized_max_corrective_velocity;
+    params.normalized_prediction_distance = snapshot.normalized_prediction_distance;
+    params.num_solver_iterations = snapshot.num_solver_iterations;
+    params.num_internal_pgs_iterations = snapshot.num_internal_pgs_iterations;
+    params.num_internal_stabilization_iterations = snapshot.num_internal_stabilization_iterations;
+    params.min_island_size = snapshot.min_island_size;
+    params.max_ccd_substeps = snapshot.max_ccd_substeps;
+}
+
+fn stress_to_snapshot(settings: StressSettings) -> StressSettingsSnapshot {
+    settings.into()
+}
+
+fn stress_from_snapshot(snapshot: StressSettingsSnapshot) -> StressSettings {
+    snapshot.into()
+}
+
+pub(crate) fn ensure_snapshot_mode_available(mode: SnapshotMode) -> Result<(), FxRapierError> {
+    if mode == SnapshotMode::Deterministic && !cfg!(feature = "deterministic-replay") {
+        return Err(FxRapierSnapshotError::DeterministicReplayFeatureRequired.into());
+    }
+    Ok(())
+}
+
+fn validate_snapshot_metadata(snapshot: &FxRapierWorldSnapshot) -> Result<(), FxRapierError> {
+    if !snapshot.gravity[0].is_finite() || !snapshot.gravity[1].is_finite() {
+        return Err(FxRapierSnapshotError::InvalidValue("gravity").into());
+    }
+    validate_integration_snapshot(snapshot.integration)?;
+    validate_stress_snapshot(snapshot.stress)?;
+
+    let mut families = BTreeSet::new();
+    for family in &snapshot.families {
+        if !families.insert(family.family) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate family").into());
+        }
+    }
+
+    let mut actor_physics = BTreeSet::new();
+    let mut actor_bodies = BTreeSet::new();
+    let mut actor_colliders = BTreeSet::new();
+    for item in &snapshot.actor_physics {
+        if !actor_physics.insert((item.family, item.actor)) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate actor physics").into());
+        }
+        if !actor_bodies.insert(item.body_handle) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate actor body handle").into());
+        }
+        if !actor_colliders.insert(item.collider_handle) {
+            return Err(
+                FxRapierSnapshotError::StateMismatch("duplicate actor collider handle").into(),
+            );
+        }
+        if !item.body_local_origin_in_asset[0].is_finite()
+            || !item.body_local_origin_in_asset[1].is_finite()
+        {
+            return Err(FxRapierSnapshotError::InvalidValue("actor local origin").into());
+        }
+    }
+    let mut body_actors = BTreeSet::new();
+    for item in &snapshot.body_actors {
+        if !body_actors.insert(item.body_handle) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate body actor").into());
+        }
+    }
+    let mut collider_actors = BTreeSet::new();
+    for item in &snapshot.collider_actors {
+        if !collider_actors.insert(item.collider_handle) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate collider actor").into());
+        }
+    }
+    let mut collider_voxels = BTreeSet::new();
+    for item in &snapshot.collider_voxels {
+        if !collider_voxels.insert(item.collider_handle) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate collider voxels").into());
+        }
+    }
+
+    let mut static_policies = BTreeSet::new();
+    for item in &snapshot.static_anchor_policies {
+        if !static_policies.insert((item.family, item.bond)) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate static policy").into());
+        }
+    }
+    let mut applied_policies = BTreeSet::new();
+    for item in &snapshot.applied_static_anchor_policies {
+        if !applied_policies.insert((item.family, item.actor)) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate applied policy").into());
+        }
+    }
+    let mut baselines = BTreeSet::new();
+    for item in &snapshot.static_anchor_body_baselines {
+        if !baselines.insert((item.family, item.actor)) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate body baseline").into());
+        }
+    }
+    let mut materials = BTreeSet::new();
+    for (material, properties) in &snapshot.contact_materials {
+        if !materials.insert(*material) {
+            return Err(FxRapierSnapshotError::StateMismatch("duplicate contact material").into());
+        }
+        if !properties.friction.is_finite() || !properties.restitution.is_finite() {
+            return Err(FxRapierSnapshotError::InvalidValue("contact material").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_integration_snapshot(
+    snapshot: crate::snapshot::IntegrationSnapshot,
+) -> Result<(), FxRapierError> {
+    let scalars = [
+        snapshot.dt,
+        snapshot.min_ccd_dt,
+        snapshot.contact_softness_natural_frequency,
+        snapshot.contact_softness_damping_ratio,
+        snapshot.warmstart_coefficient,
+        snapshot.length_unit,
+        snapshot.normalized_allowed_linear_error,
+        snapshot.normalized_max_corrective_velocity,
+        snapshot.normalized_prediction_distance,
+    ];
+    if scalars.into_iter().any(|value| !value.is_finite()) {
+        return Err(FxRapierSnapshotError::InvalidValue("integration").into());
+    }
+    Ok(())
+}
+
+fn validate_stress_snapshot(snapshot: StressSettingsSnapshot) -> Result<(), FxRapierError> {
+    if !snapshot.tension_limit_scale.is_finite()
+        || !snapshot.shear_limit_scale.is_finite()
+        || !snapshot.damage_per_overload.is_finite()
+    {
+        return Err(FxRapierSnapshotError::InvalidValue("stress").into());
+    }
+    Ok(())
 }
 
 fn child_world_translation(snapshot: BodySnapshot, child_local_com: Vec2) -> Vector {

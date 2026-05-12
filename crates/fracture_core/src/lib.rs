@@ -9,6 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;
 
+pub mod replay;
+pub mod snapshot;
+pub use replay::{ReplayCommand, ReplayError, ReplayTickTrace, run_replay_ticks};
+pub use snapshot::{FxCoreSnapshotError, SnapshotMode};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec2 {
     pub x: f32,
@@ -489,8 +494,11 @@ impl FxAsset {
     pub fn validate(&self) -> Result<(), ValidationError> {
         let mut covered =
             vec![None; self.occupancy.width as usize * self.occupancy.height as usize];
-        let node_ids: BTreeSet<_> = self.support_nodes.iter().map(|node| node.id).collect();
+        let mut node_ids = BTreeSet::new();
         for node in &self.support_nodes {
+            if !node_ids.insert(node.id) {
+                return Err(ValidationError::DuplicateSupportNodeId(node.id));
+            }
             if node.voxels.is_empty() {
                 return Err(ValidationError::EmptySupportNode(node.id));
             }
@@ -518,7 +526,11 @@ impl FxAsset {
                 return Err(ValidationError::MissingSupportCoverage(coord));
             }
         }
+        let mut chunk_ids = BTreeSet::new();
         for chunk in &self.chunks {
+            if !chunk_ids.insert(chunk.id) {
+                return Err(ValidationError::DuplicateChunkId(chunk.id));
+            }
             if !node_ids.contains(&chunk.support_node) {
                 return Err(ValidationError::ChunkEndpointMissing(chunk.support_node));
             }
@@ -527,9 +539,23 @@ impl FxAsset {
         if chunk_nodes != node_ids {
             return Err(ValidationError::ChunkHierarchyNotExact);
         }
-        for bond in &self.internal_bonds {
+        let mut bond_ids = BTreeSet::new();
+        for (index, bond) in self.internal_bonds.iter().enumerate() {
+            if !bond_ids.insert(bond.id) {
+                return Err(ValidationError::DuplicateInternalBondId(bond.id));
+            }
+            let expected = BondId(index as u32);
+            if bond.id != expected {
+                return Err(ValidationError::NonContiguousInternalBondId {
+                    expected,
+                    actual: bond.id,
+                });
+            }
             if bond.node_a == bond.node_b {
                 return Err(ValidationError::SelfBond(bond.node_a));
+            }
+            if bond.node_a > bond.node_b {
+                return Err(ValidationError::NonCanonicalBondEndpoints(bond.id));
             }
             if !node_ids.contains(&bond.node_a) {
                 return Err(ValidationError::BondEndpointMissing(bond.node_a));
@@ -537,9 +563,17 @@ impl FxAsset {
             if !node_ids.contains(&bond.node_b) {
                 return Err(ValidationError::BondEndpointMissing(bond.node_b));
             }
-            if bond.length <= 0.0 {
+            if !valid_vec2(bond.centroid)
+                || !valid_runtime_scalar(bond.base_health)
+                || !valid_runtime_scalar(bond.tension_limit)
+                || !valid_runtime_scalar(bond.shear_limit)
+            {
+                return Err(ValidationError::InvalidBondScalar(bond.id));
+            }
+            if !bond.length.is_finite() || bond.length <= 0.0 {
                 return Err(ValidationError::NonPositiveBondLength(bond.id));
             }
+            validate_internal_bond_direction(bond)?;
             if bond.interface_edges.is_empty() {
                 return Err(ValidationError::EmptyBondInterface(bond.id));
             }
@@ -2264,14 +2298,28 @@ pub enum ValidationError {
     EmptySupportNode(SupportNodeId),
     #[error("support node containing {0:?} is not 4-neighbor connected")]
     SupportNodeNotFourConnected(SupportNodeId),
+    #[error("duplicate support node id {0:?}")]
+    DuplicateSupportNodeId(SupportNodeId),
+    #[error("duplicate chunk id {0:?}")]
+    DuplicateChunkId(ChunkId),
     #[error("chunk references missing support node {0:?}")]
     ChunkEndpointMissing(SupportNodeId),
     #[error("chunk hierarchy is not an exact cover over support nodes")]
     ChunkHierarchyNotExact,
+    #[error("duplicate internal bond id {0:?}")]
+    DuplicateInternalBondId(BondId),
+    #[error("internal bond id {actual:?} is not contiguous at index {expected:?}")]
+    NonContiguousInternalBondId { expected: BondId, actual: BondId },
     #[error("bond endpoint {0:?} is missing")]
     BondEndpointMissing(SupportNodeId),
     #[error("bond cannot connect support node {0:?} to itself")]
     SelfBond(SupportNodeId),
+    #[error("bond {0:?} endpoints must be canonical")]
+    NonCanonicalBondEndpoints(BondId),
+    #[error("bond {0:?} has invalid scalar values")]
+    InvalidBondScalar(BondId),
+    #[error("bond {0:?} has invalid normal/tangent directions")]
+    InvalidBondDirection(BondId),
     #[error("bond {0:?} length must be positive")]
     NonPositiveBondLength(BondId),
     #[error("bond {0:?} has no interface edges")]
@@ -2572,6 +2620,23 @@ fn valid_runtime_scalar(value: f32) -> bool {
 
 fn valid_vec2(value: Vec2) -> bool {
     value.x.is_finite() && value.y.is_finite()
+}
+
+fn validate_internal_bond_direction(bond: &Bond2D) -> Result<(), ValidationError> {
+    if !valid_vec2(bond.normal) || !valid_vec2(bond.tangent) {
+        return Err(ValidationError::InvalidBondDirection(bond.id));
+    }
+    let normal_len = bond.normal.length();
+    let tangent_len = bond.tangent.length();
+    if (normal_len - 1.0).abs() > 0.0001 || (tangent_len - 1.0).abs() > 0.0001 {
+        return Err(ValidationError::InvalidBondDirection(bond.id));
+    }
+    let expected = bond.normal.perp();
+    if (bond.tangent.x - expected.x).abs() > 0.0001 || (bond.tangent.y - expected.y).abs() > 0.0001
+    {
+        return Err(ValidationError::InvalidBondDirection(bond.id));
+    }
+    Ok(())
 }
 
 fn validate_direction(value: Vec2) -> Option<Vec2> {

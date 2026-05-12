@@ -4,15 +4,18 @@ use fracture_core::{
     BondId, CommandId, ConnectionError, ConnectionId, DamageSource, DeterministicOrderKey,
     DynamicConnectionPolicy, DynamicStructuralBondDesc, ExternalBondId, ExternalTarget2D,
     ExternalTargetKind, ExternalTargetToken, FractureCommand, FractureTarget, FxActorId,
-    FxFamilyId, StaticAnchorDesc, StressSettings, SupportNodeId, Vec2,
+    FxFamilyId, StaticAnchorDesc, StressSettings, SupportNodeId, Vec2, snapshot::SnapshotMode,
 };
 use fracture_voxel::{VoxelAuthoringInput, author_voxel_asset};
 use rapier2d::prelude::*;
 
+#[cfg(feature = "deterministic-replay")]
+use crate::FxRapierReplayCommand;
 use crate::contact_map::{ContactPairSide, map_contact_pair};
+use crate::snapshot::{decode_world_snapshot, encode_world_snapshot};
 use crate::{
-    ContactMaterialProperties, DynamicStructuralConnectionDesc, FxRapierError, FxRapierWorld2D,
-    StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
+    ContactMaterialProperties, DynamicStructuralConnectionDesc, FxRapierError,
+    FxRapierSnapshotError, FxRapierWorld2D, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
 
 fn two_node_asset(contact_material: u16) -> fracture_voxel::AuthoredVoxelAsset {
@@ -1041,6 +1044,485 @@ fn destructible_vs_destructible_generates_two_readbacks() {
     );
 }
 
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn rapier_checkpoint_restores_into_real_world() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.integration_parameters_mut().dt = 1.0 / 120.0;
+    world.integration_parameters_mut().min_ccd_dt = 1.0 / 3600.0;
+    world.integration_parameters_mut().warmstart_coefficient = 0.73;
+    world.integration_parameters_mut().num_solver_iterations = 6;
+    world.integration_parameters_mut().max_ccd_substeps = 2;
+    world.set_contact_material_properties(
+        5,
+        ContactMaterialProperties {
+            friction: 0.75,
+            restitution: 0.25,
+        },
+    );
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(7, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let handles = world.actor_handles(family, FxActorId(0)).unwrap();
+    {
+        let body = world.rigid_bodies_mut().get_mut(handles.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(3.0, 4.0)), true);
+        body.set_linvel(Vector::new(1.0, -2.0), true);
+        body.set_angvel(0.5, true);
+        body.enable_ccd(true);
+        body.set_soft_ccd_prediction(0.125);
+    }
+
+    let digest = world.family(family).unwrap().deterministic_state_digest();
+    let bytes = world.snapshot().unwrap();
+    let mut restored = FxRapierWorld2D::restore_snapshot(&bytes).unwrap();
+    assert_eq!(
+        restored
+            .family(family)
+            .unwrap()
+            .deterministic_state_digest(),
+        digest
+    );
+    let restored_handles = restored.actor_handles(family, FxActorId(0)).unwrap();
+    let restored_body = restored.rigid_bodies().get(restored_handles.body).unwrap();
+    assert!(restored_body.is_fixed());
+    assert!(restored_body.is_ccd_enabled());
+    assert_scalar_close(restored_body.soft_ccd_prediction(), 0.125);
+    assert_scalar_close(restored.integration_parameters().dt, 1.0 / 120.0);
+    assert_scalar_close(restored.integration_parameters().min_ccd_dt, 1.0 / 3600.0);
+    assert_scalar_close(
+        restored.integration_parameters().warmstart_coefficient,
+        0.73,
+    );
+    assert_eq!(restored.integration_parameters().num_solver_iterations, 6);
+    assert_eq!(restored.integration_parameters().max_ccd_substeps, 2);
+    restored.step().unwrap();
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn deterministic_replay_after_split_checkpoint_identical() {
+    let family = FxFamilyId(1);
+    let mut original = FxRapierWorld2D::new();
+    original.set_snapshot_mode(SnapshotMode::Deterministic);
+    original.set_gravity(Vector::ZERO);
+    original.integration_parameters_mut().dt = 1.0 / 120.0;
+    original.integration_parameters_mut().min_ccd_dt = 1.0 / 4800.0;
+    original.integration_parameters_mut().warmstart_coefficient = 0.7;
+    original.integration_parameters_mut().num_solver_iterations = 7;
+    original.integration_parameters_mut().max_ccd_substeps = 3;
+    original
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    original
+        .fracture_and_sync_for_test(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(0))],
+        )
+        .unwrap();
+    for _ in 0..10 {
+        original.step().unwrap();
+    }
+    let checkpoint = original.snapshot().unwrap();
+    let mut restored = FxRapierWorld2D::restore_snapshot(&checkpoint).unwrap();
+    assert_scalar_close(restored.integration_parameters().dt, 1.0 / 120.0);
+    assert_scalar_close(restored.integration_parameters().min_ccd_dt, 1.0 / 4800.0);
+    assert_scalar_close(restored.integration_parameters().warmstart_coefficient, 0.7);
+    assert_eq!(restored.integration_parameters().num_solver_iterations, 7);
+    assert_eq!(restored.integration_parameters().max_ccd_substeps, 3);
+    let commands = vec![FxRapierReplayCommand {
+        tick: 25,
+        stable_order: 0,
+        family,
+        command: break_bond_command(25, family, FxActorId(0), BondId(2)),
+    }];
+
+    let original_trace = original.run_replay_trace(1000, &commands).unwrap();
+    let restored_trace = restored.run_replay_trace(1000, &commands).unwrap();
+    assert_eq!(original_trace, restored_trace);
+    assert!(
+        original_trace
+            .ticks
+            .iter()
+            .flat_map(|tick| tick.split_events.iter())
+            .any(|event| !event.created_children.is_empty())
+    );
+    assert_eq!(
+        original
+            .family(family)
+            .unwrap()
+            .deterministic_state_digest(),
+        restored
+            .family(family)
+            .unwrap()
+            .deterministic_state_digest()
+    );
+    assert_eq!(
+        original.sorted_actor_body_trace(),
+        restored.sorted_actor_body_trace()
+    );
+}
+
+#[test]
+fn snapshot_restore_full_rapier_public_bodies_colliders_joints() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let managed = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    let (public_body, public_collider) = add_fixed_box(
+        &mut world,
+        Vector::new(4.0, 0.0),
+        Vector::new(0.5, 0.5),
+        1.0,
+    );
+    let joint =
+        world.insert_impulse_joint(managed.body, public_body, FixedJointBuilder::new(), true);
+
+    let restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
+    assert!(restored.rigid_bodies().get(public_body).is_some());
+    assert!(restored.colliders().get(public_collider).is_some());
+    assert!(restored.impulse_joints().get(joint).is_some());
+    assert!(
+        restored
+            .actor_handles(FxFamilyId(1), FxActorId(0))
+            .is_some()
+    );
+}
+
+#[test]
+fn snapshot_restore_full_integration_parameters() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world.integration_parameters_mut().dt = 1.0 / 123.0;
+    world.integration_parameters_mut().min_ccd_dt = 1.0 / 9876.0;
+    world
+        .integration_parameters_mut()
+        .contact_softness
+        .natural_frequency = 42.0;
+    world
+        .integration_parameters_mut()
+        .contact_softness
+        .damping_ratio = 0.37;
+    world.integration_parameters_mut().warmstart_coefficient = 0.61;
+    world.integration_parameters_mut().length_unit = 2.5;
+    world
+        .integration_parameters_mut()
+        .normalized_allowed_linear_error = 0.004;
+    world
+        .integration_parameters_mut()
+        .normalized_max_corrective_velocity = 12.5;
+    world
+        .integration_parameters_mut()
+        .normalized_prediction_distance = 0.071;
+    world.integration_parameters_mut().num_solver_iterations = 9;
+    world
+        .integration_parameters_mut()
+        .num_internal_pgs_iterations = 4;
+    world
+        .integration_parameters_mut()
+        .num_internal_stabilization_iterations = 3;
+    world.integration_parameters_mut().min_island_size = 8;
+    world.integration_parameters_mut().max_ccd_substeps = 5;
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+
+    let restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        restored.integration_parameters(),
+        world.integration_parameters()
+    );
+}
+
+#[test]
+fn snapshot_restore_stress_settings() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world.set_stress_settings(StressSettings {
+        tension_limit_scale: 0.5,
+        shear_limit_scale: 0.25,
+        damage_per_overload: 3.0,
+        max_fractures_per_frame: 2,
+    });
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+
+    let mut restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
+    assert_eq!(restored.stress_settings(), world.stress_settings());
+    restored.step().unwrap();
+}
+
+#[test]
+fn snapshot_restore_rejects_duplicate_family() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.families.push(snapshot.families[0].clone());
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("duplicate family")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_stale_body_mapping() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.actor_physics[0].body_handle = (123_456, 0);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("actor references missing body")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_stale_collider_mapping() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.actor_physics[0].collider_handle = (123_456, 0);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("actor references missing collider")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_collider_parent_mismatch() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let (_, public_collider) = add_fixed_box(
+        &mut world,
+        Vector::new(4.0, 0.0),
+        Vector::new(0.5, 0.5),
+        1.0,
+    );
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    let public_key = public_collider.into_raw_parts();
+    snapshot.actor_physics[0].collider_handle = public_key;
+    snapshot.collider_actors[0].collider_handle = public_key;
+    snapshot.collider_voxels[0].collider_handle = public_key;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("actor collider parent mismatch")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_duplicate_collider_voxel_subshape() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    let duplicate = snapshot.collider_voxels[0].voxels[0].clone();
+    snapshot.collider_voxels[0].voxels.push(duplicate);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("collider voxel metadata mismatch")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_unknown_collider_voxel_node() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.collider_voxels[0].voxels[0].node = SupportNodeId(99);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("collider voxel metadata mismatch")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_wrong_collider_voxel_material() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.collider_voxels[0].voxels[0].contact_material = 8;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("collider voxel metadata mismatch")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_missing_static_anchor_baseline() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(7, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.static_anchor_body_baselines.clear();
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch(
+                "static anchor applied policy/baseline key mismatch"
+            )
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_stale_static_anchor_baseline() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(7, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.applied_static_anchor_policies.clear();
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch(
+                "static anchor applied policy/baseline key mismatch"
+            )
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_static_anchor_body_type_mismatch() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(7, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.applied_static_anchor_policies[0].policy =
+        StaticAnchorBodyPolicy::KinematicVelocityBased;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("static anchor applied body type mismatch")
+        ))
+    ));
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn snapshot_restore_active_contact_uses_cold_start_contract() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    world
+        .add_destructible(FxFamilyId(2), single_node_asset(7))
+        .unwrap();
+    let b = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+    world
+        .rigid_bodies_mut()
+        .get_mut(b.body)
+        .unwrap()
+        .set_position(Pose::from_translation(Vector::new(0.5, 0.0)), true);
+
+    world.step().unwrap();
+
+    let bytes = world.snapshot().unwrap();
+    let mut restored = FxRapierWorld2D::restore_snapshot(&bytes).unwrap();
+    assert_eq!(restored.snapshot_mode(), SnapshotMode::Deterministic);
+    assert_eq!(restored.tick(), world.tick());
+    restored.step().unwrap();
+    assert!(
+        restored
+            .actor_handles(FxFamilyId(1), FxActorId(0))
+            .is_some()
+    );
+    assert!(
+        restored
+            .actor_handles(FxFamilyId(2), FxActorId(0))
+            .is_some()
+    );
+}
+
 fn assert_vector_close(actual: Vector, expected: Vector) {
     assert!(
         (actual - expected).length() < 0.0001,
@@ -1053,4 +1535,359 @@ fn assert_scalar_close(actual: f32, expected: f32) {
         (actual - expected).abs() < 0.0001,
         "actual={actual:?} expected={expected:?}"
     );
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn snapshot_restore() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.set_gravity(Vector::ZERO);
+    world.integration_parameters_mut().dt = 1.0 / 120.0;
+    world.set_contact_material_properties(
+        5,
+        ContactMaterialProperties {
+            friction: 0.25,
+            restitution: 0.1,
+        },
+    );
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(33, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(2))],
+        )
+        .unwrap();
+    let child = world.actor_handles(family, FxActorId(1)).unwrap();
+    {
+        let body = world.rigid_bodies_mut().get_mut(child.body).unwrap();
+        body.set_position(
+            Pose::from_parts(Vector::new(3.0, 4.0), Rotation::new(0.4)),
+            true,
+        );
+        body.set_linvel(Vector::new(1.0, -2.0), true);
+        body.set_angvel(0.75, true);
+        body.enable_ccd(true);
+    }
+
+    let bytes = world.snapshot().unwrap();
+    assert_eq!(&bytes[0..4], b"RFXS");
+    let restored = FxRapierWorld2D::restore_snapshot(&bytes).unwrap();
+    assert_eq!(restored.snapshot_mode(), SnapshotMode::Deterministic);
+    assert_eq!(restored.tick(), world.tick());
+    assert_eq!(
+        restored
+            .family(family)
+            .unwrap()
+            .deterministic_state_digest(),
+        world.family(family).unwrap().deterministic_state_digest()
+    );
+    let logical_body = |world: &FxRapierWorld2D| {
+        world
+            .sorted_actor_body_trace()
+            .into_iter()
+            .map(|body| {
+                (
+                    body.family,
+                    body.actor,
+                    body.translation,
+                    body.rotation_angle,
+                    body.linvel,
+                    body.angvel,
+                    body.body_type,
+                    body.sleeping,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(logical_body(&restored), logical_body(&world));
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn replay_split_order() {
+    let family = FxFamilyId(1);
+    let mut a = FxRapierWorld2D::new();
+    let mut b = FxRapierWorld2D::new();
+    a.set_snapshot_mode(SnapshotMode::Deterministic);
+    b.set_snapshot_mode(SnapshotMode::Deterministic);
+    a.set_gravity(Vector::ZERO);
+    b.set_gravity(Vector::ZERO);
+    a.add_destructible(family, four_node_line_asset()).unwrap();
+    b.add_destructible(family, four_node_line_asset()).unwrap();
+    let commands = vec![
+        FxRapierReplayCommand {
+            tick: 0,
+            stable_order: 2,
+            family,
+            command: break_bond_command(0, family, FxActorId(0), BondId(2)),
+        },
+        FxRapierReplayCommand {
+            tick: 0,
+            stable_order: 1,
+            family,
+            command: break_bond_command(0, family, FxActorId(0), BondId(0)),
+        },
+    ];
+    let reversed = vec![commands[1].clone(), commands[0].clone()];
+
+    let a_report = a.apply_replay_tick(0, &commands).unwrap();
+    let b_report = b.apply_replay_tick(0, &reversed).unwrap();
+    assert_eq!(a_report.split_events, b_report.split_events);
+    assert_eq!(a.sorted_actor_body_trace(), b.sorted_actor_body_trace());
+    assert_eq!(
+        a.family(family).unwrap().deterministic_state_digest(),
+        b.family(family).unwrap().deterministic_state_digest()
+    );
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn replay_rejects_duplicate_ambiguous_keys() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    let commands = vec![
+        FxRapierReplayCommand {
+            tick: 0,
+            stable_order: 7,
+            family,
+            command: break_bond_command(0, family, FxActorId(0), BondId(0)),
+        },
+        FxRapierReplayCommand {
+            tick: 0,
+            stable_order: 7,
+            family,
+            command: break_bond_command(0, family, FxActorId(0), BondId(0)),
+        },
+    ];
+
+    assert!(matches!(
+        world.apply_replay_tick(0, &commands),
+        Err(FxRapierError::DuplicateReplayKey {
+            tick: 0,
+            stable_order: 7
+        })
+    ));
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn replay_rejects_unknown_family_commands() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(5)).unwrap();
+    let command = FxRapierReplayCommand {
+        tick: 0,
+        stable_order: 0,
+        family: FxFamilyId(99),
+        command: break_bond_command(0, FxFamilyId(99), FxActorId(0), BondId(0)),
+    };
+
+    assert!(matches!(
+        world.apply_replay_tick(0, &[command]),
+        Err(FxRapierError::UnknownReplayFamily(FxFamilyId(99)))
+    ));
+}
+
+#[test]
+fn normal_mode_not_assert_exact() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(5)).unwrap();
+    let bytes = world.snapshot().unwrap();
+    assert_eq!(&bytes[0..4], b"RFXS");
+    let restored = FxRapierWorld2D::restore_snapshot(&bytes).unwrap();
+    assert_eq!(restored.snapshot_mode(), SnapshotMode::Normal);
+    assert!(restored.actor_handles(family, FxActorId(0)).is_some());
+    let mut restored = restored;
+    assert!(matches!(
+        restored.run_replay_trace(restored.tick() + 1, &[]),
+        Err(FxRapierError::ReplayRequiresDeterministicMode)
+    ));
+}
+
+#[cfg(not(feature = "deterministic-replay"))]
+#[test]
+fn deterministic_mode_requires_feature_for_snapshot_and_replay() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Deterministic);
+    world.add_destructible(family, two_node_asset(5)).unwrap();
+
+    assert!(matches!(
+        world.snapshot(),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::DeterministicReplayFeatureRequired
+        ))
+    ));
+    assert!(matches!(
+        world.apply_replay_tick(0, &[]),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::DeterministicReplayFeatureRequired
+        ))
+    ));
+    assert!(matches!(
+        world.run_replay_trace(world.tick(), &[]),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::DeterministicReplayFeatureRequired
+        ))
+    ));
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn deterministic_1000_tick_small_scene_replay_identical() {
+    fn build() -> FxRapierWorld2D {
+        let mut world = FxRapierWorld2D::new();
+        world.set_snapshot_mode(SnapshotMode::Deterministic);
+        world.set_gravity(Vector::ZERO);
+        world.integration_parameters_mut().dt = 1.0 / 60.0;
+        world
+            .add_destructible(FxFamilyId(1), four_node_line_asset())
+            .unwrap();
+        world
+    }
+
+    let family = FxFamilyId(1);
+    let commands = vec![
+        FxRapierReplayCommand {
+            tick: 10,
+            stable_order: 1,
+            family,
+            command: break_bond_command(10, family, FxActorId(0), BondId(0)),
+        },
+        FxRapierReplayCommand {
+            tick: 500,
+            stable_order: 2,
+            family,
+            command: break_bond_command(500, family, FxActorId(0), BondId(2)),
+        },
+    ];
+    let reversed = vec![commands[1].clone(), commands[0].clone()];
+    let mut a = build();
+    let mut b = build();
+    let trace_a = a.run_replay_trace(1000, &commands).unwrap();
+    let trace_b = b.run_replay_trace(1000, &reversed).unwrap();
+    assert_eq!(trace_a, trace_b);
+    assert_eq!(a.snapshot().unwrap(), b.snapshot().unwrap());
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn deterministic_replay_live_contact_identical() {
+    fn build() -> FxRapierWorld2D {
+        let mut world = FxRapierWorld2D::new();
+        world.set_snapshot_mode(SnapshotMode::Deterministic);
+        world.set_gravity(Vector::ZERO);
+        world
+            .add_destructible(FxFamilyId(1), single_node_asset(7))
+            .unwrap();
+        world
+            .add_destructible(FxFamilyId(2), single_node_asset(7))
+            .unwrap();
+        let b = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+        world
+            .rigid_bodies_mut()
+            .get_mut(b.body)
+            .unwrap()
+            .set_position(Pose::from_translation(Vector::new(0.5, 0.0)), true);
+        world
+    }
+
+    let mut a = build();
+    let mut b = build();
+    assert_eq!(
+        a.run_replay_trace(16, &[]).unwrap(),
+        b.run_replay_trace(16, &[]).unwrap()
+    );
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn deterministic_static_anchor_after_restore_identical() {
+    let family = FxFamilyId(1);
+    let mut original = FxRapierWorld2D::new();
+    original.set_snapshot_mode(SnapshotMode::Deterministic);
+    original.set_gravity(Vector::ZERO);
+    original
+        .add_destructible(family, two_node_asset(7))
+        .unwrap();
+    original
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(44, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let mut restored = FxRapierWorld2D::restore_snapshot(&original.snapshot().unwrap()).unwrap();
+
+    assert_eq!(
+        original.run_replay_trace(24, &[]).unwrap(),
+        restored.run_replay_trace(24, &[]).unwrap()
+    );
+}
+
+#[cfg(feature = "deterministic-replay")]
+#[test]
+fn deterministic_joint_feedback_after_restore_identical() {
+    let mut original = FxRapierWorld2D::new();
+    original.set_snapshot_mode(SnapshotMode::Deterministic);
+    original.set_gravity(Vector::new(0.0, -9.81));
+    original
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let destructible = original.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    let anchor =
+        original.insert_rigid_body(RigidBodyBuilder::fixed().translation(Vector::new(0.0, 1.0)));
+    original.insert_impulse_joint(destructible.body, anchor, FixedJointBuilder::new(), true);
+    let mut restored = FxRapierWorld2D::restore_snapshot(&original.snapshot().unwrap()).unwrap();
+
+    let original_report = original.step().unwrap();
+    let restored_report = restored.step().unwrap();
+    assert_eq!(
+        original_report.joint_feedback,
+        restored_report.joint_feedback
+    );
+}
+
+#[test]
+fn deterministic_trace_uses_logical_body_mapping() {
+    let family = FxFamilyId(1);
+    let mut a = FxRapierWorld2D::new();
+    let mut b = FxRapierWorld2D::new();
+    a.set_gravity(Vector::ZERO);
+    b.set_gravity(Vector::ZERO);
+    a.add_destructible(family, single_node_asset(7)).unwrap();
+    add_fixed_box(
+        &mut b,
+        Vector::new(100.0, 100.0),
+        Vector::new(0.5, 0.5),
+        1.0,
+    );
+    b.add_destructible(family, single_node_asset(7)).unwrap();
+
+    assert_ne!(
+        a.actor_handles(family, FxActorId(0)).unwrap().body,
+        b.actor_handles(family, FxActorId(0)).unwrap().body
+    );
+    assert_eq!(a.sorted_actor_body_trace(), b.sorted_actor_body_trace());
 }

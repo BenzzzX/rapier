@@ -13,6 +13,9 @@ use fracture_core::{
 };
 use thiserror::Error;
 
+pub mod snapshot;
+pub use snapshot::{AuthoredVoxelAssetSnapshot, VoxelSnapshotError};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoxelAuthoringInput {
     pub width: u32,
