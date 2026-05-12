@@ -287,6 +287,13 @@ impl VoxelRuntime {
         self.last_repair.as_ref()
     }
 
+    pub fn apply_fracture_commands(
+        &mut self,
+        commands: &[fracture_core::FractureCommand],
+    ) -> Vec<fracture_core::FractureEvent> {
+        fracture_core::apply_fracture_commands(&mut self.family, commands)
+    }
+
     pub fn split_dirty_actors(&mut self) -> Vec<SplitEvent> {
         fracture_core::split_dirty_actors(&mut self.family)
     }
