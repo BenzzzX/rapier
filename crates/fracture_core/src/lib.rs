@@ -231,6 +231,18 @@ impl DenseOccupancy {
             })
         })
     }
+
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn index_of(&self, coord: GridCoord) -> Option<usize> {
+        self.contains(coord).then(|| self.index(coord))
+    }
+
+    pub fn cells(&self) -> &[bool] {
+        &self.cells
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,6 +251,8 @@ pub struct SupportNode2D {
     pub chunk_id: ChunkId,
     pub voxels: Vec<GridCoord>,
     pub material_id: u16,
+    pub orientation_summary: Option<u16>,
+    pub anisotropy_axis: Vec2,
     pub stable_seed: u64,
 }
 
@@ -295,6 +309,7 @@ pub struct FxAssetDesc {
     pub occupancy: DenseOccupancy,
     pub support_node_map: Vec<Option<SupportNodeId>>,
     pub material_map: Option<Vec<u16>>,
+    pub orientation_map: Option<Vec<u16>>,
     pub default_bond_health: f32,
     pub default_tension_limit: f32,
     pub default_shear_limit: f32,
@@ -313,6 +328,7 @@ impl FxAssetDesc {
             occupancy,
             support_node_map,
             material_map: None,
+            orientation_map: None,
             default_bond_health: 1.0,
             default_tension_limit: 10.0,
             default_shear_limit: 10.0,
@@ -345,6 +361,10 @@ impl FxAsset {
         &self.internal_bonds
     }
 
+    pub fn voxel_to_node_map(&self) -> &[Option<SupportNodeId>] {
+        &self.voxel_to_node
+    }
+
     pub fn from_desc(desc: FxAssetDesc) -> Result<Self, ValidationError> {
         if desc.voxel_size <= 0.0 {
             return Err(ValidationError::InvalidVoxelSize);
@@ -362,6 +382,14 @@ impl FxAsset {
                 return Err(ValidationError::GridSizeMismatch {
                     expected: cell_count,
                     actual: material_map.len(),
+                });
+            }
+        }
+        if let Some(orientation_map) = &desc.orientation_map {
+            if orientation_map.len() != cell_count {
+                return Err(ValidationError::GridSizeMismatch {
+                    expected: cell_count,
+                    actual: orientation_map.len(),
                 });
             }
         }
@@ -394,12 +422,19 @@ impl FxAsset {
             let material_id =
                 dominant_material(&voxels, &desc.occupancy, desc.material_map.as_ref());
             let chunk_id = ChunkId(node_id.0);
-            let stable_seed = stable_node_seed(node_id, &voxels, material_id);
+            let orientation_summary =
+                dominant_orientation(&voxels, &desc.occupancy, desc.orientation_map.as_ref());
+            let anisotropy_axis = orientation_summary
+                .map(angle16_to_axis)
+                .unwrap_or(Vec2::new(1.0, 0.0));
+            let stable_seed = stable_node_seed(node_id, &voxels, material_id, orientation_summary);
             support_nodes.push(SupportNode2D {
                 id: node_id,
                 chunk_id,
                 voxels,
                 material_id,
+                orientation_summary,
+                anisotropy_axis,
                 stable_seed,
             });
             chunks.push(Chunk2D {
@@ -647,6 +682,12 @@ impl BondRuntimeState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct NodeRuntimeState {
+    pub health: f32,
+    pub accumulated_damage: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FxActor {
     pub id: FxActorId,
     pub owned_nodes: Vec<SupportNodeId>,
@@ -668,6 +709,7 @@ pub struct FxFamily {
     asset: FxAsset,
     actors: BTreeMap<FxActorId, FxActor>,
     node_owner: BTreeMap<SupportNodeId, FxActorId>,
+    node_states: BTreeMap<SupportNodeId, NodeRuntimeState>,
     bond_states: Vec<BondRuntimeState>,
     dirty_actors: BTreeSet<FxActorId>,
     next_actor_id: u32,
@@ -686,12 +728,26 @@ impl FxFamily {
                 accumulated_damage: 0.0,
             })
             .collect();
+        let node_states = asset
+            .support_nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id,
+                    NodeRuntimeState {
+                        health: 1.0,
+                        accumulated_damage: 0.0,
+                    },
+                )
+            })
+            .collect();
 
         let mut family = Self {
             id,
             asset,
             actors: BTreeMap::new(),
             node_owner: BTreeMap::new(),
+            node_states,
             bond_states,
             dirty_actors: BTreeSet::new(),
             next_actor_id: 0,
@@ -739,6 +795,14 @@ impl FxFamily {
         &self.bond_states
     }
 
+    pub fn node_state(&self, node: SupportNodeId) -> Option<&NodeRuntimeState> {
+        self.node_states.get(&node)
+    }
+
+    pub fn node_states(&self) -> impl Iterator<Item = (SupportNodeId, &NodeRuntimeState)> + '_ {
+        self.node_states.iter().map(|(node, state)| (*node, state))
+    }
+
     pub fn dirty_actors(&self) -> impl Iterator<Item = FxActorId> + '_ {
         self.dirty_actors.iter().copied()
     }
@@ -781,6 +845,11 @@ impl FxFamily {
             hasher.write_u32(node.id.0);
             hasher.write_u32(node.chunk_id.0);
             hasher.write_u32(node.material_id as u32);
+            hasher.write_u32(node.orientation_summary.map_or(u32::MAX, u32::from));
+            hasher.write_f32(node.anisotropy_axis.x);
+            hasher.write_f32(node.anisotropy_axis.y);
+            hasher.write_u32((node.stable_seed & 0xffff_ffff) as u32);
+            hasher.write_u32((node.stable_seed >> 32) as u32);
             for voxel in &node.voxels {
                 hasher.write_u32(voxel.x);
                 hasher.write_u32(voxel.y);
@@ -830,6 +899,11 @@ impl FxFamily {
             hasher.write_u32(node.0);
             hasher.write_u32(owner.0);
         }
+        for (node, state) in &self.node_states {
+            hasher.write_u32(node.0);
+            hasher.write_f32(state.health);
+            hasher.write_f32(state.accumulated_damage);
+        }
         for state in &self.bond_states {
             hasher.write_f32(state.health);
             hasher.write_f32(state.effective_length);
@@ -855,6 +929,185 @@ impl FxFamily {
             self.dirty_actors.insert(*actor);
         }
     }
+
+    pub fn apply_repair_plan(
+        &mut self,
+        plan: RepairPlan,
+    ) -> Result<RepairCommitSummary, RepairError> {
+        plan.asset.validate()?;
+
+        let node_ids: BTreeSet<_> = plan
+            .asset
+            .support_nodes()
+            .iter()
+            .map(|node| node.id)
+            .collect();
+        let mut node_owner = BTreeMap::new();
+        for (node, actor) in plan.node_owners {
+            if !node_ids.contains(&node) {
+                return Err(RepairError::UnknownNode(node));
+            }
+            if !self.actors.contains_key(&actor) {
+                return Err(RepairError::MissingNodeOwnerActor { node, actor });
+            }
+            if node_owner.insert(node, actor).is_some() {
+                return Err(RepairError::DuplicateNodeOwner(node));
+            }
+        }
+        for node in &node_ids {
+            if !node_owner.contains_key(node) {
+                return Err(RepairError::MissingNodeOwner(*node));
+            }
+        }
+
+        if plan.bond_states.len() != plan.asset.internal_bonds().len() {
+            return Err(RepairError::BondStateCountMismatch {
+                expected: plan.asset.internal_bonds().len(),
+                actual: plan.bond_states.len(),
+            });
+        }
+
+        let mut node_states = BTreeMap::new();
+        for (node, state) in plan.node_states {
+            if !node_ids.contains(&node) {
+                return Err(RepairError::UnknownNode(node));
+            }
+            if !valid_runtime_scalar(state.health)
+                || !valid_runtime_scalar(state.accumulated_damage)
+            {
+                return Err(RepairError::InvalidNodeState(node));
+            }
+            if node_states.insert(node, state).is_some() {
+                return Err(RepairError::DuplicateNodeState(node));
+            }
+        }
+        for node in &node_ids {
+            if !node_states.contains_key(node) {
+                return Err(RepairError::MissingNodeState(*node));
+            }
+        }
+
+        let mut grouped: BTreeMap<FxActorId, Vec<SupportNodeId>> = BTreeMap::new();
+        for (node, actor) in &node_owner {
+            grouped.entry(*actor).or_default().push(*node);
+        }
+
+        let mut actors = BTreeMap::new();
+        for (actor, mut nodes) in grouped {
+            nodes.sort_unstable();
+            actors.insert(actor, build_actor(actor, &nodes, &plan.asset));
+        }
+
+        for (idx, state) in plan.bond_states.iter().enumerate() {
+            if !valid_runtime_scalar(state.health)
+                || !valid_runtime_scalar(state.effective_length)
+                || !valid_runtime_scalar(state.accumulated_damage)
+            {
+                return Err(RepairError::InvalidBondState(BondId(idx as u32)));
+            }
+        }
+
+        let mut dirty_actors = BTreeSet::new();
+        for actor in plan.dirty_actors {
+            if !actors.contains_key(&actor) {
+                return Err(RepairError::UnknownDirtyActor(actor));
+            }
+            dirty_actors.insert(actor);
+        }
+        for (actor_id, old_actor) in &self.actors {
+            let new_nodes = actors
+                .get(actor_id)
+                .map(|actor| actor.owned_nodes.as_slice())
+                .unwrap_or(&[]);
+            if old_actor.owned_nodes.as_slice() != new_nodes && !dirty_actors.contains(actor_id) {
+                return Err(RepairError::ActorChangedNotDirty(*actor_id));
+            }
+        }
+        let temp_family = Self {
+            id: self.id,
+            asset: plan.asset.clone(),
+            actors: actors.clone(),
+            node_owner: node_owner.clone(),
+            node_states: node_states.clone(),
+            bond_states: plan.bond_states.clone(),
+            dirty_actors: dirty_actors.clone(),
+            next_actor_id: self.next_actor_id,
+            next_event_id: self.next_event_id,
+        };
+        for (actor_id, actor) in &temp_family.actors {
+            if actor_components(actor, &temp_family).len() > 1 && !dirty_actors.contains(actor_id) {
+                return Err(RepairError::DisconnectedActorNotDirty(*actor_id));
+            }
+        }
+        let actor_order = actors.keys().copied().collect::<Vec<_>>();
+
+        self.asset = plan.asset;
+        self.actors = actors;
+        self.node_owner = node_owner;
+        self.node_states = node_states;
+        self.bond_states = plan.bond_states;
+        self.dirty_actors = dirty_actors;
+        self.next_actor_id = self.next_actor_id.max(
+            self.actors
+                .keys()
+                .map(|actor| actor.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+
+        Ok(RepairCommitSummary {
+            dirty_actors: self.dirty_actors.iter().copied().collect(),
+            actor_order,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepairPlan {
+    pub asset: FxAsset,
+    pub node_owners: Vec<(SupportNodeId, FxActorId)>,
+    pub node_states: Vec<(SupportNodeId, NodeRuntimeState)>,
+    pub bond_states: Vec<BondRuntimeState>,
+    pub dirty_actors: Vec<FxActorId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepairCommitSummary {
+    pub dirty_actors: Vec<FxActorId>,
+    pub actor_order: Vec<FxActorId>,
+}
+
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum RepairError {
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+    #[error("repair plan is missing owner for node {0:?}")]
+    MissingNodeOwner(SupportNodeId),
+    #[error("repair plan references unknown node {0:?}")]
+    UnknownNode(SupportNodeId),
+    #[error("repair plan assigns node {node:?} to missing actor {actor:?}")]
+    MissingNodeOwnerActor {
+        node: SupportNodeId,
+        actor: FxActorId,
+    },
+    #[error("repair plan assigns node {0:?} more than once")]
+    DuplicateNodeOwner(SupportNodeId),
+    #[error("repair plan is missing runtime state for node {0:?}")]
+    MissingNodeState(SupportNodeId),
+    #[error("repair plan provides node state for node {0:?} more than once")]
+    DuplicateNodeState(SupportNodeId),
+    #[error("repair plan has invalid runtime state for node {0:?}")]
+    InvalidNodeState(SupportNodeId),
+    #[error("repair plan has invalid runtime state for bond {0:?}")]
+    InvalidBondState(BondId),
+    #[error("repair plan marks unknown dirty actor {0:?}")]
+    UnknownDirtyActor(FxActorId),
+    #[error("repair plan changes actor {0:?} without marking it dirty")]
+    ActorChangedNotDirty(FxActorId),
+    #[error("repair plan leaves actor {0:?} disconnected without marking it dirty")]
+    DisconnectedActorNotDirty(FxActorId),
+    #[error("repair plan bond state count mismatch: expected {expected}, got {actual}")]
+    BondStateCountMismatch { expected: usize, actual: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1046,7 +1299,33 @@ pub fn apply_fracture_commands(
                     source: command.source,
                 });
             }
-            FractureTarget::Node(_) => {}
+            FractureTarget::Node(node_id) => {
+                if health_loss == 0.0 {
+                    continue;
+                }
+                let Some(state) = family.node_states.get_mut(&node_id) else {
+                    continue;
+                };
+                let old_health = state.health;
+                state.health = (state.health - health_loss).max(0.0);
+                state.accumulated_damage += health_loss;
+                let new_health = state.health;
+                if let Some(actor) = family.node_owner.get(&node_id) {
+                    family.dirty_actors.insert(*actor);
+                }
+                events.push(FractureEvent {
+                    event_id: family.next_event_id(),
+                    order_key: command.order_key,
+                    family: family.id,
+                    actor: command.actor,
+                    target: command.target,
+                    old_health,
+                    new_health,
+                    old_effective_length: 0.0,
+                    new_effective_length: 0.0,
+                    source: command.source,
+                });
+            }
         }
     }
     events
@@ -1329,10 +1608,41 @@ fn dominant_material(
         .unwrap_or(0)
 }
 
-fn stable_node_seed(node_id: SupportNodeId, voxels: &[GridCoord], material_id: u16) -> u64 {
+fn dominant_orientation(
+    voxels: &[GridCoord],
+    occupancy: &DenseOccupancy,
+    orientation_map: Option<&Vec<u16>>,
+) -> Option<u16> {
+    let orientation_map = orientation_map?;
+    let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+    for &voxel in voxels {
+        *counts
+            .entry(orientation_map[occupancy.index(voxel)])
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|(angle_a, count_a), (angle_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| angle_b.cmp(angle_a))
+        })
+        .map(|(angle, _)| angle)
+}
+
+fn angle16_to_axis(angle: u16) -> Vec2 {
+    let radians = (angle as f32 / u16::MAX as f32) * std::f32::consts::TAU;
+    Vec2::new(radians.cos(), radians.sin()).normalized_or_zero()
+}
+
+fn stable_node_seed(
+    node_id: SupportNodeId,
+    voxels: &[GridCoord],
+    material_id: u16,
+    orientation_summary: Option<u16>,
+) -> u64 {
     let mut hasher = Fnva64::default();
     hasher.write_u32(node_id.0);
     hasher.write_u32(material_id as u32);
+    hasher.write_u32(orientation_summary.map_or(u32::MAX, u32::from));
     for voxel in voxels {
         hasher.write_u32(voxel.x);
         hasher.write_u32(voxel.y);
@@ -1523,6 +1833,10 @@ fn compare_fragment_for_keep(
         .then_with(|| b_min.cmp(&a_min))
 }
 
+fn valid_runtime_scalar(value: f32) -> bool {
+    value.is_finite() && value >= 0.0
+}
+
 #[derive(Clone, Debug)]
 struct Fnva64(u64);
 
@@ -1593,6 +1907,23 @@ mod tests {
 
     fn family_for(asset: FxAsset) -> FxFamily {
         FxFamily::instantiate(FxFamilyId(3), asset)
+    }
+
+    fn repair_plan_from_family(family: &FxFamily) -> RepairPlan {
+        RepairPlan {
+            asset: family.asset().clone(),
+            node_owners: family
+                .node_owner
+                .iter()
+                .map(|(node, actor)| (*node, *actor))
+                .collect(),
+            node_states: family
+                .node_states()
+                .map(|(node, state)| (node, state.clone()))
+                .collect(),
+            bond_states: family.bond_states().to_vec(),
+            dirty_actors: vec![],
+        }
     }
 
     #[test]
@@ -1931,6 +2262,234 @@ mod tests {
     }
 
     #[test]
+    fn apply_repair_plan_preserves_actor_order() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let asset = family.asset().clone();
+        let bond_states = asset
+            .internal_bonds()
+            .iter()
+            .map(|bond| BondRuntimeState {
+                health: bond.base_health,
+                effective_length: bond.length,
+                accumulated_damage: 0.0,
+            })
+            .collect();
+        let plan = RepairPlan {
+            asset,
+            node_owners: vec![
+                (SupportNodeId(1), FxActorId(1)),
+                (SupportNodeId(0), FxActorId(0)),
+            ],
+            node_states: vec![
+                (
+                    SupportNodeId(0),
+                    NodeRuntimeState {
+                        health: 1.0,
+                        accumulated_damage: 0.0,
+                    },
+                ),
+                (
+                    SupportNodeId(1),
+                    NodeRuntimeState {
+                        health: 1.0,
+                        accumulated_damage: 0.0,
+                    },
+                ),
+            ],
+            bond_states,
+            dirty_actors: vec![FxActorId(1), FxActorId(0)],
+        };
+        let summary = family.apply_repair_plan(plan).unwrap();
+        assert_eq!(summary.actor_order, vec![FxActorId(0), FxActorId(1)]);
+        assert_eq!(summary.dirty_actors, vec![FxActorId(0), FxActorId(1)]);
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_missing_node_owner() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let asset = family.asset().clone();
+        let bond_states = asset
+            .internal_bonds()
+            .iter()
+            .map(|bond| BondRuntimeState {
+                health: bond.base_health,
+                effective_length: bond.length,
+                accumulated_damage: 0.0,
+            })
+            .collect();
+        let err = family
+            .apply_repair_plan(RepairPlan {
+                asset,
+                node_owners: vec![(SupportNodeId(0), FxActorId(0))],
+                node_states: vec![
+                    (
+                        SupportNodeId(0),
+                        NodeRuntimeState {
+                            health: 1.0,
+                            accumulated_damage: 0.0,
+                        },
+                    ),
+                    (
+                        SupportNodeId(1),
+                        NodeRuntimeState {
+                            health: 1.0,
+                            accumulated_damage: 0.0,
+                        },
+                    ),
+                ],
+                bond_states,
+                dirty_actors: vec![],
+            })
+            .unwrap_err();
+        assert_eq!(err, RepairError::MissingNodeOwner(SupportNodeId(1)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_invalid_node_runtime_state() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let mut plan = repair_plan_from_family(&family);
+        plan.node_states[0].1.health = f32::NAN;
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::InvalidNodeState(SupportNodeId(0)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_invalid_bond_runtime_state() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let mut plan = repair_plan_from_family(&family);
+        plan.bond_states[0].effective_length = -1.0;
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::InvalidBondState(BondId(0)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_unknown_dirty_actor() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let mut plan = repair_plan_from_family(&family);
+        plan.dirty_actors = vec![FxActorId(99)];
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::UnknownDirtyActor(FxActorId(99)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_old_only_dirty_actor() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let plan = RepairPlan {
+            asset: asset_from_rows(&["#"], &[Some(0)]),
+            node_owners: vec![(SupportNodeId(0), FxActorId(0))],
+            node_states: vec![(
+                SupportNodeId(0),
+                family.node_state(SupportNodeId(0)).unwrap().clone(),
+            )],
+            bond_states: vec![],
+            dirty_actors: vec![FxActorId(1)],
+        };
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::UnknownDirtyActor(FxActorId(1)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_changed_actor_not_dirty() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let mut plan = repair_plan_from_family(&family);
+        plan.node_owners = vec![
+            (SupportNodeId(0), FxActorId(0)),
+            (SupportNodeId(1), FxActorId(0)),
+        ];
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::ActorChangedNotDirty(FxActorId(0)));
+    }
+
+    #[test]
+    fn apply_repair_plan_rejects_disconnected_actor_not_dirty() {
+        let mut family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
+        let mut plan = repair_plan_from_family(&family);
+        plan.bond_states[1].health = 0.0;
+        let err = family.apply_repair_plan(plan).unwrap_err();
+        assert_eq!(err, RepairError::DisconnectedActorNotDirty(FxActorId(0)));
+    }
+
+    #[test]
+    fn apply_repair_plan_digest_changes_on_asset_overlay() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let before = family.deterministic_state_digest();
+        let asset = asset_from_rows(&["#"], &[Some(0)]);
+        let plan = RepairPlan {
+            bond_states: vec![],
+            node_owners: vec![(SupportNodeId(0), FxActorId(0))],
+            node_states: vec![(
+                SupportNodeId(0),
+                NodeRuntimeState {
+                    health: 1.0,
+                    accumulated_damage: 0.0,
+                },
+            )],
+            asset,
+            dirty_actors: vec![FxActorId(0)],
+        };
+        family.apply_repair_plan(plan).unwrap();
+        assert_ne!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn node_health_damage_and_repair_transfer() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Node(SupportNodeId(0)),
+            health_loss: 0.25,
+            effective_length_loss: 0.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[command]);
+        assert_eq!(family.node_state(SupportNodeId(0)).unwrap().health, 0.75);
+        let asset = family.asset().clone();
+        let plan = RepairPlan {
+            asset: asset.clone(),
+            node_owners: vec![
+                (SupportNodeId(0), FxActorId(0)),
+                (SupportNodeId(1), FxActorId(0)),
+            ],
+            node_states: vec![
+                (
+                    SupportNodeId(0),
+                    family.node_state(SupportNodeId(0)).unwrap().clone(),
+                ),
+                (
+                    SupportNodeId(1),
+                    family.node_state(SupportNodeId(1)).unwrap().clone(),
+                ),
+            ],
+            bond_states: family.bond_states().to_vec(),
+            dirty_actors: vec![FxActorId(0)],
+        };
+        family.apply_repair_plan(plan).unwrap();
+        assert_eq!(family.node_state(SupportNodeId(0)).unwrap().health, 0.75);
+    }
+
+    #[test]
+    fn repair_plan_marks_dirty_actors_for_split() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let asset = family.asset().clone();
+        let plan = RepairPlan {
+            asset,
+            node_owners: vec![
+                (SupportNodeId(0), FxActorId(0)),
+                (SupportNodeId(1), FxActorId(0)),
+            ],
+            node_states: family
+                .node_states()
+                .map(|(node, state)| (node, state.clone()))
+                .collect(),
+            bond_states: family.bond_states().to_vec(),
+            dirty_actors: vec![FxActorId(0)],
+        };
+        family.apply_repair_plan(plan).unwrap();
+        assert!(family.is_dirty(FxActorId(0)));
+    }
+
+    #[test]
     fn split_single_island_noop() {
         let mut family = family_for(chain_asset());
         family.mark_actor_dirty_for_test(FxActorId(0));
@@ -2139,6 +2698,24 @@ mod tests {
             effective_length,
             family.bond_state(BondId(0)).unwrap().effective_length
         );
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn node_target_effective_length_only_is_noop() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let before = family.deterministic_state_digest();
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Node(SupportNodeId(0)),
+            health_loss: 0.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        let events = apply_fracture_commands(&mut family, &[command]);
+        assert!(events.is_empty());
+        assert!(!family.is_dirty(FxActorId(0)));
         assert_eq!(before, family.deterministic_state_digest());
     }
 
