@@ -20,7 +20,10 @@ pub mod replay;
 pub mod snapshot;
 pub mod world;
 
-pub use collider_sync::{ActorPhysicsHandles, DestructibleActorRef, VoxelContact};
+pub use collider_sync::{
+    ActorColliderBuildKind, ActorPhysicsHandles, ColliderLodSettings, DestructibleActorRef,
+    FxPhysicsSyncReport, VoxelContact,
+};
 pub use connect_api::{
     DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
@@ -28,7 +31,10 @@ pub use contact_map::{ContactPairMapping, ContactPairSide};
 pub use hooks::{ContactMaterialProperties, HookObservation};
 pub use impulse_readback::{ContactImpulseInput, TrackedContactImpulse};
 pub use joint_feedback::JointFeedbackStress;
-pub use pipeline::FxStepReport;
+pub use pipeline::{
+    ACTIVE_BODY_BUDGET, FxGlobalStressCapReport, FxPerformanceBudgetReport, FxStepDiagnostics,
+    FxStepReport, FxStepWithDiagnostics, OCCUPIED_VOXEL_BUDGET, SUPPORT_NODE_BUDGET,
+};
 pub use replay::{
     FxRapierReplayCommand, FxRapierReplayTickReport, ReplayTrace, ReplayTraceActorBody,
 };

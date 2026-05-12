@@ -1963,12 +1963,41 @@ pub struct StressSolver2D {
     pub settings: StressSettings,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StressProfile {
+    pub input_count: usize,
+    pub actor_count_visited: usize,
+    pub actors_with_input: usize,
+    pub internal_bond_candidates: usize,
+    pub internal_bonds_tested: usize,
+    pub external_bond_candidates: usize,
+    pub external_bonds_tested: usize,
+    pub dynamic_structural_bonds_tested: usize,
+    pub generated_commands_before_cap: usize,
+    pub generated_commands_after_cap: usize,
+    pub frame_cap: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StressSolveReport {
+    pub commands: Vec<FractureCommand>,
+    pub profile: StressProfile,
+}
+
 impl StressSolver2D {
     pub fn new(settings: StressSettings) -> Self {
         Self { settings }
     }
 
     pub fn generate(&self, family: &FxFamily, inputs: &[StressInput]) -> Vec<FractureCommand> {
+        self.generate_with_profile(family, inputs).commands
+    }
+
+    pub fn generate_with_profile(
+        &self,
+        family: &FxFamily,
+        inputs: &[StressInput],
+    ) -> StressSolveReport {
         let mut force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
         let mut first_key_by_actor: BTreeMap<FxActorId, DeterministicOrderKey> = BTreeMap::new();
         let mut source_by_actor: BTreeMap<FxActorId, DamageSource> = BTreeMap::new();
@@ -2007,8 +2036,15 @@ impl StressSolver2D {
             }
         }
 
+        let mut profile = StressProfile {
+            input_count: inputs.len(),
+            actors_with_input: first_key_by_actor.len(),
+            frame_cap: self.settings.max_fractures_per_frame,
+            ..StressProfile::default()
+        };
         let mut commands = Vec::new();
         for (actor_id, actor) in &family.actors {
+            profile.actor_count_visited += 1;
             let Some(order_key) = first_key_by_actor.get(actor_id).copied() else {
                 continue;
             };
@@ -2018,12 +2054,14 @@ impl StressSolver2D {
                 if !owned.contains(&bond.node_a) || !owned.contains(&bond.node_b) {
                     continue;
                 }
+                profile.internal_bond_candidates += 1;
                 if family
                     .bond_state(bond.id)
                     .is_none_or(BondRuntimeState::is_broken)
                 {
                     continue;
                 }
+                profile.internal_bonds_tested += 1;
                 let side_a = component_without_bond(actor, family, bond.node_a, Some(bond.id));
                 let side_b = component_without_bond(actor, family, bond.node_b, Some(bond.id));
                 let force_a = side_a.iter().fold(Vec2::ZERO, |acc, node| {
@@ -2095,6 +2133,7 @@ impl StressSolver2D {
                 let Some(actor_b) = family.actor(owner_b) else {
                     continue;
                 };
+                profile.dynamic_structural_bonds_tested += 1;
                 let side_a = component_without_dynamic_connection(
                     actor_a,
                     family,
@@ -2152,9 +2191,14 @@ impl StressSolver2D {
                 }
             }
             for bond in family.external_bonds.values() {
-                if !owned.contains(&bond.node) || bond.runtime.is_broken() {
+                if !owned.contains(&bond.node) {
                     continue;
                 }
+                profile.external_bond_candidates += 1;
+                if bond.runtime.is_broken() {
+                    continue;
+                }
+                profile.external_bonds_tested += 1;
                 let side = component_without_bond(actor, family, bond.node, None);
                 let force = side.iter().fold(Vec2::ZERO, |acc, node| {
                     acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
@@ -2188,12 +2232,13 @@ impl StressSolver2D {
                     });
                 }
             }
-            sort_fracture_commands(&mut actor_commands);
+            profile.generated_commands_before_cap += actor_commands.len();
             actor_commands.truncate(self.settings.max_fractures_per_frame as usize);
+            profile.generated_commands_after_cap += actor_commands.len();
             commands.extend(actor_commands);
         }
         sort_fracture_commands(&mut commands);
-        commands
+        StressSolveReport { commands, profile }
     }
 }
 
@@ -3451,6 +3496,41 @@ mod tests {
     }
 
     #[test]
+    fn stress_generate_with_profile_reports_deterministic_counters() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let report = solver.generate_with_profile(&family, &[input.clone()]);
+
+        assert_eq!(report.commands.len(), 1);
+        assert_eq!(report.profile.input_count, 1);
+        assert_eq!(report.profile.actor_count_visited, 1);
+        assert_eq!(report.profile.actors_with_input, 1);
+        assert_eq!(report.profile.internal_bond_candidates, 1);
+        assert_eq!(report.profile.internal_bonds_tested, 1);
+        assert_eq!(report.profile.external_bond_candidates, 0);
+        assert_eq!(report.profile.external_bonds_tested, 0);
+        assert_eq!(report.profile.dynamic_structural_bonds_tested, 0);
+        assert_eq!(report.profile.generated_commands_before_cap, 1);
+        assert_eq!(report.profile.generated_commands_after_cap, 1);
+        assert_eq!(report.profile.frame_cap, 1);
+        assert_eq!(
+            solver.generate(&family, &[input]).len(),
+            report.commands.len()
+        );
+    }
+
+    #[test]
     fn deterministic_component_order_independent_of_adjacency() {
         let mut family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
         let commands = vec![
@@ -3659,6 +3739,73 @@ mod tests {
         assert!(
             solver.generate(&family, &[input]).is_empty(),
             "broken external anchors must stop acting as fixed endpoints"
+        );
+    }
+
+    #[test]
+    fn stress_frame_cap_is_per_actor() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let _anchor0 = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let _anchor1 = family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        });
+        let report = solver.generate_with_profile(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(2),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+        assert_eq!(report.profile.input_count, 2);
+        assert_eq!(report.profile.actor_count_visited, 2);
+        assert_eq!(report.profile.actors_with_input, 2);
+        assert_eq!(report.profile.external_bond_candidates, 2);
+        assert_eq!(report.profile.external_bonds_tested, 2);
+        assert_eq!(report.profile.generated_commands_before_cap, 2);
+        assert_eq!(report.profile.generated_commands_after_cap, 2);
+        assert_eq!(report.profile.frame_cap, 1);
+        assert_eq!(report.commands.len(), 2);
+        assert_eq!(solver.generate(&family, &[]).len(), 0);
+        assert_eq!(report.commands[0].actor, FxActorId(0));
+        assert_eq!(
+            report.commands[0].target,
+            FractureTarget::ExternalBond(ExternalBondId(7))
+        );
+        assert_eq!(report.commands[1].actor, FxActorId(1));
+        assert_eq!(
+            report.commands[1].target,
+            FractureTarget::ExternalBond(ExternalBondId(8))
         );
     }
 

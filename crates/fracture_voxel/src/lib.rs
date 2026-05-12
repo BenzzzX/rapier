@@ -93,6 +93,12 @@ pub struct VoxelMetadata {
     pub orientation: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoxelAssetMetrics {
+    pub occupied_voxels: usize,
+    pub support_nodes: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthoredVoxelAsset {
     core: FxAsset,
@@ -136,6 +142,19 @@ impl AuthoredVoxelAsset {
 
     pub fn orientation_map(&self) -> Option<&[u16]> {
         self.orientation.as_deref()
+    }
+
+    pub fn metrics(&self) -> VoxelAssetMetrics {
+        VoxelAssetMetrics {
+            occupied_voxels: self
+                .core
+                .occupancy()
+                .cells()
+                .iter()
+                .filter(|cell| **cell)
+                .count(),
+            support_nodes: self.core.support_nodes().len(),
+        }
     }
 
     pub fn voxel_metadata(&self, coord: GridCoord) -> Result<VoxelMetadata, VoxelError> {
@@ -1501,6 +1520,19 @@ mod tests {
         let asset = author_voxel_asset(input_from_rows(&["##"], &[1, 2])).unwrap();
         assert_eq!(asset.core().support_nodes().len(), 2);
         assert_eq!(asset.core().internal_bonds().len(), 1);
+    }
+
+    #[test]
+    fn asset_metrics_count_occupied_voxels_and_support_nodes() {
+        let asset =
+            author_voxel_asset(input_from_rows(&["#.#", "###"], &[1, 0, 2, 1, 1, 2])).unwrap();
+        assert_eq!(
+            asset.metrics(),
+            VoxelAssetMetrics {
+                occupied_voxels: 5,
+                support_nodes: 2,
+            }
+        );
     }
 
     #[test]

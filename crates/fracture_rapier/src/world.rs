@@ -1,18 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fracture_core::{
-    ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FxActorId, FxFamily,
-    FxFamilyId, MergeActorsResult, SplitEvent, StressSettings, StressSolver2D, Vec2,
-    apply_fracture_commands,
+    ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FractureCommand,
+    FxActorId, FxFamily, FxFamilyId, MergeActorsResult, SplitEvent, StressSettings, StressSolver2D,
+    Vec2, apply_fracture_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
-    split_dirty_actors,
+    sort_fracture_commands, split_dirty_actors,
 };
 use fracture_voxel::AuthoredVoxelAsset;
 use rapier2d::prelude::*;
 use thiserror::Error;
 
 use crate::collider_sync::{
-    ActorPhysicsHandles, DestructibleActorRef, actor_body_builder_at, actor_collider_build,
+    ActorColliderBuildKind, ActorPhysicsHandles, ColliderLodSettings, DestructibleActorRef,
+    FxPhysicsSyncReport, VoxelContact, actor_body_builder_at, actor_collider_build,
     actor_default_contact_material,
 };
 use crate::connect_api::{
@@ -22,7 +23,10 @@ use crate::contact_map::{collider_key, rigid_body_key};
 use crate::hooks::{ContactMaterialProperties, FxContactHooks, HookObservation};
 use crate::impulse_readback::collect_contact_impulse_inputs;
 use crate::joint_feedback::collect_joint_feedback_stress;
-use crate::pipeline::FxStepReport;
+use crate::pipeline::{
+    ACTIVE_BODY_BUDGET, FxPerformanceBudgetReport, FxStepDiagnostics, FxStepReport,
+    FxStepWithDiagnostics, OCCUPIED_VOXEL_BUDGET, SUPPORT_NODE_BUDGET,
+};
 use crate::replay::{FxRapierReplayCommand, FxRapierReplayTickReport, sort_replay_commands};
 use crate::snapshot::{
     ActorPhysicsSnapshot, AppliedStaticAnchorPolicySnapshot, BodyActorSnapshot,
@@ -79,6 +83,42 @@ pub(crate) struct ActorPhysicsState {
     pub(crate) body_local_origin_in_asset: Vec2,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum VoxelMetadataValidation {
+    Exact,
+    Captured,
+}
+
+impl VoxelMetadataValidation {
+    fn accepts(self, actual: &[VoxelContact], expected: &[VoxelContact]) -> bool {
+        match self {
+            Self::Exact => actual == expected,
+            Self::Captured => {
+                let mut expected_contacts = BTreeSet::new();
+                for contact in expected {
+                    expected_contacts.insert(voxel_contact_key(contact));
+                }
+                let mut actual_contacts = BTreeSet::new();
+                !actual.is_empty()
+                    && actual.iter().all(|contact| {
+                        let key = voxel_contact_key(contact);
+                        expected_contacts.contains(&key) && actual_contacts.insert(key)
+                    })
+            }
+        }
+    }
+}
+
+fn voxel_contact_key(contact: &VoxelContact) -> (u32, u32, u32, u16, u32) {
+    (
+        contact.coord.x,
+        contact.coord.y,
+        contact.node.0,
+        contact.contact_material,
+        contact.subshape,
+    )
+}
+
 pub struct FxRapierWorld2D {
     pub(crate) gravity: Vector,
     pub(crate) integration_parameters: IntegrationParameters,
@@ -93,6 +133,7 @@ pub struct FxRapierWorld2D {
     ccd_solver: CCDSolver,
     hooks: FxContactHooks,
     stress_solver: StressSolver2D,
+    lod_settings: ColliderLodSettings,
     pub(crate) families: BTreeMap<FxFamilyId, DestructibleFamily>,
     body_actors: BTreeMap<(u32, u32), DestructibleActorRef>,
     static_anchor_policies: BTreeMap<(FxFamilyId, ExternalBondId), StaticAnchorBodyPolicy>,
@@ -136,6 +177,7 @@ impl FxRapierWorld2D {
             ccd_solver: CCDSolver::new(),
             hooks: FxContactHooks::new(),
             stress_solver: StressSolver2D::new(StressSettings::default()),
+            lod_settings: ColliderLodSettings::default(),
             families: BTreeMap::new(),
             body_actors: BTreeMap::new(),
             static_anchor_policies: BTreeMap::new(),
@@ -152,6 +194,51 @@ impl FxRapierWorld2D {
 
     pub fn stress_settings(&self) -> StressSettings {
         self.stress_solver.settings
+    }
+
+    pub fn lod_settings(&self) -> ColliderLodSettings {
+        self.lod_settings
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lod_settings(&mut self, settings: ColliderLodSettings) {
+        self.lod_settings = settings;
+    }
+
+    pub fn performance_budget_report(&self) -> FxPerformanceBudgetReport {
+        let (occupied_voxels, support_nodes) =
+            self.families
+                .values()
+                .fold((0usize, 0usize), |(occupied, support), entry| {
+                    let metrics = entry.asset.metrics();
+                    (
+                        occupied + metrics.occupied_voxels,
+                        support + metrics.support_nodes,
+                    )
+                });
+        FxPerformanceBudgetReport {
+            occupied_voxels,
+            occupied_voxel_budget: OCCUPIED_VOXEL_BUDGET,
+            support_nodes,
+            support_node_budget: SUPPORT_NODE_BUDGET,
+            active_bodies: self
+                .families
+                .values()
+                .map(|entry| entry.physics.len())
+                .sum(),
+            active_body_budget: ACTIVE_BODY_BUDGET,
+        }
+    }
+
+    pub fn validate_performance_budget(
+        &self,
+    ) -> Result<FxPerformanceBudgetReport, FxPerformanceBudgetReport> {
+        let report = self.performance_budget_report();
+        if report.within_budget() {
+            Ok(report)
+        } else {
+            Err(report)
+        }
     }
 
     pub fn gravity(&self) -> Vector {
@@ -176,6 +263,9 @@ impl FxRapierWorld2D {
 
     pub fn set_snapshot_mode(&mut self, mode: SnapshotMode) {
         self.snapshot_mode = mode;
+        if mode == SnapshotMode::Deterministic {
+            self.lod_settings = ColliderLodSettings::disabled();
+        }
     }
 
     pub fn tick(&self) -> u64 {
@@ -184,6 +274,7 @@ impl FxRapierWorld2D {
 
     pub fn snapshot(&self) -> Result<Vec<u8>, FxRapierError> {
         ensure_snapshot_mode_available(self.snapshot_mode)?;
+        ensure_deterministic_lod_disabled(self.snapshot_mode, self.lod_settings)?;
         Ok(encode_world_snapshot(&self.capture_snapshot()?))
     }
 
@@ -443,6 +534,10 @@ impl FxRapierWorld2D {
     }
 
     pub fn step(&mut self) -> Result<FxStepReport, FxRapierError> {
+        Ok(self.step_with_diagnostics()?.into_report())
+    }
+
+    pub fn step_with_diagnostics(&mut self) -> Result<FxStepWithDiagnostics, FxRapierError> {
         let family_ids = self.families.keys().copied().collect::<Vec<_>>();
         for family_id in family_ids {
             self.sync_family_actors(family_id)?;
@@ -502,37 +597,162 @@ impl FxRapierWorld2D {
             joint_feedback,
             ..FxStepReport::default()
         };
+        let mut diagnostics = FxStepDiagnostics::default();
 
+        self.apply_step_stress_inputs(&mut report, &mut diagnostics)?;
+
+        diagnostics.budget = Some(self.performance_budget_report());
+        self.tick += 1;
+        Ok(FxStepWithDiagnostics {
+            report,
+            diagnostics,
+        })
+    }
+
+    fn apply_step_stress_inputs(
+        &mut self,
+        report: &mut FxStepReport,
+        diagnostics: &mut FxStepDiagnostics,
+    ) -> Result<(), FxRapierError> {
         let family_ids = self.families.keys().copied().collect::<Vec<_>>();
-        for family_id in family_ids {
+        let global_cap = self.stress_solver.settings.max_fractures_per_frame;
+        let mut uncapped_settings = self.stress_solver.settings;
+        uncapped_settings.max_fractures_per_frame = u16::MAX;
+        let uncapped_solver = StressSolver2D::new(uncapped_settings);
+        let mut family_profiles = BTreeMap::new();
+        let mut candidate_commands = Vec::new();
+        let mut input_family_count = 0usize;
+
+        for family_id in &family_ids {
             let stress_inputs = report
                 .stress_inputs
                 .iter()
-                .filter(|input| input.order_key.family_id == family_id)
+                .filter(|input| input.order_key.family_id == *family_id)
                 .cloned()
                 .collect::<Vec<_>>();
+            if !stress_inputs.is_empty() {
+                input_family_count += 1;
+            }
+            let Some(entry) = self.families.get(family_id) else {
+                return Err(FxRapierError::UnknownFamily(*family_id));
+            };
+            let stress_report =
+                uncapped_solver.generate_with_profile(&entry.family, &stress_inputs);
+            let mut profile = stress_report.profile;
+            profile.frame_cap = global_cap;
+            profile.generated_commands_after_cap = 0;
+            family_profiles.insert(*family_id, profile);
+            candidate_commands.extend(stress_report.commands);
+        }
+
+        sort_fracture_commands(&mut candidate_commands);
+        let generated_commands_before_cap = candidate_commands.len();
+        candidate_commands.truncate(global_cap as usize);
+        let generated_commands_after_cap = candidate_commands.len();
+
+        let mut selected_by_family: BTreeMap<FxFamilyId, Vec<FractureCommand>> = BTreeMap::new();
+        for command in candidate_commands {
+            selected_by_family
+                .entry(command.order_key.family_id)
+                .or_default()
+                .push(command);
+        }
+        for (family_id, commands) in &selected_by_family {
+            if let Some(profile) = family_profiles.get_mut(family_id) {
+                profile.generated_commands_after_cap = commands.len();
+            }
+        }
+
+        diagnostics.global_stress_cap.input_count = report.stress_inputs.len();
+        diagnostics.global_stress_cap.family_count = input_family_count;
+        diagnostics.global_stress_cap.generated_commands_before_cap = generated_commands_before_cap;
+        diagnostics.global_stress_cap.generated_commands_after_cap = generated_commands_after_cap;
+        diagnostics.global_stress_cap.frame_cap = global_cap;
+        diagnostics.stress_profiles.extend(
+            family_ids
+                .iter()
+                .filter_map(|id| family_profiles.remove(id)),
+        );
+
+        for family_id in family_ids {
             let parent_snapshots = self.snapshot_family_bodies(family_id);
             let split_events = {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
-                let commands = self.stress_solver.generate(&entry.family, &stress_inputs);
-                report
-                    .fracture_events
-                    .extend(apply_fracture_commands(&mut entry.family, &commands));
+                if let Some(commands) = selected_by_family.get(&family_id) {
+                    report
+                        .fracture_events
+                        .extend(apply_fracture_commands(&mut entry.family, commands));
+                }
                 split_dirty_actors(&mut entry.family)
             };
-            let split_happened = !split_events.is_empty();
-            if split_happened {
-                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            if !split_events.is_empty() {
+                let sync_report =
+                    self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+                diagnostics.physics_sync.absorb(sync_report);
             } else {
                 self.reconcile_static_anchor_body_policies(family_id)?;
             }
             report.split_events.extend(split_events);
         }
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_with_stress_inputs_for_test(
+        &mut self,
+        stress_inputs: Vec<fracture_core::StressInput>,
+    ) -> Result<FxStepWithDiagnostics, FxRapierError> {
+        let mut report = FxStepReport {
+            stress_inputs,
+            ..FxStepReport::default()
+        };
+        let mut diagnostics = FxStepDiagnostics::default();
+        self.apply_step_stress_inputs(&mut report, &mut diagnostics)?;
+        diagnostics.budget = Some(self.performance_budget_report());
         self.tick += 1;
-        Ok(report)
+        Ok(FxStepWithDiagnostics {
+            report,
+            diagnostics,
+        })
+    }
+
+    pub fn apply_fracture_commands_to_family(
+        &mut self,
+        family_id: FxFamilyId,
+        commands: &[fracture_core::FractureCommand],
+    ) -> Result<FxStepWithDiagnostics, FxRapierError> {
+        self.sync_family_actors(family_id)?;
+        let parent_snapshots = self.snapshot_family_bodies(family_id);
+        let split_events = {
+            let Some(entry) = self.families.get_mut(&family_id) else {
+                return Err(FxRapierError::UnknownFamily(family_id));
+            };
+            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+            let split_events = split_dirty_actors(&mut entry.family);
+            (fracture_events, split_events)
+        };
+        let (fracture_events, split_events) = split_events;
+        let report = FxStepReport {
+            fracture_events,
+            split_events: split_events.clone(),
+            ..FxStepReport::default()
+        };
+        let mut diagnostics = FxStepDiagnostics::default();
+        if !split_events.is_empty() {
+            let sync_report =
+                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            diagnostics.physics_sync.absorb(sync_report);
+        } else {
+            self.reconcile_static_anchor_body_policies(family_id)?;
+        }
+        diagnostics.budget = Some(self.performance_budget_report());
+        Ok(FxStepWithDiagnostics {
+            report,
+            diagnostics,
+        })
     }
 
     pub fn apply_replay_tick(
@@ -544,6 +764,7 @@ impl FxRapierWorld2D {
             return Err(FxRapierError::ReplayRequiresDeterministicMode);
         }
         ensure_snapshot_mode_available(self.snapshot_mode)?;
+        ensure_deterministic_lod_disabled(self.snapshot_mode, self.lod_settings)?;
         crate::replay::validate_replay_commands(commands)?;
         for family_id in self.family_ids() {
             self.sync_family_actors(family_id)?;
@@ -583,7 +804,8 @@ impl FxRapierWorld2D {
                 split_dirty_actors(&mut entry.family)
             };
             if !split_events.is_empty() {
-                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+                let _sync_report =
+                    self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
             } else {
                 self.reconcile_static_anchor_body_policies(family_id)?;
             }
@@ -608,11 +830,36 @@ impl FxRapierWorld2D {
             split_dirty_actors(&mut entry.family)
         };
         if !split_events.is_empty() {
-            self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            let _sync_report =
+                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
         } else {
             self.reconcile_static_anchor_body_policies(family_id)?;
         }
         Ok(split_events)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fracture_and_sync_report_for_test(
+        &mut self,
+        family_id: FxFamilyId,
+        commands: &[fracture_core::FractureCommand],
+    ) -> Result<(Vec<SplitEvent>, FxPhysicsSyncReport), FxRapierError> {
+        self.sync_family_actors(family_id)?;
+        let parent_snapshots = self.snapshot_family_bodies(family_id);
+        let split_events = {
+            let Some(entry) = self.families.get_mut(&family_id) else {
+                return Err(FxRapierError::UnknownFamily(family_id));
+            };
+            apply_fracture_commands(&mut entry.family, commands);
+            split_dirty_actors(&mut entry.family)
+        };
+        let sync_report = if !split_events.is_empty() {
+            self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?
+        } else {
+            self.reconcile_static_anchor_body_policies(family_id)?;
+            FxPhysicsSyncReport::default()
+        };
+        Ok((split_events, sync_report))
     }
 
     #[cfg(test)]
@@ -633,7 +880,8 @@ impl FxRapierWorld2D {
             split_dirty_actors(&mut entry.family)
         };
         if !split_events.is_empty() {
-            self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            let _sync_report =
+                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
         } else {
             self.reconcile_static_anchor_body_policies(family_id)?;
         }
@@ -672,7 +920,8 @@ impl FxRapierWorld2D {
                 split_dirty_actors(&mut entry.family)
             };
             if !split_events.is_empty() {
-                self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+                let _sync_report =
+                    self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
             } else {
                 self.reconcile_static_anchor_body_policies(family_id)?;
             }
@@ -692,7 +941,7 @@ impl FxRapierWorld2D {
             .read()
             .expect("contact material registry poisoned")
             .clone();
-        self.validate_checkpoint_state(&registry)?;
+        self.validate_checkpoint_state(&registry, VoxelMetadataValidation::Exact)?;
         let mut families = Vec::new();
         let mut actor_physics = Vec::new();
         for (family_id, entry) in &self.families {
@@ -848,6 +1097,11 @@ impl FxRapierWorld2D {
         world.gravity = Vector::new(snapshot.gravity[0], snapshot.gravity[1]);
         apply_integration_snapshot(&mut world.integration_parameters, snapshot.integration);
         world.stress_solver = StressSolver2D::new(stress_from_snapshot(snapshot.stress));
+        world.lod_settings = if snapshot.mode == SnapshotMode::Deterministic {
+            ColliderLodSettings::disabled()
+        } else {
+            ColliderLodSettings::default()
+        };
         let rapier = decode_rapier_owned_state(&snapshot.rapier_owned_state)?;
         world.bodies = rapier.bodies;
         world.colliders = rapier.colliders;
@@ -1018,7 +1272,7 @@ impl FxRapierWorld2D {
         {
             let registry = world.hooks.registry();
             let registry = registry.read().expect("contact material registry poisoned");
-            world.validate_checkpoint_state(&registry)?;
+            world.validate_checkpoint_state(&registry, VoxelMetadataValidation::Captured)?;
         }
         Ok(world)
     }
@@ -1026,6 +1280,7 @@ impl FxRapierWorld2D {
     fn validate_checkpoint_state(
         &self,
         registry: &crate::hooks::ContactMaterialRegistry,
+        voxel_metadata: VoxelMetadataValidation,
     ) -> Result<(), FxRapierError> {
         let mut managed_body_keys = BTreeSet::new();
         let mut managed_collider_keys = BTreeSet::new();
@@ -1115,17 +1370,22 @@ impl FxRapierWorld2D {
                     &entry.asset,
                     state.body_local_origin_in_asset,
                     properties,
+                    self.lod_settings,
                 )
                 .ok_or(FxRapierSnapshotError::StateMismatch(
                     "actor collider metadata missing",
                 ))?
                 .voxels;
-                if registry
+                let Some(actual_voxels) = registry
                     .collider_voxels
                     .get(&collider_key(state.handles.collider))
-                    .map(Vec::as_slice)
-                    != Some(expected_voxels.as_slice())
-                {
+                else {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "collider voxel metadata mismatch",
+                    )
+                    .into());
+                };
+                if !voxel_metadata.accepts(actual_voxels, &expected_voxels) {
                     return Err(FxRapierSnapshotError::StateMismatch(
                         "collider voxel metadata mismatch",
                     )
@@ -1330,10 +1590,13 @@ impl FxRapierWorld2D {
         family_id: FxFamilyId,
         parent_snapshots: &BTreeMap<FxActorId, BodySnapshot>,
         split_events: &[SplitEvent],
-    ) -> Result<(), FxRapierError> {
+    ) -> Result<FxPhysicsSyncReport, FxRapierError> {
         // Rapier handle allocation order is not part of the deterministic contract; adapter
         // family/actor traversal and report append order are kept deterministic with BTree maps.
+        let mut report = FxPhysicsSyncReport::default();
         let mut child_snapshots = BTreeMap::new();
+        let mut touched_existing = BTreeSet::new();
+        let mut touched_created = BTreeSet::new();
         for event in split_events {
             let Some(parent_snapshot) = parent_snapshots.get(&event.parent_actor).copied() else {
                 if let Some(child) = event.created_children.first().copied() {
@@ -1345,8 +1608,11 @@ impl FxRapierWorld2D {
                 }
                 continue;
             };
+            touched_existing.insert(event.parent_actor);
+            touched_existing.insert(event.kept_actor);
             for child in &event.created_children {
                 child_snapshots.insert(*child, parent_snapshot);
+                touched_created.insert(*child);
             }
         }
         let existing = self
@@ -1366,29 +1632,41 @@ impl FxRapierWorld2D {
             .map(|(id, _)| *id)
             .collect::<BTreeSet<_>>();
         for actor in existing {
-            if live.contains(&actor) {
-                self.rebuild_actor_collider_preserving_body(
+            if !live.contains(&actor) {
+                if self.remove_actor_handles(family_id, actor) {
+                    report.removed_actor_bodies += 1;
+                }
+            } else if touched_existing.contains(&actor) {
+                if let Some(kind) = self.rebuild_actor_collider_preserving_body(
                     family_id,
                     actor,
                     parent_snapshots.get(&actor).copied(),
-                )?;
-            } else {
-                self.remove_actor_handles(family_id, actor);
+                )? {
+                    report.rebuilt_colliders += 1;
+                    report.record_kind(kind);
+                }
             }
         }
+        report.untouched_actor_count = live
+            .iter()
+            .filter(|actor| !touched_existing.contains(actor) && !touched_created.contains(actor))
+            .count();
         let actor_ids = live.into_iter().collect::<Vec<_>>();
         for actor_id in actor_ids {
             if self.actor_handles(family_id, actor_id).is_none() {
                 let parent_snapshot = child_snapshots.get(&actor_id).copied();
-                if child_snapshots.contains_key(&actor_id) {
-                    self.rebuild_actor_handles(family_id, actor_id, parent_snapshot)?;
-                } else {
-                    self.rebuild_actor_handles(family_id, actor_id, None)?;
+                let inherited = child_snapshots
+                    .contains_key(&actor_id)
+                    .then_some(parent_snapshot)
+                    .flatten();
+                if let Some(kind) = self.rebuild_actor_handles(family_id, actor_id, inherited)? {
+                    report.created_actor_bodies += 1;
+                    report.record_kind(kind);
                 }
             }
         }
         self.reconcile_static_anchor_body_policies(family_id)?;
-        Ok(())
+        Ok(report)
     }
 
     fn rebuild_actor_handles(
@@ -1396,7 +1674,7 @@ impl FxRapierWorld2D {
         family_id: FxFamilyId,
         actor_id: FxActorId,
         inherited: Option<BodySnapshot>,
-    ) -> Result<(), FxRapierError> {
+    ) -> Result<Option<ActorColliderBuildKind>, FxRapierError> {
         self.remove_actor_handles(family_id, actor_id);
         let entry = self
             .families
@@ -1423,11 +1701,16 @@ impl FxRapierWorld2D {
             .map(|snapshot| child_world_translation(snapshot, actor.local_com))
             .unwrap_or_else(|| Vector::new(actor.local_com.x, actor.local_com.y));
         let local_origin = actor.local_com;
-        let Some(collider_build) =
-            actor_collider_build(actor, &entry.asset, local_origin, properties)
-        else {
-            return Ok(());
+        let Some(collider_build) = actor_collider_build(
+            actor,
+            &entry.asset,
+            local_origin,
+            properties,
+            self.lod_settings,
+        ) else {
+            return Ok(None);
         };
+        let kind = collider_build.kind;
         let body = self
             .bodies
             .insert(actor_body_builder_at(actor, body_translation));
@@ -1468,7 +1751,7 @@ impl FxRapierWorld2D {
                     body_local_origin_in_asset: local_origin,
                 },
             );
-        Ok(())
+        Ok(Some(kind))
     }
 
     fn rebuild_actor_collider_preserving_body(
@@ -1476,7 +1759,7 @@ impl FxRapierWorld2D {
         family_id: FxFamilyId,
         actor_id: FxActorId,
         snapshot: Option<BodySnapshot>,
-    ) -> Result<(), FxRapierError> {
+    ) -> Result<Option<ActorColliderBuildKind>, FxRapierError> {
         let old_state = self
             .families
             .get(&family_id)
@@ -1529,11 +1812,16 @@ impl FxRapierWorld2D {
         let local_origin = snapshot
             .map(|snapshot| snapshot.body_local_origin_in_asset)
             .unwrap_or(old_state.body_local_origin_in_asset);
-        let Some(collider_build) =
-            actor_collider_build(actor, &entry.asset, local_origin, properties)
-        else {
-            return Ok(());
+        let Some(collider_build) = actor_collider_build(
+            actor,
+            &entry.asset,
+            local_origin,
+            properties,
+            self.lod_settings,
+        ) else {
+            return Ok(None);
         };
+        let kind = collider_build.kind;
         if let Some(snapshot) = snapshot {
             if let Some(body) = self.bodies.get_mut(old_handles.body) {
                 apply_body_snapshot(body, snapshot);
@@ -1575,17 +1863,17 @@ impl FxRapierWorld2D {
                     body_local_origin_in_asset: local_origin,
                 },
             );
-        Ok(())
+        Ok(Some(kind))
     }
 
-    fn remove_actor_handles(&mut self, family_id: FxFamilyId, actor_id: FxActorId) {
+    fn remove_actor_handles(&mut self, family_id: FxFamilyId, actor_id: FxActorId) -> bool {
         let handles = self
             .families
             .get_mut(&family_id)
             .and_then(|entry| entry.physics.remove(&actor_id))
             .map(|state| state.handles);
         let Some(handles) = handles else {
-            return;
+            return false;
         };
         {
             let registry = self.hooks.registry();
@@ -1608,6 +1896,7 @@ impl FxRapierWorld2D {
             &mut self.multibody_joints,
             true,
         );
+        true
     }
 
     fn set_actor_total_mass(
@@ -1805,6 +2094,16 @@ fn stress_from_snapshot(snapshot: StressSettingsSnapshot) -> StressSettings {
 pub(crate) fn ensure_snapshot_mode_available(mode: SnapshotMode) -> Result<(), FxRapierError> {
     if mode == SnapshotMode::Deterministic && !cfg!(feature = "deterministic-replay") {
         return Err(FxRapierSnapshotError::DeterministicReplayFeatureRequired.into());
+    }
+    Ok(())
+}
+
+fn ensure_deterministic_lod_disabled(
+    mode: SnapshotMode,
+    lod_settings: ColliderLodSettings,
+) -> Result<(), FxRapierError> {
+    if mode == SnapshotMode::Deterministic && lod_settings.enabled {
+        return Err(FxRapierSnapshotError::InvalidValue("deterministic lod").into());
     }
     Ok(())
 }
