@@ -1,0 +1,13 @@
+[package]
+name = "fracture_core"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true

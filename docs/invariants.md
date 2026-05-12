@@ -57,7 +57,7 @@ Required for Phase 1:
 - Runtime `bond_health`, `effective_length`, and `chunk_health` arrays have deterministic indexing keyed by asset or stable runtime IDs.
 - Broken bonds do not contribute to island connectivity.
 - Family ID allocation is deterministic in deterministic mode and monotonic within a core-local test state.
-- Phase 1 must expose enough core-local state for determinism tests: actor ownership, bond health, effective length, chunk health, external bond tokens, stable ID allocator state, and pending command order keys must be readable through a `deterministic_state_digest`, debug dump, or serializable test state.
+- Phase 1 must expose enough core-local state for determinism tests: actor ownership, bond health, effective length, chunk health, stable ID allocator state, and pending command order keys must be readable through a `deterministic_state_digest`, debug dump, or serializable test state. External bond state remains a Phase 4 forward concern and must not be required by the Phase 1 digest/readable state.
 - Full binary checkpoint format, full replay module, and long-running restore validation are Phase 5 responsibilities, not Phase 1 requirements.
 
 Suggested tests:
@@ -103,7 +103,7 @@ Suggested tests:
 - `support_node_material_summary_stable`: same source material map gives same summary and seed.
 - Phase 2 forward test name: `remove_voxel_splits_node` from plan 20.3 must preserve lineage for surviving parts.
 
-## `Bond2D` and `ExternalBond2D`
+## `Bond2D`
 
 Required for Phase 1:
 
@@ -115,19 +115,30 @@ Required for Phase 1:
 - Broken bonds are ignored by island connectivity and stress propagation.
 - Interface geometry is deterministic: centroid, normal, tangent, and length are computed from sorted interface edges or a stable equivalent.
 - Disconnected interface islands between the same node pair are separate bonds, not one merged bond.
-- `ExternalBond2D` has exactly one internal support node endpoint and one external target endpoint.
-- Phase 1 `ExternalBond2D` may use an opaque external endpoint or future enum token for `World`, static collider, kinematic target, dynamic merge, or dynamic structural bond.
-- Phase 1 only locks graph/stress semantics for static/world external endpoints. Dynamic merge and dynamic structural bond behavior/API belong to Phase 4 unless a later plan explicitly pulls them forward.
-- `ExternalBond2D` must not imply a default Rapier soft joint.
-- Static/world external endpoints act as fixed/infinite-mass endpoints for Phase 1 graph/stress semantics.
 
 Suggested tests:
 
 - `bond_generation_edge_scan` from plan 20.1: two nodes sharing edges produce length equal to shared edge count times `voxel_size`.
 - `disconnected_interface_expands_bonds` from plan 20.1: separated interfaces generate independent bonds.
 - `bond_rejects_self_loop`: `node_a == node_b` fails validation.
-- `explicit_static_anchor` from plan 20.3: anchor map produces world/external bond.
 - `stress_tension_break` and `stress_shear_break` from plan 20.2: over-limit forces produce fracture commands.
+
+## `ExternalBond2D`
+
+Phase 4 forward invariant:
+
+- `ExternalBond2D` is not a Phase 1 required implementation gate.
+- Phase 1 must not expose a public/runtime external connection API, mutate `FxFamily` through external bonds, or include external bond state in the Phase 1 deterministic digest.
+- Phase 4 must provide an explicit connection API for world/static external bonds, dynamic merge, and dynamic structural bond behavior.
+- A future `ExternalBond2D` has exactly one internal support node endpoint and one external target endpoint.
+- A future `ExternalBond2D` may use an opaque external endpoint or enum token for `World`, static collider, kinematic target, dynamic merge, or dynamic structural bond.
+- A future `ExternalBond2D` must not imply a default Rapier soft joint.
+- Future static/world external endpoints should act as fixed/infinite-mass endpoints for graph/stress semantics once the connection API is implemented.
+
+Forward tests:
+
+- `explicit_static_anchor` from plan 20.3 is deferred to Phase 4 connection API validation; it does not block the Phase 1 core commit.
+- Future Phase 4 tests should cover world/static anchors, dynamic merge, and dynamic structural bond graph semantics without default soft joints.
 
 ## `DamageCommand` and `FractureCommand` Flow
 
@@ -286,7 +297,7 @@ Phase 1 should not pass until these plan 20.1, 20.2, 20.3, and 20.5 obligations 
 | 20.3 | `remove_voxel_splits_node` | Phase 2 forward invariant; Phase 1 data lineage must support it |
 | 20.3 | `add_voxel_no_auto_merge` | Phase 2 forward invariant; no implicit merge behavior in Phase 1 |
 | 20.3 | `repair_preserves_bond_damage` | Phase 2 forward invariant; bond lineage/effective length must support it |
-| 20.3 | `explicit_static_anchor` | Required for `ExternalBond2D` graph semantics; full API may be later |
+| 20.3 | `explicit_static_anchor` | Phase 4 forward test for connection API; not required for Phase 1 core commit |
 | 20.3 | `dynamic_merge_conserves_momentum` | Later than Phase 1 unless dynamic merge policy is implemented early |
 | 20.5 | `deterministic_sort_commands` | Required |
 | 20.5 | `replay_split_order` | Required |

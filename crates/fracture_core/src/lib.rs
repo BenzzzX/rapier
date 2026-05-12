@@ -1,0 +1,2288 @@
+//! Engine-neutral 2D voxel fracture core.
+//!
+//! This crate intentionally has no Rapier or Parry dependency. It implements
+//! the Phase 1 in-memory loop: asset fixture -> family/actor -> bond health ->
+//! damage/stress generate -> apply -> split -> deterministic digest.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vec2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Vec2 {
+    pub const ZERO: Self = Self { x: 0.0, y: 0.0 };
+
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn dot(self, rhs: Self) -> f32 {
+        self.x * rhs.x + self.y * rhs.y
+    }
+
+    pub fn perp(self) -> Self {
+        Self::new(-self.y, self.x)
+    }
+
+    pub fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    pub fn normalized_or_zero(self) -> Self {
+        let len = self.length();
+        if len > 0.0 {
+            Self::new(self.x / len, self.y / len)
+        } else {
+            Self::ZERO
+        }
+    }
+}
+
+impl std::ops::Add for Vec2 {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y)
+    }
+}
+
+impl std::ops::AddAssign for Vec2 {
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+    }
+}
+
+impl std::ops::Sub for Vec2 {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
+impl std::ops::Mul<f32> for Vec2 {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs)
+    }
+}
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub u32);
+
+        impl $name {
+            pub const fn new(value: u32) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+id_type!(FxAssetId);
+id_type!(FxFamilyId);
+id_type!(FxActorId);
+id_type!(SupportNodeId);
+id_type!(ChunkId);
+id_type!(BondId);
+id_type!(CommandId);
+id_type!(EventId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GridCoord {
+    pub x: u32,
+    pub y: u32,
+}
+
+impl GridCoord {
+    pub const fn new(x: u32, y: u32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn center(self, voxel_size: f32) -> Vec2 {
+        Vec2::new(
+            (self.x as f32 + 0.5) * voxel_size,
+            (self.y as f32 + 0.5) * voxel_size,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LatticePoint {
+    pub x: u32,
+    pub y: u32,
+}
+
+impl LatticePoint {
+    pub const fn new(x: u32, y: u32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn to_vec2(self, voxel_size: f32) -> Vec2 {
+        Vec2::new(self.x as f32 * voxel_size, self.y as f32 * voxel_size)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InterfaceEdge {
+    pub start: LatticePoint,
+    pub end: LatticePoint,
+}
+
+impl InterfaceEdge {
+    pub fn new(a: LatticePoint, b: LatticePoint) -> Self {
+        if a <= b {
+            Self { start: a, end: b }
+        } else {
+            Self { start: b, end: a }
+        }
+    }
+
+    fn midpoint(self, voxel_size: f32) -> Vec2 {
+        (self.start.to_vec2(voxel_size) + self.end.to_vec2(voxel_size)) * 0.5
+    }
+
+    fn touches(self, rhs: Self) -> bool {
+        self.start == rhs.start
+            || self.start == rhs.end
+            || self.end == rhs.start
+            || self.end == rhs.end
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DenseOccupancy {
+    width: u32,
+    height: u32,
+    cells: Vec<bool>,
+}
+
+impl DenseOccupancy {
+    pub fn new(width: u32, height: u32, cells: Vec<bool>) -> Result<Self, ValidationError> {
+        let expected = width as usize * height as usize;
+        if cells.len() != expected {
+            return Err(ValidationError::GridSizeMismatch {
+                expected,
+                actual: cells.len(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            cells,
+        })
+    }
+
+    pub fn from_rows(rows: &[&str]) -> Result<Self, ValidationError> {
+        let height = rows.len() as u32;
+        let width = rows.first().map_or(0, |row| row.len()) as u32;
+        let mut cells = Vec::with_capacity(width as usize * height as usize);
+        for row in rows {
+            if row.len() as u32 != width {
+                return Err(ValidationError::RaggedRows);
+            }
+            for byte in row.bytes() {
+                cells.push(match byte {
+                    b'#' | b'1' | b'X' => true,
+                    b'.' | b'0' | b' ' => false,
+                    other => {
+                        return Err(ValidationError::InvalidOccupancyByte(other));
+                    }
+                });
+            }
+        }
+        Self::new(width, height, cells)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn contains(&self, coord: GridCoord) -> bool {
+        coord.x < self.width && coord.y < self.height
+    }
+
+    pub fn is_occupied(&self, coord: GridCoord) -> bool {
+        self.contains(coord) && self.cells[self.index(coord)]
+    }
+
+    fn index(&self, coord: GridCoord) -> usize {
+        coord.y as usize * self.width as usize + coord.x as usize
+    }
+
+    pub fn occupied_voxels(&self) -> impl Iterator<Item = GridCoord> + '_ {
+        (0..self.height).flat_map(move |y| {
+            (0..self.width).filter_map(move |x| {
+                let coord = GridCoord::new(x, y);
+                self.is_occupied(coord).then_some(coord)
+            })
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SupportNode2D {
+    pub id: SupportNodeId,
+    pub chunk_id: ChunkId,
+    pub voxels: Vec<GridCoord>,
+    pub material_id: u16,
+    pub stable_seed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chunk2D {
+    pub id: ChunkId,
+    pub support_node: SupportNodeId,
+    pub parent: Option<ChunkId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bond2D {
+    pub id: BondId,
+    pub node_a: SupportNodeId,
+    pub node_b: SupportNodeId,
+    pub centroid: Vec2,
+    pub normal: Vec2,
+    pub tangent: Vec2,
+    pub length: f32,
+    pub base_health: f32,
+    pub tension_limit: f32,
+    pub shear_limit: f32,
+    pub material_pair: (u16, u16),
+    pub interface_edges: Vec<InterfaceEdge>,
+}
+
+impl Bond2D {
+    pub fn other(&self, node: SupportNodeId) -> Option<SupportNodeId> {
+        if self.node_a == node {
+            Some(self.node_b)
+        } else if self.node_b == node {
+            Some(self.node_a)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxAsset {
+    id: FxAssetId,
+    voxel_size: f32,
+    occupancy: DenseOccupancy,
+    support_nodes: Vec<SupportNode2D>,
+    chunks: Vec<Chunk2D>,
+    internal_bonds: Vec<Bond2D>,
+    voxel_to_node: Vec<Option<SupportNodeId>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FxAssetDesc {
+    pub id: FxAssetId,
+    pub voxel_size: f32,
+    pub occupancy: DenseOccupancy,
+    pub support_node_map: Vec<Option<SupportNodeId>>,
+    pub material_map: Option<Vec<u16>>,
+    pub default_bond_health: f32,
+    pub default_tension_limit: f32,
+    pub default_shear_limit: f32,
+}
+
+impl FxAssetDesc {
+    pub fn new(
+        id: FxAssetId,
+        voxel_size: f32,
+        occupancy: DenseOccupancy,
+        support_node_map: Vec<Option<SupportNodeId>>,
+    ) -> Self {
+        Self {
+            id,
+            voxel_size,
+            occupancy,
+            support_node_map,
+            material_map: None,
+            default_bond_health: 1.0,
+            default_tension_limit: 10.0,
+            default_shear_limit: 10.0,
+        }
+    }
+}
+
+impl FxAsset {
+    pub fn id(&self) -> FxAssetId {
+        self.id
+    }
+
+    pub fn voxel_size(&self) -> f32 {
+        self.voxel_size
+    }
+
+    pub fn occupancy(&self) -> &DenseOccupancy {
+        &self.occupancy
+    }
+
+    pub fn support_nodes(&self) -> &[SupportNode2D] {
+        &self.support_nodes
+    }
+
+    pub fn chunks(&self) -> &[Chunk2D] {
+        &self.chunks
+    }
+
+    pub fn internal_bonds(&self) -> &[Bond2D] {
+        &self.internal_bonds
+    }
+
+    pub fn from_desc(desc: FxAssetDesc) -> Result<Self, ValidationError> {
+        if desc.voxel_size <= 0.0 {
+            return Err(ValidationError::InvalidVoxelSize);
+        }
+
+        let cell_count = desc.occupancy.width as usize * desc.occupancy.height as usize;
+        if desc.support_node_map.len() != cell_count {
+            return Err(ValidationError::GridSizeMismatch {
+                expected: cell_count,
+                actual: desc.support_node_map.len(),
+            });
+        }
+        if let Some(material_map) = &desc.material_map {
+            if material_map.len() != cell_count {
+                return Err(ValidationError::GridSizeMismatch {
+                    expected: cell_count,
+                    actual: material_map.len(),
+                });
+            }
+        }
+
+        let mut grouped: BTreeMap<SupportNodeId, Vec<GridCoord>> = BTreeMap::new();
+        for y in 0..desc.occupancy.height {
+            for x in 0..desc.occupancy.width {
+                let coord = GridCoord::new(x, y);
+                let idx = desc.occupancy.index(coord);
+                match (desc.occupancy.cells[idx], desc.support_node_map[idx]) {
+                    (true, Some(node)) => {
+                        grouped.entry(node).or_default().push(coord);
+                    }
+                    (true, None) => {
+                        return Err(ValidationError::MissingSupportCoverage(coord));
+                    }
+                    (false, Some(node)) => {
+                        return Err(ValidationError::EmptyVoxelCovered { coord, node });
+                    }
+                    (false, None) => {}
+                }
+            }
+        }
+
+        let mut support_nodes = Vec::with_capacity(grouped.len());
+        let mut chunks = Vec::with_capacity(grouped.len());
+        for (node_id, mut voxels) in grouped {
+            voxels.sort_unstable();
+            validate_four_neighbor_connected(&voxels)?;
+            let material_id =
+                dominant_material(&voxels, &desc.occupancy, desc.material_map.as_ref());
+            let chunk_id = ChunkId(node_id.0);
+            let stable_seed = stable_node_seed(node_id, &voxels, material_id);
+            support_nodes.push(SupportNode2D {
+                id: node_id,
+                chunk_id,
+                voxels,
+                material_id,
+                stable_seed,
+            });
+            chunks.push(Chunk2D {
+                id: chunk_id,
+                support_node: node_id,
+                parent: None,
+            });
+        }
+
+        let mut asset = Self {
+            id: desc.id,
+            voxel_size: desc.voxel_size,
+            occupancy: desc.occupancy,
+            support_nodes,
+            chunks,
+            internal_bonds: Vec::new(),
+            voxel_to_node: desc.support_node_map,
+        };
+        asset.internal_bonds = asset.generate_internal_bonds(
+            desc.default_bond_health,
+            desc.default_tension_limit,
+            desc.default_shear_limit,
+        )?;
+        asset.validate()?;
+        Ok(asset)
+    }
+
+    pub fn node_at(&self, coord: GridCoord) -> Option<SupportNodeId> {
+        self.occupancy
+            .contains(coord)
+            .then(|| self.voxel_to_node[self.occupancy.index(coord)])
+            .flatten()
+    }
+
+    pub fn node(&self, id: SupportNodeId) -> Option<&SupportNode2D> {
+        self.support_nodes
+            .binary_search_by_key(&id, |node| node.id)
+            .ok()
+            .map(|idx| &self.support_nodes[idx])
+    }
+
+    pub fn bond(&self, id: BondId) -> Option<&Bond2D> {
+        self.internal_bonds
+            .binary_search_by_key(&id, |bond| bond.id)
+            .ok()
+            .map(|idx| &self.internal_bonds[idx])
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let mut covered =
+            vec![None; self.occupancy.width as usize * self.occupancy.height as usize];
+        let node_ids: BTreeSet<_> = self.support_nodes.iter().map(|node| node.id).collect();
+        for node in &self.support_nodes {
+            if node.voxels.is_empty() {
+                return Err(ValidationError::EmptySupportNode(node.id));
+            }
+            validate_four_neighbor_connected(&node.voxels)?;
+            for &coord in &node.voxels {
+                if !self.occupancy.is_occupied(coord) {
+                    return Err(ValidationError::EmptyVoxelCovered {
+                        coord,
+                        node: node.id,
+                    });
+                }
+                let slot = &mut covered[self.occupancy.index(coord)];
+                if let Some(existing) = *slot {
+                    return Err(ValidationError::OverlappingSupportCoverage {
+                        coord,
+                        first: existing,
+                        second: node.id,
+                    });
+                }
+                *slot = Some(node.id);
+            }
+        }
+        for coord in self.occupancy.occupied_voxels() {
+            if covered[self.occupancy.index(coord)].is_none() {
+                return Err(ValidationError::MissingSupportCoverage(coord));
+            }
+        }
+        for chunk in &self.chunks {
+            if !node_ids.contains(&chunk.support_node) {
+                return Err(ValidationError::ChunkEndpointMissing(chunk.support_node));
+            }
+        }
+        let chunk_nodes: BTreeSet<_> = self.chunks.iter().map(|chunk| chunk.support_node).collect();
+        if chunk_nodes != node_ids {
+            return Err(ValidationError::ChunkHierarchyNotExact);
+        }
+        for bond in &self.internal_bonds {
+            if bond.node_a == bond.node_b {
+                return Err(ValidationError::SelfBond(bond.node_a));
+            }
+            if !node_ids.contains(&bond.node_a) {
+                return Err(ValidationError::BondEndpointMissing(bond.node_a));
+            }
+            if !node_ids.contains(&bond.node_b) {
+                return Err(ValidationError::BondEndpointMissing(bond.node_b));
+            }
+            if bond.length <= 0.0 {
+                return Err(ValidationError::NonPositiveBondLength(bond.id));
+            }
+            if bond.interface_edges.is_empty() {
+                return Err(ValidationError::EmptyBondInterface(bond.id));
+            }
+        }
+        Ok(())
+    }
+
+    fn generate_internal_bonds(
+        &self,
+        base_health: f32,
+        tension_limit: f32,
+        shear_limit: f32,
+    ) -> Result<Vec<Bond2D>, ValidationError> {
+        let mut grouped: BTreeMap<
+            (SupportNodeId, SupportNodeId),
+            Vec<impl_edge_sample::EdgeSample>,
+        > = BTreeMap::new();
+        for y in 0..self.occupancy.height {
+            for x in 0..self.occupancy.width {
+                let here = GridCoord::new(x, y);
+                let Some(here_node) = self.node_at(here) else {
+                    continue;
+                };
+                if x + 1 < self.occupancy.width {
+                    let there = GridCoord::new(x + 1, y);
+                    if let Some(there_node) = self.node_at(there) {
+                        self.record_interface_edge(
+                            &mut grouped,
+                            here_node,
+                            there_node,
+                            InterfaceEdge::new(
+                                LatticePoint::new(x + 1, y),
+                                LatticePoint::new(x + 1, y + 1),
+                            ),
+                            Vec2::new(1.0, 0.0),
+                        );
+                    }
+                }
+                if y + 1 < self.occupancy.height {
+                    let there = GridCoord::new(x, y + 1);
+                    if let Some(there_node) = self.node_at(there) {
+                        self.record_interface_edge(
+                            &mut grouped,
+                            here_node,
+                            there_node,
+                            InterfaceEdge::new(
+                                LatticePoint::new(x, y + 1),
+                                LatticePoint::new(x + 1, y + 1),
+                            ),
+                            Vec2::new(0.0, 1.0),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut bonds = Vec::new();
+        for ((node_a, node_b), mut samples) in grouped {
+            samples.sort_by_key(|sample| sample.edge);
+            for island in split_edge_islands(&samples) {
+                let mut centroid = Vec2::ZERO;
+                let mut normal = Vec2::ZERO;
+                let mut edges = Vec::with_capacity(island.len());
+                for sample in island {
+                    centroid += sample.edge.midpoint(self.voxel_size);
+                    normal += sample.normal;
+                    edges.push(sample.edge);
+                }
+                centroid = centroid * (1.0 / edges.len() as f32);
+                normal = normal.normalized_or_zero();
+                let tangent = normal.perp();
+                let material_pair = (
+                    self.node(node_a)
+                        .ok_or(ValidationError::BondEndpointMissing(node_a))?
+                        .material_id,
+                    self.node(node_b)
+                        .ok_or(ValidationError::BondEndpointMissing(node_b))?
+                        .material_id,
+                );
+                bonds.push(Bond2D {
+                    id: BondId(bonds.len() as u32),
+                    node_a,
+                    node_b,
+                    centroid,
+                    normal,
+                    tangent,
+                    length: edges.len() as f32 * self.voxel_size,
+                    base_health,
+                    tension_limit,
+                    shear_limit,
+                    material_pair,
+                    interface_edges: edges,
+                });
+            }
+        }
+        Ok(bonds)
+    }
+
+    fn record_interface_edge(
+        &self,
+        grouped: &mut BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>>,
+        a: SupportNodeId,
+        b: SupportNodeId,
+        edge: InterfaceEdge,
+        normal_a_to_b: Vec2,
+    ) {
+        if a == b {
+            return;
+        }
+        let (node_a, node_b, normal) = if a < b {
+            (a, b, normal_a_to_b)
+        } else {
+            (b, a, normal_a_to_b * -1.0)
+        };
+        grouped
+            .entry((node_a, node_b))
+            .or_default()
+            .push(impl_edge_sample::EdgeSample { edge, normal });
+    }
+}
+
+mod impl_edge_sample {
+    use super::{InterfaceEdge, Vec2};
+
+    #[derive(Clone, Copy)]
+    pub(super) struct EdgeSample {
+        pub(super) edge: InterfaceEdge,
+        pub(super) normal: Vec2,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BondRuntimeState {
+    pub health: f32,
+    pub effective_length: f32,
+    pub accumulated_damage: f32,
+}
+
+impl BondRuntimeState {
+    pub fn is_broken(&self) -> bool {
+        self.health <= 0.0 || self.effective_length <= 0.000_001
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxActor {
+    pub id: FxActorId,
+    pub owned_nodes: Vec<SupportNodeId>,
+    pub mass: f32,
+    pub local_com: Vec2,
+    pub inertia: f32,
+    pub bounds: Option<GridAabb>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridAabb {
+    pub min: GridCoord,
+    pub max: GridCoord,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxFamily {
+    pub id: FxFamilyId,
+    asset: FxAsset,
+    actors: BTreeMap<FxActorId, FxActor>,
+    node_owner: BTreeMap<SupportNodeId, FxActorId>,
+    bond_states: Vec<BondRuntimeState>,
+    dirty_actors: BTreeSet<FxActorId>,
+    next_actor_id: u32,
+    next_event_id: u32,
+}
+
+impl FxFamily {
+    pub fn instantiate(id: FxFamilyId, asset: FxAsset) -> Self {
+        let all_nodes: Vec<_> = asset.support_nodes.iter().map(|node| node.id).collect();
+        let bond_states: Vec<_> = asset
+            .internal_bonds
+            .iter()
+            .map(|bond| BondRuntimeState {
+                health: bond.base_health,
+                effective_length: bond.length,
+                accumulated_damage: 0.0,
+            })
+            .collect();
+
+        let mut family = Self {
+            id,
+            asset,
+            actors: BTreeMap::new(),
+            node_owner: BTreeMap::new(),
+            bond_states,
+            dirty_actors: BTreeSet::new(),
+            next_actor_id: 0,
+            next_event_id: 0,
+        };
+
+        let initial_actor = FxActor {
+            id: FxActorId(u32::MAX),
+            owned_nodes: all_nodes,
+            mass: 0.0,
+            local_com: Vec2::ZERO,
+            inertia: 0.0,
+            bounds: None,
+        };
+        let components = actor_components(&initial_actor, &family);
+        for component in components {
+            let actor_id = FxActorId(family.next_actor_id);
+            family.next_actor_id += 1;
+            let actor = build_actor(actor_id, &component, &family.asset);
+            for &node in &component {
+                family.node_owner.insert(node, actor_id);
+            }
+            family.actors.insert(actor_id, actor);
+        }
+        family
+    }
+
+    pub fn asset(&self) -> &FxAsset {
+        &self.asset
+    }
+
+    pub fn actors(&self) -> impl Iterator<Item = (&FxActorId, &FxActor)> {
+        self.actors.iter()
+    }
+
+    pub fn actor_count(&self) -> usize {
+        self.actors.len()
+    }
+
+    pub fn node_owner(&self, node: SupportNodeId) -> Option<FxActorId> {
+        self.node_owner.get(&node).copied()
+    }
+
+    pub fn bond_states(&self) -> &[BondRuntimeState] {
+        &self.bond_states
+    }
+
+    pub fn dirty_actors(&self) -> impl Iterator<Item = FxActorId> + '_ {
+        self.dirty_actors.iter().copied()
+    }
+
+    pub fn is_dirty(&self, actor: FxActorId) -> bool {
+        self.dirty_actors.contains(&actor)
+    }
+
+    #[cfg(test)]
+    fn mark_actor_dirty_for_test(&mut self, actor: FxActorId) {
+        self.dirty_actors.insert(actor);
+    }
+
+    #[cfg(test)]
+    fn next_actor_id_for_test(&self) -> u32 {
+        self.next_actor_id
+    }
+
+    #[cfg(test)]
+    fn next_event_id_for_test(&self) -> u32 {
+        self.next_event_id
+    }
+
+    pub fn actor(&self, id: FxActorId) -> Option<&FxActor> {
+        self.actors.get(&id)
+    }
+
+    pub fn bond_state(&self, id: BondId) -> Option<&BondRuntimeState> {
+        self.bond_states.get(id.0 as usize)
+    }
+
+    pub fn deterministic_state_digest(&self) -> u64 {
+        let mut hasher = Fnva64::default();
+        hasher.write_u32(self.id.0);
+        hasher.write_u32(self.asset.id.0);
+        hasher.write_u32(self.next_actor_id);
+        hasher.write_u32(self.next_event_id);
+        hasher.write_f32(self.asset.voxel_size);
+        for node in &self.asset.support_nodes {
+            hasher.write_u32(node.id.0);
+            hasher.write_u32(node.chunk_id.0);
+            hasher.write_u32(node.material_id as u32);
+            for voxel in &node.voxels {
+                hasher.write_u32(voxel.x);
+                hasher.write_u32(voxel.y);
+            }
+        }
+        for chunk in &self.asset.chunks {
+            hasher.write_u32(chunk.id.0);
+            hasher.write_u32(chunk.support_node.0);
+            hasher.write_u32(chunk.parent.map_or(u32::MAX, |parent| parent.0));
+        }
+        for bond in &self.asset.internal_bonds {
+            hasher.write_u32(bond.id.0);
+            hasher.write_u32(bond.node_a.0);
+            hasher.write_u32(bond.node_b.0);
+            hasher.write_f32(bond.length);
+            hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.shear_limit);
+            for edge in &bond.interface_edges {
+                hasher.write_u32(edge.start.x);
+                hasher.write_u32(edge.start.y);
+                hasher.write_u32(edge.end.x);
+                hasher.write_u32(edge.end.y);
+            }
+        }
+        for (actor_id, actor) in &self.actors {
+            hasher.write_u32(actor_id.0);
+            for node in &actor.owned_nodes {
+                hasher.write_u32(node.0);
+            }
+            hasher.write_f32(actor.mass);
+            hasher.write_f32(actor.local_com.x);
+            hasher.write_f32(actor.local_com.y);
+            hasher.write_f32(actor.inertia);
+            if let Some(bounds) = actor.bounds {
+                hasher.write_u32(bounds.min.x);
+                hasher.write_u32(bounds.min.y);
+                hasher.write_u32(bounds.max.x);
+                hasher.write_u32(bounds.max.y);
+            } else {
+                hasher.write_u32(u32::MAX);
+                hasher.write_u32(u32::MAX);
+                hasher.write_u32(u32::MAX);
+                hasher.write_u32(u32::MAX);
+            }
+        }
+        for (node, owner) in &self.node_owner {
+            hasher.write_u32(node.0);
+            hasher.write_u32(owner.0);
+        }
+        for state in &self.bond_states {
+            hasher.write_f32(state.health);
+            hasher.write_f32(state.effective_length);
+            hasher.write_f32(state.accumulated_damage);
+        }
+        for actor in &self.dirty_actors {
+            hasher.write_u32(actor.0);
+        }
+        hasher.finish()
+    }
+
+    fn next_event_id(&mut self) -> EventId {
+        let id = EventId(self.next_event_id);
+        self.next_event_id += 1;
+        id
+    }
+
+    fn mark_bond_dirty(&mut self, bond: &Bond2D) {
+        if let Some(actor) = self.node_owner.get(&bond.node_a) {
+            self.dirty_actors.insert(*actor);
+        }
+        if let Some(actor) = self.node_owner.get(&bond.node_b) {
+            self.dirty_actors.insert(*actor);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeterministicOrderKey {
+    pub tick: u64,
+    pub source_priority: u16,
+    pub family_id: FxFamilyId,
+    pub actor_id: FxActorId,
+    pub command_id: CommandId,
+}
+
+impl DeterministicOrderKey {
+    pub const fn new(
+        tick: u64,
+        source_priority: u16,
+        family_id: FxFamilyId,
+        actor_id: FxActorId,
+        command_id: CommandId,
+    ) -> Self {
+        Self {
+            tick,
+            source_priority,
+            family_id,
+            actor_id,
+            command_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageSource {
+    Script,
+    ContactImpulse,
+    JointFeedback,
+    Stress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FractureTarget {
+    Bond(BondId),
+    Node(SupportNodeId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DamageInput {
+    pub order_key: DeterministicOrderKey,
+    pub actor: FxActorId,
+    pub target: FractureTarget,
+    pub health_loss: f32,
+    pub effective_length_loss: f32,
+    pub source: DamageSource,
+    pub position: Vec2,
+    pub radius: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FractureCommand {
+    pub order_key: DeterministicOrderKey,
+    pub actor: FxActorId,
+    pub target: FractureTarget,
+    pub health_loss: f32,
+    pub effective_length_loss: f32,
+    pub source: DamageSource,
+}
+
+impl FractureCommand {
+    fn stable_cmp(&self, rhs: &Self) -> Ordering {
+        self.order_key
+            .cmp(&rhs.order_key)
+            .then_with(|| self.target.cmp(&rhs.target))
+            .then_with(|| self.health_loss.to_bits().cmp(&rhs.health_loss.to_bits()))
+            .then_with(|| {
+                self.effective_length_loss
+                    .to_bits()
+                    .cmp(&rhs.effective_length_loss.to_bits())
+            })
+    }
+}
+
+pub fn sort_fracture_commands(commands: &mut [FractureCommand]) {
+    commands.sort_by(|a, b| a.stable_cmp(b));
+}
+
+pub fn generate_damage_commands(family: &FxFamily, inputs: &[DamageInput]) -> Vec<FractureCommand> {
+    let mut sorted_inputs = inputs.to_vec();
+    sorted_inputs.sort_by_key(|input| input.order_key);
+    let mut out = Vec::new();
+    for input in sorted_inputs {
+        let health_loss = input.health_loss.max(0.0);
+        let effective_length_loss = input.effective_length_loss.max(0.0);
+        if health_loss == 0.0 && effective_length_loss == 0.0 {
+            continue;
+        }
+        if !actor_owns_target(family, input.actor, input.target) {
+            continue;
+        }
+        match input.target {
+            FractureTarget::Bond(bond_id) => {
+                if family.asset.bond(bond_id).is_some() {
+                    out.push(FractureCommand {
+                        order_key: input.order_key,
+                        actor: input.actor,
+                        target: input.target,
+                        health_loss,
+                        effective_length_loss,
+                        source: input.source,
+                    });
+                }
+            }
+            FractureTarget::Node(node_id) => {
+                for bond in &family.asset.internal_bonds {
+                    let target = FractureTarget::Bond(bond.id);
+                    if (bond.node_a == node_id || bond.node_b == node_id)
+                        && actor_owns_target(family, input.actor, target)
+                    {
+                        out.push(FractureCommand {
+                            order_key: input.order_key,
+                            actor: input.actor,
+                            target,
+                            health_loss,
+                            effective_length_loss,
+                            source: input.source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    sort_fracture_commands(&mut out);
+    out
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FractureEvent {
+    pub event_id: EventId,
+    pub order_key: DeterministicOrderKey,
+    pub family: FxFamilyId,
+    pub actor: FxActorId,
+    pub target: FractureTarget,
+    pub old_health: f32,
+    pub new_health: f32,
+    pub old_effective_length: f32,
+    pub new_effective_length: f32,
+    pub source: DamageSource,
+}
+
+pub fn apply_fracture_commands(
+    family: &mut FxFamily,
+    commands: &[FractureCommand],
+) -> Vec<FractureEvent> {
+    let mut sorted = commands.to_vec();
+    sort_fracture_commands(&mut sorted);
+    let mut events = Vec::new();
+    for command in sorted {
+        let health_loss = command.health_loss.max(0.0);
+        let effective_length_loss = command.effective_length_loss.max(0.0);
+        if health_loss == 0.0 && effective_length_loss == 0.0 {
+            continue;
+        }
+        if !actor_owns_target(family, command.actor, command.target) {
+            continue;
+        }
+        match command.target {
+            FractureTarget::Bond(bond_id) => {
+                let Some(bond) = family.asset.bond(bond_id).cloned() else {
+                    continue;
+                };
+                let Some(state) = family.bond_states.get_mut(bond_id.0 as usize) else {
+                    continue;
+                };
+                let old_health = state.health;
+                let old_effective_length = state.effective_length;
+                state.health = (state.health - health_loss).max(0.0);
+                state.effective_length = (state.effective_length - effective_length_loss).max(0.0);
+                state.accumulated_damage += health_loss;
+                let new_health = state.health;
+                let new_effective_length = state.effective_length;
+                family.mark_bond_dirty(&bond);
+                events.push(FractureEvent {
+                    event_id: family.next_event_id(),
+                    order_key: command.order_key,
+                    family: family.id,
+                    actor: command.actor,
+                    target: command.target,
+                    old_health,
+                    new_health,
+                    old_effective_length,
+                    new_effective_length,
+                    source: command.source,
+                });
+            }
+            FractureTarget::Node(_) => {}
+        }
+    }
+    events
+}
+
+fn actor_owns_target(family: &FxFamily, actor: FxActorId, target: FractureTarget) -> bool {
+    match target {
+        FractureTarget::Bond(bond_id) => {
+            let Some(bond) = family.asset.bond(bond_id) else {
+                return false;
+            };
+            family.node_owner.get(&bond.node_a) == Some(&actor)
+                && family.node_owner.get(&bond.node_b) == Some(&actor)
+        }
+        FractureTarget::Node(node_id) => family.node_owner.get(&node_id) == Some(&actor),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StressInput {
+    pub order_key: DeterministicOrderKey,
+    pub actor: FxActorId,
+    pub node: SupportNodeId,
+    pub force: Vec2,
+    pub source: DamageSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StressSettings {
+    pub tension_limit_scale: f32,
+    pub shear_limit_scale: f32,
+    pub damage_per_overload: f32,
+    pub max_fractures_per_frame: u16,
+}
+
+impl Default for StressSettings {
+    fn default() -> Self {
+        Self {
+            tension_limit_scale: 1.0,
+            shear_limit_scale: 1.0,
+            damage_per_overload: 1.0,
+            max_fractures_per_frame: u16::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StressSolver2D {
+    pub settings: StressSettings,
+}
+
+impl StressSolver2D {
+    pub fn new(settings: StressSettings) -> Self {
+        Self { settings }
+    }
+
+    pub fn generate(&self, family: &FxFamily, inputs: &[StressInput]) -> Vec<FractureCommand> {
+        let mut force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
+        let mut first_key_by_actor: BTreeMap<FxActorId, DeterministicOrderKey> = BTreeMap::new();
+        let mut source_by_actor: BTreeMap<FxActorId, DamageSource> = BTreeMap::new();
+        let mut sorted_inputs = inputs.to_vec();
+        sorted_inputs.sort_by_key(|input| input.order_key);
+        for input in sorted_inputs {
+            *force_by_node.entry(input.node).or_insert(Vec2::ZERO) += input.force;
+            first_key_by_actor
+                .entry(input.actor)
+                .and_modify(|key| *key = (*key).min(input.order_key))
+                .or_insert(input.order_key);
+            source_by_actor.entry(input.actor).or_insert(input.source);
+        }
+
+        let mut commands = Vec::new();
+        for (actor_id, actor) in &family.actors {
+            let Some(order_key) = first_key_by_actor.get(actor_id).copied() else {
+                continue;
+            };
+            let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
+            let mut actor_commands = Vec::new();
+            for bond in &family.asset.internal_bonds {
+                if !owned.contains(&bond.node_a) || !owned.contains(&bond.node_b) {
+                    continue;
+                }
+                if family
+                    .bond_state(bond.id)
+                    .is_none_or(BondRuntimeState::is_broken)
+                {
+                    continue;
+                }
+                let side_a = component_without_bond(actor, family, bond.node_a, Some(bond.id));
+                let side_b = component_without_bond(actor, family, bond.node_b, Some(bond.id));
+                let force_a = side_a.iter().fold(Vec2::ZERO, |acc, node| {
+                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+                });
+                let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
+                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+                });
+                let load_a = force_a
+                    .dot(bond.normal)
+                    .abs()
+                    .max(force_a.dot(bond.tangent).abs());
+                let load_b = force_b
+                    .dot(bond.normal)
+                    .abs()
+                    .max(force_b.dot(bond.tangent).abs());
+                let side_force = if load_b > load_a { force_b } else { force_a };
+                let tension = side_force.dot(bond.normal).abs();
+                let shear = side_force.dot(bond.tangent).abs();
+                let state = family.bond_state(bond.id).expect("bond state exists");
+                let health_ratio = if bond.base_health > 0.0 {
+                    (state.health / bond.base_health).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let tension_limit = bond.tension_limit
+                    * self.settings.tension_limit_scale
+                    * health_ratio.max(0.001);
+                let shear_limit =
+                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
+                if tension > tension_limit || shear > shear_limit {
+                    actor_commands.push(FractureCommand {
+                        order_key,
+                        actor: *actor_id,
+                        target: FractureTarget::Bond(bond.id),
+                        health_loss: self.settings.damage_per_overload,
+                        effective_length_loss: if tension > tension_limit {
+                            bond.length
+                        } else {
+                            0.0
+                        },
+                        source: *source_by_actor
+                            .get(actor_id)
+                            .unwrap_or(&DamageSource::Stress),
+                    });
+                }
+            }
+            sort_fracture_commands(&mut actor_commands);
+            actor_commands.truncate(self.settings.max_fractures_per_frame as usize);
+            commands.extend(actor_commands);
+        }
+        sort_fracture_commands(&mut commands);
+        commands
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitEvent {
+    pub event_id: EventId,
+    pub family: FxFamilyId,
+    pub parent_actor: FxActorId,
+    pub kept_actor: FxActorId,
+    pub created_children: Vec<FxActorId>,
+    pub fragments: Vec<Vec<SupportNodeId>>,
+    pub kept_fragment: Vec<SupportNodeId>,
+}
+
+pub fn split_dirty_actors(family: &mut FxFamily) -> Vec<SplitEvent> {
+    let dirty: Vec<_> = family.dirty_actors.iter().copied().collect();
+    let mut events = Vec::new();
+    for actor_id in dirty {
+        let Some(actor) = family.actors.get(&actor_id).cloned() else {
+            family.dirty_actors.remove(&actor_id);
+            continue;
+        };
+        let components = actor_components(&actor, family);
+        if components.len() <= 1 {
+            family.dirty_actors.remove(&actor_id);
+            continue;
+        }
+
+        let kept_idx = components
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| compare_fragment_for_keep(a, b, &family.asset))
+            .map(|(idx, _)| idx)
+            .expect("components is non-empty");
+        let kept_nodes = components[kept_idx].clone();
+        let mut created_children = Vec::new();
+        let mut child_components: Vec<_> = components
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, nodes)| (idx != kept_idx).then_some(nodes.clone()))
+            .collect();
+        child_components.sort_by_key(|nodes| nodes.first().copied().unwrap_or_default());
+
+        family
+            .actors
+            .insert(actor_id, build_actor(actor_id, &kept_nodes, &family.asset));
+        for node in &kept_nodes {
+            family.node_owner.insert(*node, actor_id);
+        }
+
+        for nodes in child_components {
+            let child_id = FxActorId(family.next_actor_id);
+            family.next_actor_id += 1;
+            let child = build_actor(child_id, &nodes, &family.asset);
+            for node in &nodes {
+                family.node_owner.insert(*node, child_id);
+            }
+            family.actors.insert(child_id, child);
+            created_children.push(child_id);
+        }
+
+        let mut fragments = components;
+        fragments.sort_by_key(|nodes| nodes.first().copied().unwrap_or_default());
+        events.push(SplitEvent {
+            event_id: family.next_event_id(),
+            family: family.id,
+            parent_actor: actor_id,
+            kept_actor: actor_id,
+            created_children,
+            fragments,
+            kept_fragment: kept_nodes,
+        });
+        family.dirty_actors.remove(&actor_id);
+    }
+    events
+}
+
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum ValidationError {
+    #[error("grid size mismatch: expected {expected}, got {actual}")]
+    GridSizeMismatch { expected: usize, actual: usize },
+    #[error("occupancy rows must have the same width")]
+    RaggedRows,
+    #[error("invalid occupancy byte {0}")]
+    InvalidOccupancyByte(u8),
+    #[error("voxel size must be positive")]
+    InvalidVoxelSize,
+    #[error("occupied voxel {0:?} is missing support coverage")]
+    MissingSupportCoverage(GridCoord),
+    #[error("empty voxel {coord:?} is covered by support node {node:?}")]
+    EmptyVoxelCovered {
+        coord: GridCoord,
+        node: SupportNodeId,
+    },
+    #[error("support coverage overlaps at {coord:?}: {first:?} and {second:?}")]
+    OverlappingSupportCoverage {
+        coord: GridCoord,
+        first: SupportNodeId,
+        second: SupportNodeId,
+    },
+    #[error("support node {0:?} has no voxels")]
+    EmptySupportNode(SupportNodeId),
+    #[error("support node containing {0:?} is not 4-neighbor connected")]
+    SupportNodeNotFourConnected(SupportNodeId),
+    #[error("chunk references missing support node {0:?}")]
+    ChunkEndpointMissing(SupportNodeId),
+    #[error("chunk hierarchy is not an exact cover over support nodes")]
+    ChunkHierarchyNotExact,
+    #[error("bond endpoint {0:?} is missing")]
+    BondEndpointMissing(SupportNodeId),
+    #[error("bond cannot connect support node {0:?} to itself")]
+    SelfBond(SupportNodeId),
+    #[error("bond {0:?} length must be positive")]
+    NonPositiveBondLength(BondId),
+    #[error("bond {0:?} has no interface edges")]
+    EmptyBondInterface(BondId),
+}
+
+fn dominant_material(
+    voxels: &[GridCoord],
+    occupancy: &DenseOccupancy,
+    material_map: Option<&Vec<u16>>,
+) -> u16 {
+    let Some(material_map) = material_map else {
+        return 0;
+    };
+    let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+    for &voxel in voxels {
+        *counts
+            .entry(material_map[occupancy.index(voxel)])
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|(mat_a, count_a), (mat_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| mat_b.cmp(mat_a))
+        })
+        .map(|(material, _)| material)
+        .unwrap_or(0)
+}
+
+fn stable_node_seed(node_id: SupportNodeId, voxels: &[GridCoord], material_id: u16) -> u64 {
+    let mut hasher = Fnva64::default();
+    hasher.write_u32(node_id.0);
+    hasher.write_u32(material_id as u32);
+    for voxel in voxels {
+        hasher.write_u32(voxel.x);
+        hasher.write_u32(voxel.y);
+    }
+    hasher.finish()
+}
+
+fn validate_four_neighbor_connected(voxels: &[GridCoord]) -> Result<(), ValidationError> {
+    if voxels.is_empty() {
+        return Ok(());
+    }
+    let node_id = SupportNodeId(u32::MAX);
+    let set: BTreeSet<_> = voxels.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([voxels[0]]);
+    seen.insert(voxels[0]);
+    while let Some(coord) = queue.pop_front() {
+        for next in four_neighbors(coord) {
+            if set.contains(&next) && seen.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    if seen.len() != voxels.len() {
+        Err(ValidationError::SupportNodeNotFourConnected(node_id))
+    } else {
+        Ok(())
+    }
+}
+
+fn four_neighbors(coord: GridCoord) -> impl Iterator<Item = GridCoord> {
+    let mut out = Vec::with_capacity(4);
+    if coord.x > 0 {
+        out.push(GridCoord::new(coord.x - 1, coord.y));
+    }
+    if coord.y > 0 {
+        out.push(GridCoord::new(coord.x, coord.y - 1));
+    }
+    out.push(GridCoord::new(coord.x + 1, coord.y));
+    out.push(GridCoord::new(coord.x, coord.y + 1));
+    out.into_iter()
+}
+
+fn split_edge_islands(
+    samples: &[impl_edge_sample::EdgeSample],
+) -> Vec<Vec<impl_edge_sample::EdgeSample>> {
+    let mut seen = vec![false; samples.len()];
+    let mut islands = Vec::new();
+    for start in 0..samples.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut queue = VecDeque::from([start]);
+        let mut island = Vec::new();
+        while let Some(idx) = queue.pop_front() {
+            island.push(samples[idx]);
+            for next in 0..samples.len() {
+                if !seen[next] && samples[idx].edge.touches(samples[next].edge) {
+                    seen[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        island.sort_by_key(|sample| sample.edge);
+        islands.push(island);
+    }
+    islands.sort_by_key(|island| island.first().map(|sample| sample.edge));
+    islands
+}
+
+fn build_actor(id: FxActorId, nodes: &[SupportNodeId], asset: &FxAsset) -> FxActor {
+    let mut owned_nodes = nodes.to_vec();
+    owned_nodes.sort_unstable();
+    let mut mass = 0.0;
+    let mut weighted_center = Vec2::ZERO;
+    let mut min: Option<GridCoord> = None;
+    let mut max: Option<GridCoord> = None;
+    for node_id in &owned_nodes {
+        let Some(node) = asset.node(*node_id) else {
+            continue;
+        };
+        for &voxel in &node.voxels {
+            mass += 1.0;
+            weighted_center += voxel.center(asset.voxel_size);
+            min = Some(match min {
+                Some(old) => GridCoord::new(old.x.min(voxel.x), old.y.min(voxel.y)),
+                None => voxel,
+            });
+            max = Some(match max {
+                Some(old) => GridCoord::new(old.x.max(voxel.x), old.y.max(voxel.y)),
+                None => voxel,
+            });
+        }
+    }
+    let local_com = if mass > 0.0 {
+        weighted_center * (1.0 / mass)
+    } else {
+        Vec2::ZERO
+    };
+    let mut inertia = 0.0;
+    for node_id in &owned_nodes {
+        let Some(node) = asset.node(*node_id) else {
+            continue;
+        };
+        for &voxel in &node.voxels {
+            let d = voxel.center(asset.voxel_size) - local_com;
+            inertia += d.dot(d) + (asset.voxel_size * asset.voxel_size) / 6.0;
+        }
+    }
+    FxActor {
+        id,
+        owned_nodes,
+        mass,
+        local_com,
+        inertia,
+        bounds: min.zip(max).map(|(min, max)| GridAabb { min, max }),
+    }
+}
+
+fn component_without_bond(
+    actor: &FxActor,
+    family: &FxFamily,
+    start: SupportNodeId,
+    skipped_bond: Option<BondId>,
+) -> Vec<SupportNodeId> {
+    let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([start]);
+    seen.insert(start);
+    while let Some(node) = queue.pop_front() {
+        for bond in &family.asset.internal_bonds {
+            if Some(bond.id) == skipped_bond {
+                continue;
+            }
+            if family
+                .bond_state(bond.id)
+                .is_none_or(BondRuntimeState::is_broken)
+            {
+                continue;
+            }
+            let Some(other) = bond.other(node) else {
+                continue;
+            };
+            if owned.contains(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+fn actor_components(actor: &FxActor, family: &FxFamily) -> Vec<Vec<SupportNodeId>> {
+    let mut remaining: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
+    let mut components = Vec::new();
+    while let Some(start) = remaining.first().copied() {
+        let component = component_without_bond(actor, family, start, None);
+        for node in &component {
+            remaining.remove(node);
+        }
+        components.push(component);
+    }
+    components.sort_by_key(|nodes| nodes.first().copied().unwrap_or_default());
+    components
+}
+
+fn fragment_stats(nodes: &[SupportNodeId], asset: &FxAsset) -> (usize, f32, SupportNodeId) {
+    let voxel_count = nodes
+        .iter()
+        .filter_map(|node| asset.node(*node))
+        .map(|node| node.voxels.len())
+        .sum::<usize>();
+    let mass = voxel_count as f32;
+    let min_node = nodes.iter().copied().min().unwrap_or_default();
+    (voxel_count, mass, min_node)
+}
+
+fn compare_fragment_for_keep(
+    a: &[SupportNodeId],
+    b: &[SupportNodeId],
+    asset: &FxAsset,
+) -> Ordering {
+    let (a_voxels, a_mass, a_min) = fragment_stats(a, asset);
+    let (b_voxels, b_mass, b_min) = fragment_stats(b, asset);
+    a_voxels
+        .cmp(&b_voxels)
+        .then_with(|| a_mass.total_cmp(&b_mass))
+        .then_with(|| b_min.cmp(&a_min))
+}
+
+#[derive(Clone, Debug)]
+struct Fnva64(u64);
+
+impl Default for Fnva64 {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnva64 {
+    fn write_u8(&mut self, value: u8) {
+        self.0 ^= value as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        for byte in value.to_le_bytes() {
+            self.write_u8(byte);
+        }
+    }
+
+    fn write_f32(&mut self, value: f32) {
+        self.write_u32(value.to_bits());
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(width: u32, ids: &[Option<u32>]) -> Vec<Option<SupportNodeId>> {
+        assert_eq!(ids.len() % width as usize, 0);
+        ids.iter()
+            .map(|id| id.map(SupportNodeId))
+            .collect::<Vec<_>>()
+    }
+
+    fn asset_from_rows(rows: &[&str], node_ids: &[Option<u32>]) -> FxAsset {
+        asset_from_rows_with_limits(rows, node_ids, 10.0, 10.0)
+    }
+
+    fn asset_from_rows_with_limits(
+        rows: &[&str],
+        node_ids: &[Option<u32>],
+        tension_limit: f32,
+        shear_limit: f32,
+    ) -> FxAsset {
+        let occupancy = DenseOccupancy::from_rows(rows).unwrap();
+        let mut desc = FxAssetDesc::new(
+            FxAssetId(7),
+            1.0,
+            occupancy.clone(),
+            map(occupancy.width(), node_ids),
+        );
+        desc.default_bond_health = 10.0;
+        desc.default_tension_limit = tension_limit;
+        desc.default_shear_limit = shear_limit;
+        FxAsset::from_desc(desc).unwrap()
+    }
+
+    fn chain_asset() -> FxAsset {
+        asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)])
+    }
+
+    fn family_for(asset: FxAsset) -> FxFamily {
+        FxFamily::instantiate(FxFamilyId(3), asset)
+    }
+
+    #[test]
+    fn exact_cover_basic() {
+        let asset = asset_from_rows(&["##", "##"], &[Some(0), Some(0), Some(1), Some(1)]);
+        assert_eq!(asset.support_nodes().len(), 2);
+        assert_eq!(asset.support_nodes()[0].voxels.len(), 2);
+        assert_eq!(asset.support_nodes()[1].voxels.len(), 2);
+        assert!(asset.validate().is_ok());
+    }
+
+    #[test]
+    fn four_neighbor_connectivity() {
+        let occupancy = DenseOccupancy::from_rows(&["#.", ".#"]).unwrap();
+        let desc = FxAssetDesc::new(
+            FxAssetId(1),
+            1.0,
+            occupancy,
+            map(2, &[Some(0), None, None, Some(0)]),
+        );
+        assert!(matches!(
+            FxAsset::from_desc(desc),
+            Err(ValidationError::SupportNodeNotFourConnected(_))
+        ));
+    }
+
+    #[test]
+    fn bond_generation_edge_scan() {
+        let asset = asset_from_rows(&["##", "##"], &[Some(0), Some(1), Some(0), Some(1)]);
+        assert_eq!(asset.internal_bonds().len(), 1);
+        let bond = &asset.internal_bonds()[0];
+        assert_eq!(bond.node_a, SupportNodeId(0));
+        assert_eq!(bond.node_b, SupportNodeId(1));
+        assert_eq!(bond.interface_edges.len(), 2);
+        assert_eq!(bond.length, 2.0);
+    }
+
+    #[test]
+    fn disconnected_interface_expands_bonds() {
+        let asset = asset_from_rows(
+            &["####", "##.#", "####"],
+            &[
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(0),
+                Some(0),
+                None,
+                Some(1),
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+            ],
+        );
+        assert_eq!(asset.internal_bonds().len(), 2);
+        assert!(asset.internal_bonds().iter().all(|bond| bond.length == 2.0));
+    }
+
+    #[test]
+    fn damage_generate_no_mutation() {
+        let family = family_for(chain_asset());
+        let before = family.deterministic_state_digest();
+        let input = DamageInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 2.0,
+            effective_length_loss: 0.0,
+            source: DamageSource::Script,
+            position: Vec2::ZERO,
+            radius: 0.0,
+        };
+        let commands = generate_damage_commands(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn apply_fracture_mutates_health() {
+        let mut family = family_for(chain_asset());
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 4.0,
+            effective_length_loss: 0.5,
+            source: DamageSource::Script,
+        };
+        let events = apply_fracture_commands(&mut family, &[command]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].old_health, 10.0);
+        assert_eq!(events[0].new_health, 6.0);
+        assert_eq!(family.bond_state(BondId(0)).unwrap().health, 6.0);
+        assert!(family.is_dirty(FxActorId(0)));
+    }
+
+    #[test]
+    fn stress_tension_break() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_shear_break() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(0.0, 20.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_tension_break_from_node_b() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(-20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_shear_break_from_node_b() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(0.0, -20.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn impact_breaks_weak_place() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["###"],
+            &[Some(0), Some(1), Some(2)],
+            100.0,
+            100.0,
+        ));
+        let weaken = FractureCommand {
+            order_key: DeterministicOrderKey::new(0, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 9.5,
+            effective_length_loss: 0.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[weaken]);
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(10.0, 0.0),
+            source: DamageSource::ContactImpulse,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(1)));
+    }
+
+    #[test]
+    fn impact_breaks_weak_place_from_other_side() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["###"],
+            &[Some(0), Some(1), Some(2)],
+            100.0,
+            100.0,
+        ));
+        let weaken = FractureCommand {
+            order_key: DeterministicOrderKey::new(0, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 9.5,
+            effective_length_loss: 0.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[weaken]);
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(2),
+            force: Vec2::new(-10.0, 0.0),
+            source: DamageSource::ContactImpulse,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(1)));
+    }
+
+    #[test]
+    fn largest_fragment_keeps_parent() {
+        let mut family = family_for(chain_asset());
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[command]);
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kept_actor, FxActorId(0));
+        assert_eq!(
+            family.actor(FxActorId(0)).unwrap().owned_nodes,
+            vec![SupportNodeId(0), SupportNodeId(1)]
+        );
+        assert_eq!(
+            family.actor(FxActorId(1)).unwrap().owned_nodes,
+            vec![SupportNodeId(2)]
+        );
+    }
+
+    #[test]
+    fn deterministic_sort_commands() {
+        let family_id = FxFamilyId(1);
+        let actor = FxActorId(0);
+        let mut commands = vec![
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(2, 1, family_id, actor, CommandId(3)),
+                actor,
+                target: FractureTarget::Bond(BondId(2)),
+                health_loss: 1.0,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            },
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, actor, CommandId(1)),
+                actor,
+                target: FractureTarget::Bond(BondId(1)),
+                health_loss: 1.0,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            },
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, actor, CommandId(0)),
+                actor,
+                target: FractureTarget::Bond(BondId(0)),
+                health_loss: 1.0,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            },
+        ];
+        sort_fracture_commands(&mut commands);
+        assert_eq!(
+            commands.iter().map(|cmd| cmd.target).collect::<Vec<_>>(),
+            vec![
+                FractureTarget::Bond(BondId(0)),
+                FractureTarget::Bond(BondId(1)),
+                FractureTarget::Bond(BondId(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn core_has_no_rapier_dependency() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("rapier2d"));
+        assert!(!manifest.contains("rapier3d"));
+        assert!(!manifest.contains("parry2d"));
+        assert!(!manifest.contains("parry3d"));
+    }
+
+    #[test]
+    fn deterministic_state_digest_stable() {
+        let mut a = family_for(chain_asset());
+        let mut b = family_for(chain_asset());
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, a.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut a, &[command.clone()]);
+        apply_fracture_commands(&mut b, &[command]);
+        split_dirty_actors(&mut a);
+        split_dirty_actors(&mut b);
+        assert_eq!(
+            a.deterministic_state_digest(),
+            b.deterministic_state_digest()
+        );
+    }
+
+    #[test]
+    fn split_single_island_noop() {
+        let mut family = family_for(chain_asset());
+        family.mark_actor_dirty_for_test(FxActorId(0));
+        let events = split_dirty_actors(&mut family);
+        assert!(events.is_empty());
+        assert_eq!(family.actor_count(), 1);
+    }
+
+    #[test]
+    fn largest_fragment_tie_breaks_by_min_node_id() {
+        let mut family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
+        let commands = vec![
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(0)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            },
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(1)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            },
+        ];
+        apply_fracture_commands(&mut family, &commands);
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            family.actor(FxActorId(0)).unwrap().owned_nodes,
+            vec![SupportNodeId(0)]
+        );
+    }
+
+    #[test]
+    fn split_child_ids_are_stable() {
+        let run = || {
+            let mut family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
+            let commands = vec![
+                FractureCommand {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    target: FractureTarget::Bond(BondId(0)),
+                    health_loss: 10.0,
+                    effective_length_loss: 1.0,
+                    source: DamageSource::Script,
+                },
+                FractureCommand {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(0),
+                    target: FractureTarget::Bond(BondId(1)),
+                    health_loss: 10.0,
+                    effective_length_loss: 1.0,
+                    source: DamageSource::Script,
+                },
+            ];
+            apply_fracture_commands(&mut family, &commands);
+            split_dirty_actors(&mut family);
+            family
+                .actors()
+                .map(|(actor_id, _)| *actor_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn stress_generate_commands_no_direct_mutation() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let before = family.deterministic_state_digest();
+        let solver = StressSolver2D::new(Default::default());
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        assert_eq!(solver.generate(&family, &[input]).len(), 1);
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn deterministic_component_order_independent_of_adjacency() {
+        let mut family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
+        let commands = vec![
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(1)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            },
+            FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(0)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            },
+        ];
+        apply_fracture_commands(&mut family, &commands);
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events[0].fragments[0], vec![SupportNodeId(0)]);
+        assert_eq!(events[0].fragments[1], vec![SupportNodeId(1)]);
+        assert_eq!(events[0].fragments[2], vec![SupportNodeId(2)]);
+    }
+
+    #[test]
+    fn wrong_actor_target_rejected() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let before = family.deterministic_state_digest();
+        let damage = DamageInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(99), CommandId(0)),
+            actor: FxActorId(99),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+            position: Vec2::ZERO,
+            radius: 0.0,
+        };
+        assert!(generate_damage_commands(&family, &[damage]).is_empty());
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(99), CommandId(0)),
+            actor: FxActorId(99),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        assert!(apply_fracture_commands(&mut family, &[command]).is_empty());
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn stale_command_after_split_rejected() {
+        let mut family = family_for(chain_asset());
+        let split_command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[split_command]);
+        split_dirty_actors(&mut family);
+        let before = family.deterministic_state_digest();
+        let stale = FractureCommand {
+            order_key: DeterministicOrderKey::new(2, 1, family.id, FxActorId(1), CommandId(0)),
+            actor: FxActorId(1),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        assert!(apply_fracture_commands(&mut family, &[stale]).is_empty());
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn negative_loss_does_not_heal() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let damage = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 2.0,
+            effective_length_loss: 0.25,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[damage]);
+        let before = family.deterministic_state_digest();
+        let health = family.bond_state(BondId(0)).unwrap().health;
+        let effective_length = family.bond_state(BondId(0)).unwrap().effective_length;
+        let negative = FractureCommand {
+            order_key: DeterministicOrderKey::new(2, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: -5.0,
+            effective_length_loss: -5.0,
+            source: DamageSource::Script,
+        };
+        assert!(apply_fracture_commands(&mut family, &[negative]).is_empty());
+        assert_eq!(health, family.bond_state(BondId(0)).unwrap().health);
+        assert_eq!(
+            effective_length,
+            family.bond_state(BondId(0)).unwrap().effective_length
+        );
+        assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn deterministic_digest_changes_when_effective_length_changes() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let before = family.deterministic_state_digest();
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 0.0,
+            effective_length_loss: 0.25,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[command]);
+        assert_ne!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn deterministic_digest_changes_when_actor_ownership_splits() {
+        let mut family = family_for(chain_asset());
+        let before = family.deterministic_state_digest();
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(1)),
+            health_loss: 10.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[command]);
+        split_dirty_actors(&mut family);
+        assert_ne!(before, family.deterministic_state_digest());
+        assert_eq!(family.node_owner(SupportNodeId(2)), Some(FxActorId(1)));
+    }
+
+    #[test]
+    fn deterministic_digest_changes_when_event_allocator_state_changes() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let before = family.deterministic_state_digest();
+        assert_eq!(family.next_event_id_for_test(), 0);
+        let command = FractureCommand {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            target: FractureTarget::Bond(BondId(0)),
+            health_loss: 1.0,
+            effective_length_loss: 0.0,
+            source: DamageSource::Script,
+        };
+        apply_fracture_commands(&mut family, &[command]);
+        assert_eq!(family.next_event_id_for_test(), 1);
+        assert_ne!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn initial_disconnected_asset_instantiates_stable_actor_islands() {
+        let family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        assert_eq!(family.actor_count(), 2);
+        assert_eq!(
+            family.actor(FxActorId(0)).unwrap().owned_nodes,
+            vec![SupportNodeId(0)]
+        );
+        assert_eq!(
+            family.actor(FxActorId(1)).unwrap().owned_nodes,
+            vec![SupportNodeId(1)]
+        );
+        assert_eq!(family.next_actor_id_for_test(), 2);
+    }
+
+    #[test]
+    fn phase1_thin_slice_generate_apply_stress_split() {
+        let asset = asset_from_rows(&["####"], &[Some(0), Some(1), Some(2), Some(3)]);
+        let mut family = family_for(asset);
+        let start_digest = family.deterministic_state_digest();
+
+        let damage_inputs = vec![
+            DamageInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(2)),
+                health_loss: 9.5,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+                position: Vec2::new(2.5, 0.5),
+                radius: 0.0,
+            },
+            DamageInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(0)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+                position: Vec2::new(0.5, 0.5),
+                radius: 0.0,
+            },
+        ];
+        let damage_commands = generate_damage_commands(&family, &damage_inputs);
+        assert_eq!(damage_commands.len(), 2);
+        assert_eq!(start_digest, family.deterministic_state_digest());
+
+        let damage_events = apply_fracture_commands(&mut family, &damage_commands);
+        assert_eq!(damage_events.len(), 2);
+        assert_eq!(family.bond_state(BondId(0)).unwrap().health, 0.0);
+        assert_eq!(family.bond_state(BondId(2)).unwrap().health, 0.5);
+
+        let after_damage_digest = family.deterministic_state_digest();
+        assert_ne!(start_digest, after_damage_digest);
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let stress_inputs = vec![StressInput {
+            order_key: DeterministicOrderKey::new(2, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(3),
+            force: Vec2::new(-10.0, 0.0),
+            source: DamageSource::ContactImpulse,
+        }];
+        let stress_commands = solver.generate(&family, &stress_inputs);
+        assert_eq!(after_damage_digest, family.deterministic_state_digest());
+        assert_eq!(stress_commands.len(), 1);
+        assert_eq!(stress_commands[0].target, FractureTarget::Bond(BondId(2)));
+
+        let stress_events = apply_fracture_commands(&mut family, &stress_commands);
+        assert_eq!(stress_events.len(), 1);
+        assert_eq!(family.bond_state(BondId(2)).unwrap().health, 0.0);
+
+        let split_events = split_dirty_actors(&mut family);
+        assert_eq!(split_events.len(), 1);
+        assert_eq!(split_events[0].kept_actor, FxActorId(0));
+        assert_eq!(
+            family.actor(FxActorId(0)).unwrap().owned_nodes,
+            vec![SupportNodeId(1), SupportNodeId(2)]
+        );
+        assert_eq!(
+            family.actor(FxActorId(1)).unwrap().owned_nodes,
+            vec![SupportNodeId(0)]
+        );
+        assert_eq!(
+            family.actor(FxActorId(2)).unwrap().owned_nodes,
+            vec![SupportNodeId(3)]
+        );
+        assert_ne!(after_damage_digest, family.deterministic_state_digest());
+    }
+}
