@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fracture_core::{
-    FxActorId, FxFamily, FxFamilyId, SplitEvent, StressSettings, StressSolver2D, Vec2,
+    ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FxActorId, FxFamily,
+    FxFamilyId, MergeActorsResult, SplitEvent, StressSettings, StressSolver2D, Vec2,
     apply_fracture_commands, split_dirty_actors,
 };
 use fracture_voxel::AuthoredVoxelAsset;
@@ -11,6 +12,9 @@ use thiserror::Error;
 use crate::collider_sync::{
     ActorPhysicsHandles, DestructibleActorRef, actor_body_builder_at, actor_collider_build,
     actor_default_contact_material,
+};
+use crate::connect_api::{
+    DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
 use crate::contact_map::{collider_key, rigid_body_key};
 use crate::hooks::{ContactMaterialProperties, FxContactHooks, HookObservation};
@@ -37,6 +41,10 @@ pub enum FxRapierError {
         parent: FxActorId,
         child: FxActorId,
     },
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    #[error("connection policy {0:?} is reserved for a future Rapier adapter implementation")]
+    UnsupportedConnectionPolicy(DynamicConnectionPolicy),
 }
 
 #[derive(Clone, Debug)]
@@ -68,12 +76,16 @@ pub struct FxRapierWorld2D {
     stress_solver: StressSolver2D,
     families: BTreeMap<FxFamilyId, DestructibleFamily>,
     body_actors: BTreeMap<(u32, u32), DestructibleActorRef>,
+    static_anchor_policies: BTreeMap<(FxFamilyId, ExternalBondId), StaticAnchorBodyPolicy>,
+    applied_static_anchor_policies: BTreeMap<(FxFamilyId, FxActorId), StaticAnchorBodyPolicy>,
+    static_anchor_body_baselines: BTreeMap<(FxFamilyId, FxActorId), RigidBodyType>,
     tick: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct BodySnapshot {
     position: Pose,
+    world_center_of_mass: Vector,
     linvel: Vector,
     angvel: f32,
     ccd_enabled: bool,
@@ -106,6 +118,9 @@ impl FxRapierWorld2D {
             stress_solver: StressSolver2D::new(StressSettings::default()),
             families: BTreeMap::new(),
             body_actors: BTreeMap::new(),
+            static_anchor_policies: BTreeMap::new(),
+            applied_static_anchor_policies: BTreeMap::new(),
+            static_anchor_body_baselines: BTreeMap::new(),
             tick: 0,
         }
     }
@@ -245,6 +260,140 @@ impl FxRapierWorld2D {
             .ok_or(FxRapierError::UnknownActor { family, actor })
     }
 
+    pub fn connect_static_anchor(
+        &mut self,
+        family_id: FxFamilyId,
+        desc: StaticAnchorConnectionDesc,
+    ) -> Result<ExternalBondId, FxRapierError> {
+        self.sync_family_actors(family_id)?;
+        let actor = self
+            .families
+            .get(&family_id)
+            .ok_or(FxRapierError::UnknownFamily(family_id))?
+            .family
+            .node_owner(desc.core.node)
+            .ok_or(ConnectionError::UnknownNode(desc.core.node))?;
+        if desc.body_policy != StaticAnchorBodyPolicy::Preserve {
+            self.actor_handles_result(family_id, actor)?;
+        }
+        let id = self
+            .families
+            .get_mut(&family_id)
+            .ok_or(FxRapierError::UnknownFamily(family_id))?
+            .family
+            .connect_static_anchor(desc.core)?;
+        if desc.body_policy != StaticAnchorBodyPolicy::Preserve {
+            self.static_anchor_policies
+                .insert((family_id, id), desc.body_policy);
+        }
+        self.reconcile_static_anchor_body_policies(family_id)?;
+        Ok(id)
+    }
+
+    pub fn connect_dynamic_structural_bond(
+        &mut self,
+        family_id: FxFamilyId,
+        desc: DynamicStructuralConnectionDesc,
+    ) -> Result<ConnectionId, FxRapierError> {
+        if desc.policy == DynamicConnectionPolicy::CustomHardConstraint {
+            return Err(FxRapierError::UnsupportedConnectionPolicy(desc.policy));
+        }
+        self.sync_family_actors(family_id)?;
+        let before_joints = self.impulse_joints.len();
+        let id = self
+            .families
+            .get_mut(&family_id)
+            .ok_or(FxRapierError::UnknownFamily(family_id))?
+            .family
+            .connect_dynamic_structural_bond_graph_only(desc.core)?;
+        debug_assert_eq!(self.impulse_joints.len(), before_joints);
+        Ok(id)
+    }
+
+    pub fn merge_actors(
+        &mut self,
+        family_id: FxFamilyId,
+        actor_a: FxActorId,
+        actor_b: FxActorId,
+    ) -> Result<MergeActorsResult, FxRapierError> {
+        self.sync_family_actors(family_id)?;
+        let snapshots = self.snapshot_family_bodies(family_id);
+        let snapshot_a = snapshots
+            .get(&actor_a)
+            .copied()
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_a,
+            })?;
+        let snapshot_b = snapshots
+            .get(&actor_b)
+            .copied()
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_b,
+            })?;
+        let handles_a = self.actor_handles_result(family_id, actor_a)?;
+        let handles_b = self.actor_handles_result(family_id, actor_b)?;
+        let mass_a = self
+            .bodies
+            .get(handles_a.body)
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_a,
+            })?
+            .mass();
+        let mass_b = self
+            .bodies
+            .get(handles_b.body)
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_b,
+            })?
+            .mass();
+        let result = self
+            .families
+            .get_mut(&family_id)
+            .ok_or(FxRapierError::UnknownFamily(family_id))?
+            .family
+            .merge_actors(actor_a, actor_b)?;
+        let merged_local_origin = self
+            .families
+            .get(&family_id)
+            .and_then(|entry| entry.family.actor(result.kept_actor))
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: result.kept_actor,
+            })?
+            .local_com;
+        let kept_snapshot = if result.kept_actor == actor_a {
+            snapshot_a
+        } else {
+            snapshot_b
+        };
+        let merged_snapshot = merged_body_snapshot(
+            kept_snapshot,
+            snapshot_a,
+            mass_a,
+            snapshot_b,
+            mass_b,
+            merged_local_origin,
+        );
+        self.rebuild_actor_collider_preserving_body(
+            family_id,
+            result.kept_actor,
+            Some(merged_snapshot),
+        )?;
+        self.set_actor_total_mass(family_id, result.kept_actor, mass_a + mass_b)?;
+        self.set_actor_world_center_of_mass(
+            family_id,
+            result.kept_actor,
+            merged_snapshot.world_center_of_mass,
+        )?;
+        self.remove_actor_handles(family_id, result.removed_actor);
+        self.reconcile_static_anchor_body_policies(family_id)?;
+        Ok(result)
+    }
+
     pub fn step(&mut self) -> Result<FxStepReport, FxRapierError> {
         let family_ids = self.families.keys().copied().collect::<Vec<_>>();
         for family_id in family_ids {
@@ -315,17 +464,21 @@ impl FxRapierWorld2D {
                 .cloned()
                 .collect::<Vec<_>>();
             let parent_snapshots = self.snapshot_family_bodies(family_id);
-            let Some(entry) = self.families.get_mut(&family_id) else {
-                return Err(FxRapierError::UnknownFamily(family_id));
+            let split_events = {
+                let Some(entry) = self.families.get_mut(&family_id) else {
+                    return Err(FxRapierError::UnknownFamily(family_id));
+                };
+                let commands = self.stress_solver.generate(&entry.family, &stress_inputs);
+                report
+                    .fracture_events
+                    .extend(apply_fracture_commands(&mut entry.family, &commands));
+                split_dirty_actors(&mut entry.family)
             };
-            let commands = self.stress_solver.generate(&entry.family, &stress_inputs);
-            report
-                .fracture_events
-                .extend(apply_fracture_commands(&mut entry.family, &commands));
-            let split_events = split_dirty_actors(&mut entry.family);
             let split_happened = !split_events.is_empty();
             if split_happened {
                 self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            } else {
+                self.reconcile_static_anchor_body_policies(family_id)?;
             }
             report.split_events.extend(split_events);
         }
@@ -351,6 +504,8 @@ impl FxRapierWorld2D {
         };
         if !split_events.is_empty() {
             self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+        } else {
+            self.reconcile_static_anchor_body_policies(family_id)?;
         }
         Ok(split_events)
     }
@@ -374,6 +529,8 @@ impl FxRapierWorld2D {
         };
         if !split_events.is_empty() {
             self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+        } else {
+            self.reconcile_static_anchor_body_policies(family_id)?;
         }
         Ok(split_events)
     }
@@ -411,6 +568,8 @@ impl FxRapierWorld2D {
             };
             if !split_events.is_empty() {
                 self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            } else {
+                self.reconcile_static_anchor_body_policies(family_id)?;
             }
             out.extend(split_events);
         }
@@ -452,6 +611,7 @@ impl FxRapierWorld2D {
         for actor in stale {
             self.remove_actor_handles(family_id, actor);
         }
+        self.reconcile_static_anchor_body_policies(family_id)?;
         Ok(())
     }
 
@@ -471,6 +631,7 @@ impl FxRapierWorld2D {
                 *actor_id,
                 BodySnapshot {
                     position: *body.position(),
+                    world_center_of_mass: body.center_of_mass(),
                     linvel: body.linvel(),
                     angvel: body.angvel(),
                     ccd_enabled: body.is_ccd_enabled(),
@@ -545,6 +706,7 @@ impl FxRapierWorld2D {
                 }
             }
         }
+        self.reconcile_static_anchor_body_policies(family_id)?;
         Ok(())
     }
 
@@ -766,6 +928,135 @@ impl FxRapierWorld2D {
             true,
         );
     }
+
+    fn set_actor_total_mass(
+        &mut self,
+        family_id: FxFamilyId,
+        actor_id: FxActorId,
+        target_mass: f32,
+    ) -> Result<(), FxRapierError> {
+        let handles = self.actor_handles_result(family_id, actor_id)?;
+        let Some(body) = self.bodies.get_mut(handles.body) else {
+            return Err(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_id,
+            });
+        };
+        body.set_additional_mass(0.0, true);
+        body.recompute_mass_properties_from_colliders(&self.colliders);
+        let collider_mass = body.mass();
+        let additional_mass = (target_mass - collider_mass).max(0.0);
+        body.set_additional_mass(additional_mass, true);
+        body.recompute_mass_properties_from_colliders(&self.colliders);
+        Ok(())
+    }
+
+    fn set_actor_world_center_of_mass(
+        &mut self,
+        family_id: FxFamilyId,
+        actor_id: FxActorId,
+        target_com: Vector,
+    ) -> Result<(), FxRapierError> {
+        let handles = self.actor_handles_result(family_id, actor_id)?;
+        let Some(body) = self.bodies.get_mut(handles.body) else {
+            return Err(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_id,
+            });
+        };
+        let mut position = *body.position();
+        position.translation += target_com - body.center_of_mass();
+        body.set_position(position, true);
+        Ok(())
+    }
+
+    fn reconcile_static_anchor_body_policies(
+        &mut self,
+        family_id: FxFamilyId,
+    ) -> Result<(), FxRapierError> {
+        let (desired, live_actors) = {
+            let entry = self
+                .families
+                .get(&family_id)
+                .ok_or(FxRapierError::UnknownFamily(family_id))?;
+            let mut desired = BTreeMap::new();
+            for ((policy_family, bond_id), policy) in &self.static_anchor_policies {
+                if *policy_family != family_id || *policy == StaticAnchorBodyPolicy::Preserve {
+                    continue;
+                }
+                let Some(bond) = entry.family.external_bond(*bond_id) else {
+                    continue;
+                };
+                if bond.runtime.is_broken() {
+                    continue;
+                }
+                let Some(actor) = entry.family.node_owner(bond.node) else {
+                    continue;
+                };
+                desired
+                    .entry(actor)
+                    .and_modify(|current| {
+                        *current = combine_static_anchor_body_policy(*current, *policy)
+                    })
+                    .or_insert(*policy);
+            }
+            let live_actors = entry
+                .family
+                .actors()
+                .map(|(actor, _)| *actor)
+                .collect::<BTreeSet<_>>();
+            (desired, live_actors)
+        };
+
+        let mut touched = desired.keys().copied().collect::<BTreeSet<_>>();
+        touched.extend(
+            self.applied_static_anchor_policies
+                .keys()
+                .filter_map(|(family, actor)| (*family == family_id).then_some(*actor)),
+        );
+
+        for actor in touched {
+            let key = (family_id, actor);
+            if !live_actors.contains(&actor) {
+                self.applied_static_anchor_policies.remove(&key);
+                self.static_anchor_body_baselines.remove(&key);
+                continue;
+            }
+            match desired.get(&actor).copied() {
+                Some(policy) => {
+                    let handles = self.actor_handles_result(family_id, actor)?;
+                    let Some(body) = self.bodies.get_mut(handles.body) else {
+                        return Err(FxRapierError::UnknownActor {
+                            family: family_id,
+                            actor,
+                        });
+                    };
+                    self.static_anchor_body_baselines
+                        .entry(key)
+                        .or_insert_with(|| body.body_type());
+                    body.set_body_type(rigid_body_type_for_anchor_policy(policy), true);
+                    self.applied_static_anchor_policies.insert(key, policy);
+                }
+                None => {
+                    if self.applied_static_anchor_policies.remove(&key).is_some() {
+                        let baseline = self
+                            .static_anchor_body_baselines
+                            .remove(&key)
+                            .unwrap_or(RigidBodyType::Dynamic);
+                        let handles = self.actor_handles_result(family_id, actor)?;
+                        let Some(body) = self.bodies.get_mut(handles.body) else {
+                            return Err(FxRapierError::UnknownActor {
+                                family: family_id,
+                                actor,
+                            });
+                        };
+                        body.set_body_type(baseline, true);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn apply_body_snapshot(body: &mut RigidBody, snapshot: BodySnapshot) {
@@ -789,4 +1080,64 @@ fn child_world_translation(snapshot: BodySnapshot, child_local_com: Vec2) -> Vec
         child_local_com.y - snapshot.body_local_origin_in_asset.y,
     );
     snapshot.position.translation + snapshot.position.rotation * delta
+}
+
+fn merged_body_snapshot(
+    kept_snapshot: BodySnapshot,
+    snapshot_a: BodySnapshot,
+    mass_a: f32,
+    snapshot_b: BodySnapshot,
+    mass_b: f32,
+    body_local_origin_in_asset: Vec2,
+) -> BodySnapshot {
+    let total_mass = mass_a + mass_b;
+    let (weight_a, weight_b) = if total_mass > 0.0 && total_mass.is_finite() {
+        (mass_a / total_mass, mass_b / total_mass)
+    } else {
+        (0.5, 0.5)
+    };
+    // Phase 4 preserves linear momentum exactly for the merged body. Angular
+    // momentum is approximated deterministically with a mass-weighted angular
+    // velocity because full inertia transfer across two arbitrary body poses is
+    // outside the MVP connection contract.
+    BodySnapshot {
+        position: Pose::from_parts(
+            snapshot_a.world_center_of_mass * weight_a + snapshot_b.world_center_of_mass * weight_b,
+            kept_snapshot.position.rotation,
+        ),
+        world_center_of_mass: snapshot_a.world_center_of_mass * weight_a
+            + snapshot_b.world_center_of_mass * weight_b,
+        linvel: snapshot_a.linvel * weight_a + snapshot_b.linvel * weight_b,
+        angvel: snapshot_a.angvel * weight_a + snapshot_b.angvel * weight_b,
+        ccd_enabled: snapshot_a.ccd_enabled || snapshot_b.ccd_enabled,
+        soft_ccd_prediction: snapshot_a
+            .soft_ccd_prediction
+            .max(snapshot_b.soft_ccd_prediction),
+        was_sleeping: snapshot_a.was_sleeping && snapshot_b.was_sleeping,
+        body_local_origin_in_asset,
+    }
+}
+
+fn rigid_body_type_for_anchor_policy(policy: StaticAnchorBodyPolicy) -> RigidBodyType {
+    match policy {
+        StaticAnchorBodyPolicy::Preserve => RigidBodyType::Dynamic,
+        StaticAnchorBodyPolicy::Fixed => RigidBodyType::Fixed,
+        StaticAnchorBodyPolicy::KinematicVelocityBased => RigidBodyType::KinematicVelocityBased,
+    }
+}
+
+fn combine_static_anchor_body_policy(
+    current: StaticAnchorBodyPolicy,
+    next: StaticAnchorBodyPolicy,
+) -> StaticAnchorBodyPolicy {
+    match (current, next) {
+        (StaticAnchorBodyPolicy::Fixed, _) | (_, StaticAnchorBodyPolicy::Fixed) => {
+            StaticAnchorBodyPolicy::Fixed
+        }
+        (StaticAnchorBodyPolicy::KinematicVelocityBased, _)
+        | (_, StaticAnchorBodyPolicy::KinematicVelocityBased) => {
+            StaticAnchorBodyPolicy::KinematicVelocityBased
+        }
+        _ => StaticAnchorBodyPolicy::Preserve,
+    }
 }

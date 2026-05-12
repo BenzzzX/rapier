@@ -57,7 +57,7 @@ Required for Phase 1:
 - Runtime `bond_health`, `effective_length`, and `chunk_health` arrays have deterministic indexing keyed by asset or stable runtime IDs.
 - Broken bonds do not contribute to island connectivity.
 - Family ID allocation is deterministic in deterministic mode and monotonic within a core-local test state.
-- Phase 1 must expose enough core-local state for determinism tests: actor ownership, bond health, effective length, chunk health, stable ID allocator state, and pending command order keys must be readable through a `deterministic_state_digest`, debug dump, or serializable test state. External bond state remains a Phase 4 forward concern and must not be required by the Phase 1 digest/readable state.
+- Phase 1 must expose enough core-local state for determinism tests: actor ownership, bond health, effective length, chunk health, stable ID allocator state, and pending command order keys must be readable through a `deterministic_state_digest`, debug dump, or serializable test state. Phase 4 extends that deterministic state to external bonds and dynamic structural connections.
 - Full binary checkpoint format, full replay module, and long-running restore validation are Phase 5 responsibilities, not Phase 1 requirements.
 
 Suggested tests:
@@ -125,20 +125,30 @@ Suggested tests:
 
 ## `ExternalBond2D`
 
-Phase 4 forward invariant:
+Phase 4 implemented invariant:
 
-- `ExternalBond2D` is not a Phase 1 required implementation gate.
-- Phase 1 must not expose a public/runtime external connection API, mutate `FxFamily` through external bonds, or include external bond state in the Phase 1 deterministic digest.
-- Phase 4 must provide an explicit connection API for world/static external bonds, dynamic merge, and dynamic structural bond behavior.
-- A future `ExternalBond2D` has exactly one internal support node endpoint and one external target endpoint.
-- A future `ExternalBond2D` may use an opaque external endpoint or enum token for `World`, static collider, kinematic target, dynamic merge, or dynamic structural bond.
-- A future `ExternalBond2D` must not imply a default Rapier soft joint.
-- Future static/world external endpoints should act as fixed/infinite-mass endpoints for graph/stress semantics once the connection API is implemented.
+- `ExternalBond2D` has exactly one internal support node endpoint and one external target endpoint represented by an engine-neutral target kind/token, not a Rapier handle.
+- `FxFamily` exposes explicit APIs for static/world external anchors, same-family actor merge, and GraphOnly dynamic structural bonds.
+- External bond descriptors must reference owned support nodes, unique external bond IDs, finite vectors, and finite nonnegative runtime scalars.
+- External bond target, anchor, normal/tangent, limits, and runtime state are part of the deterministic core digest.
+- Static/world external endpoints act as fixed/infinite endpoints for core stress/fracture while their external bond remains unbroken.
+- Broken external bonds are ignored by stress, damage generation, and direct fracture apply.
+- The Rapier adapter may apply an explicit static-anchor body policy (`Fixed` or kinematic) while the owning actor has a live unbroken anchor, and must reconcile that policy after split/sync and after external bond damage. The default policy preserves a dynamic body.
+- Dynamic structural bonds are limited to node references in the same `FxFamily` and same asset. Descriptors must use unique IDs, owned endpoints, finite vectors, finite nonnegative runtime scalars, and no self-connection.
+- GraphOnly dynamic structural bonds affect core graph/stress/fracture state but do not create default Rapier soft, fixed, spring, or impulse joints.
+- Broken dynamic structural bonds are ignored by graph traversal, stress, damage generation, and direct fracture apply.
+- Dynamic merge is same-family/same-asset only and requires an unbroken GraphOnly dynamic structural bond between the two actors. A merge without that connection must return an explicit error without core/Rapier side effects.
+- A successful merge must preserve the active actor `owned_nodes` graph-connectivity invariant. It must not create a clean active actor with disconnected ownership.
+- The Rapier adapter merges two actor bodies into one kept actor, removes stale body/collider handles, and preserves mass/COM/linear velocity. Angular velocity uses a deterministic mass-weighted fallback rather than full angular momentum transfer.
+- `CustomHardConstraint` is explicitly unsupported in Phase 4 and must return an error without side effects.
+- Phase 4 does not implement cross-family/cross-asset merge or Phase 5 snapshot/replay/checkpoint behavior.
 
-Forward tests:
+Phase 4 tests:
 
-- `explicit_static_anchor` from plan 20.3 is deferred to Phase 4 connection API validation; it does not block the Phase 1 core commit.
-- Future Phase 4 tests should cover world/static anchors, dynamic merge, and dynamic structural bond graph semantics without default soft joints.
+- Static anchors are covered by `static_anchor_stress_fixed_endpoint`, `static_anchor_marks_actor_fixed_or_kinematic`, `static_anchor_policy_moves_to_split_child`, and `broken_static_anchor_clears_body_policy`.
+- Dynamic merge is covered by `same_family_actor_merge_preserves_connection_state`, `merge_actors_requires_unbroken_graph_connection`, `merge_preserves_dirty_split_obligation`, `dynamic_merge_conserves_mass_com_velocity`, and `dynamic_merge_requires_graph_connection_no_side_effects`.
+- GraphOnly dynamic bonds are covered by `dynamic_bond_graph_only`, `graph_only_connection_stress_generates_once_for_two_endpoint_inputs`, and `dynamic_bond_custom_hard_constraint_is_future_error`.
+- Connection determinism, broken-connection behavior, and repair validation are covered by `phase4_digest_includes_connection_state`, `broken_external_and_dynamic_connections_ignore_direct_damage`, `connection_validation_rejects_invalid_inputs`, `repair_plan_rejects_removed_external_bond_endpoint`, and `repair_plan_rejects_removed_dynamic_connection_endpoint`.
 
 ## `DamageCommand` and `FractureCommand` Flow
 
@@ -297,8 +307,8 @@ Phase 1 should not pass until these plan 20.1, 20.2, 20.3, and 20.5 obligations 
 | 20.3 | `remove_voxel_splits_node` | Phase 2 forward invariant; Phase 1 data lineage must support it |
 | 20.3 | `add_voxel_no_auto_merge` | Phase 2 forward invariant; no implicit merge behavior in Phase 1 |
 | 20.3 | `repair_preserves_bond_damage` | Phase 2 forward invariant; bond lineage/effective length must support it |
-| 20.3 | `explicit_static_anchor` | Phase 4 forward test for connection API; not required for Phase 1 core commit |
-| 20.3 | `dynamic_merge_conserves_momentum` | Later than Phase 1 unless dynamic merge policy is implemented early |
+| 20.3 | `explicit_static_anchor` | Implemented in Phase 4 static-anchor connection tests |
+| 20.3 | `dynamic_merge_conserves_momentum` | Implemented for Phase 4 mass/COM/linear velocity; angular velocity uses documented deterministic fallback |
 | 20.5 | `deterministic_sort_commands` | Required |
 | 20.5 | `replay_split_order` | Required |
 | 20.5 | `snapshot_restore` | Phase 5 checkpoint/replay responsibility; Phase 1 only needs `deterministic_state_digest` or an equivalent core-local debug/test state |

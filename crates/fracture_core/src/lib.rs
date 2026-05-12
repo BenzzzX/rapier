@@ -94,6 +94,9 @@ id_type!(FxActorId);
 id_type!(SupportNodeId);
 id_type!(ChunkId);
 id_type!(BondId);
+id_type!(ConnectionId);
+id_type!(ExternalBondId);
+id_type!(ExternalTargetToken);
 id_type!(CommandId);
 id_type!(EventId);
 
@@ -681,6 +684,87 @@ impl BondRuntimeState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternalTargetKind {
+    World,
+    Static,
+    Kinematic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalTarget2D {
+    pub kind: ExternalTargetKind,
+    pub token: ExternalTargetToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicConnectionPolicy {
+    GraphOnly,
+    CustomHardConstraint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalBond2D {
+    pub id: ExternalBondId,
+    pub node: SupportNodeId,
+    pub target: ExternalTarget2D,
+    pub anchor: Vec2,
+    pub normal: Vec2,
+    pub tangent: Vec2,
+    pub base_health: f32,
+    pub tension_limit: f32,
+    pub shear_limit: f32,
+    pub runtime: BondRuntimeState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicStructuralBond2D {
+    pub id: ConnectionId,
+    pub node_a: SupportNodeId,
+    pub node_b: SupportNodeId,
+    pub policy: DynamicConnectionPolicy,
+    pub centroid: Vec2,
+    pub normal: Vec2,
+    pub tangent: Vec2,
+    pub base_health: f32,
+    pub tension_limit: f32,
+    pub shear_limit: f32,
+    pub runtime: BondRuntimeState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StaticAnchorDesc {
+    pub id: ExternalBondId,
+    pub node: SupportNodeId,
+    pub target: ExternalTarget2D,
+    pub anchor: Vec2,
+    pub normal: Vec2,
+    pub health: f32,
+    pub effective_length: f32,
+    pub tension_limit: f32,
+    pub shear_limit: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicStructuralBondDesc {
+    pub id: ConnectionId,
+    pub node_a: SupportNodeId,
+    pub node_b: SupportNodeId,
+    pub centroid: Vec2,
+    pub normal: Vec2,
+    pub health: f32,
+    pub effective_length: f32,
+    pub tension_limit: f32,
+    pub shear_limit: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeActorsResult {
+    pub kept_actor: FxActorId,
+    pub removed_actor: FxActorId,
+    pub owned_nodes: Vec<SupportNodeId>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeRuntimeState {
     pub health: f32,
@@ -711,6 +795,8 @@ pub struct FxFamily {
     node_owner: BTreeMap<SupportNodeId, FxActorId>,
     node_states: BTreeMap<SupportNodeId, NodeRuntimeState>,
     bond_states: Vec<BondRuntimeState>,
+    external_bonds: BTreeMap<ExternalBondId, ExternalBond2D>,
+    dynamic_structural_bonds: BTreeMap<ConnectionId, DynamicStructuralBond2D>,
     dirty_actors: BTreeSet<FxActorId>,
     next_actor_id: u32,
     next_event_id: u32,
@@ -749,6 +835,8 @@ impl FxFamily {
             node_owner: BTreeMap::new(),
             node_states,
             bond_states,
+            external_bonds: BTreeMap::new(),
+            dynamic_structural_bonds: BTreeMap::new(),
             dirty_actors: BTreeSet::new(),
             next_actor_id: 0,
             next_event_id: 0,
@@ -795,6 +883,24 @@ impl FxFamily {
         &self.bond_states
     }
 
+    pub fn external_bonds(&self) -> impl Iterator<Item = (&ExternalBondId, &ExternalBond2D)> {
+        self.external_bonds.iter()
+    }
+
+    pub fn external_bond(&self, id: ExternalBondId) -> Option<&ExternalBond2D> {
+        self.external_bonds.get(&id)
+    }
+
+    pub fn dynamic_structural_bonds(
+        &self,
+    ) -> impl Iterator<Item = (&ConnectionId, &DynamicStructuralBond2D)> {
+        self.dynamic_structural_bonds.iter()
+    }
+
+    pub fn dynamic_structural_bond(&self, id: ConnectionId) -> Option<&DynamicStructuralBond2D> {
+        self.dynamic_structural_bonds.get(&id)
+    }
+
     pub fn node_state(&self, node: SupportNodeId) -> Option<&NodeRuntimeState> {
         self.node_states.get(&node)
     }
@@ -832,6 +938,188 @@ impl FxFamily {
 
     pub fn bond_state(&self, id: BondId) -> Option<&BondRuntimeState> {
         self.bond_states.get(id.0 as usize)
+    }
+
+    pub fn external_bond_state(&self, id: ExternalBondId) -> Option<&BondRuntimeState> {
+        self.external_bonds.get(&id).map(|bond| &bond.runtime)
+    }
+
+    pub fn dynamic_structural_bond_state(&self, id: ConnectionId) -> Option<&BondRuntimeState> {
+        self.dynamic_structural_bonds
+            .get(&id)
+            .map(|bond| &bond.runtime)
+    }
+
+    pub fn connect_static_anchor(
+        &mut self,
+        desc: StaticAnchorDesc,
+    ) -> Result<ExternalBondId, ConnectionError> {
+        self.validate_owned_node(desc.node)?;
+        if self.external_bonds.contains_key(&desc.id) {
+            return Err(ConnectionError::DuplicateExternalBond(desc.id));
+        }
+        validate_connection_scalars(
+            desc.health,
+            desc.effective_length,
+            desc.tension_limit,
+            desc.shear_limit,
+        )
+        .map_err(|_| ConnectionError::InvalidExternalBondRuntime(desc.id))?;
+        let normal = validate_direction(desc.normal)
+            .ok_or(ConnectionError::InvalidExternalBondRuntime(desc.id))?;
+        let tangent = normal.perp();
+        if !valid_vec2(desc.anchor) {
+            return Err(ConnectionError::InvalidExternalBondRuntime(desc.id));
+        }
+        let id = desc.id;
+        self.external_bonds.insert(
+            id,
+            ExternalBond2D {
+                id,
+                node: desc.node,
+                target: desc.target,
+                anchor: desc.anchor,
+                normal,
+                tangent,
+                base_health: desc.health,
+                tension_limit: desc.tension_limit,
+                shear_limit: desc.shear_limit,
+                runtime: BondRuntimeState {
+                    health: desc.health,
+                    effective_length: desc.effective_length,
+                    accumulated_damage: 0.0,
+                },
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn connect_dynamic_structural_bond_graph_only(
+        &mut self,
+        desc: DynamicStructuralBondDesc,
+    ) -> Result<ConnectionId, ConnectionError> {
+        self.validate_owned_node(desc.node_a)?;
+        self.validate_owned_node(desc.node_b)?;
+        if desc.node_a == desc.node_b {
+            return Err(ConnectionError::SelfConnection(desc.node_a));
+        }
+        if self.dynamic_structural_bonds.contains_key(&desc.id) {
+            return Err(ConnectionError::DuplicateConnection(desc.id));
+        }
+        validate_connection_scalars(
+            desc.health,
+            desc.effective_length,
+            desc.tension_limit,
+            desc.shear_limit,
+        )
+        .map_err(|_| ConnectionError::InvalidConnectionRuntime(desc.id))?;
+        let normal = validate_direction(desc.normal)
+            .ok_or(ConnectionError::InvalidConnectionRuntime(desc.id))?;
+        if !valid_vec2(desc.centroid) {
+            return Err(ConnectionError::InvalidConnectionRuntime(desc.id));
+        }
+        let tangent = normal.perp();
+        let (node_a, node_b, normal, tangent) = if desc.node_a <= desc.node_b {
+            (desc.node_a, desc.node_b, normal, tangent)
+        } else {
+            (desc.node_b, desc.node_a, normal * -1.0, tangent * -1.0)
+        };
+        let id = desc.id;
+        self.dynamic_structural_bonds.insert(
+            id,
+            DynamicStructuralBond2D {
+                id,
+                node_a,
+                node_b,
+                policy: DynamicConnectionPolicy::GraphOnly,
+                centroid: desc.centroid,
+                normal,
+                tangent,
+                base_health: desc.health,
+                tension_limit: desc.tension_limit,
+                shear_limit: desc.shear_limit,
+                runtime: BondRuntimeState {
+                    health: desc.health,
+                    effective_length: desc.effective_length,
+                    accumulated_damage: 0.0,
+                },
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn merge_actors(
+        &mut self,
+        actor_a: FxActorId,
+        actor_b: FxActorId,
+    ) -> Result<MergeActorsResult, ConnectionError> {
+        if actor_a == actor_b {
+            return Err(ConnectionError::SelfMerge(actor_a));
+        }
+        let actor_a_nodes = self
+            .actors
+            .get(&actor_a)
+            .ok_or(ConnectionError::UnknownActor(actor_a))?
+            .owned_nodes
+            .clone();
+        let actor_b_nodes = self
+            .actors
+            .get(&actor_b)
+            .ok_or(ConnectionError::UnknownActor(actor_b))?
+            .owned_nodes
+            .clone();
+        if !self.has_unbroken_graph_connection_between(&actor_a_nodes, &actor_b_nodes) {
+            return Err(ConnectionError::MissingMergeConnection { actor_a, actor_b });
+        }
+        let (kept_actor, removed_actor, mut owned_nodes) = if actor_a <= actor_b {
+            let mut nodes = actor_a_nodes;
+            nodes.extend(actor_b_nodes);
+            (actor_a, actor_b, nodes)
+        } else {
+            let mut nodes = actor_b_nodes;
+            nodes.extend(actor_a_nodes);
+            (actor_b, actor_a, nodes)
+        };
+        owned_nodes.sort_unstable();
+        owned_nodes.dedup();
+        for node in &owned_nodes {
+            self.node_owner.insert(*node, kept_actor);
+        }
+        self.actors.insert(
+            kept_actor,
+            build_actor(kept_actor, &owned_nodes, &self.asset),
+        );
+        self.actors.remove(&removed_actor);
+        self.dirty_actors.remove(&actor_a);
+        self.dirty_actors.remove(&actor_b);
+        if self
+            .actors
+            .get(&kept_actor)
+            .is_some_and(|actor| actor_components(actor, self).len() > 1)
+        {
+            self.dirty_actors.insert(kept_actor);
+        }
+        Ok(MergeActorsResult {
+            kept_actor,
+            removed_actor,
+            owned_nodes,
+        })
+    }
+
+    fn has_unbroken_graph_connection_between(
+        &self,
+        actor_a_nodes: &[SupportNodeId],
+        actor_b_nodes: &[SupportNodeId],
+    ) -> bool {
+        let actor_a_nodes = actor_a_nodes.iter().copied().collect::<BTreeSet<_>>();
+        let actor_b_nodes = actor_b_nodes.iter().copied().collect::<BTreeSet<_>>();
+        self.dynamic_structural_bonds.values().any(|bond| {
+            bond.policy == DynamicConnectionPolicy::GraphOnly
+                && !bond.runtime.is_broken()
+                && ((actor_a_nodes.contains(&bond.node_a) && actor_b_nodes.contains(&bond.node_b))
+                    || (actor_a_nodes.contains(&bond.node_b)
+                        && actor_b_nodes.contains(&bond.node_a)))
+        })
     }
 
     pub fn deterministic_state_digest(&self) -> u64 {
@@ -909,6 +1197,49 @@ impl FxFamily {
             hasher.write_f32(state.effective_length);
             hasher.write_f32(state.accumulated_damage);
         }
+        for (id, bond) in &self.external_bonds {
+            hasher.write_u32(id.0);
+            hasher.write_u32(bond.node.0);
+            hasher.write_u32(match bond.target.kind {
+                ExternalTargetKind::World => 0,
+                ExternalTargetKind::Static => 1,
+                ExternalTargetKind::Kinematic => 2,
+            });
+            hasher.write_u32(bond.target.token.0);
+            hasher.write_f32(bond.anchor.x);
+            hasher.write_f32(bond.anchor.y);
+            hasher.write_f32(bond.normal.x);
+            hasher.write_f32(bond.normal.y);
+            hasher.write_f32(bond.tangent.x);
+            hasher.write_f32(bond.tangent.y);
+            hasher.write_f32(bond.base_health);
+            hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.shear_limit);
+            hasher.write_f32(bond.runtime.health);
+            hasher.write_f32(bond.runtime.effective_length);
+            hasher.write_f32(bond.runtime.accumulated_damage);
+        }
+        for (id, bond) in &self.dynamic_structural_bonds {
+            hasher.write_u32(id.0);
+            hasher.write_u32(bond.node_a.0);
+            hasher.write_u32(bond.node_b.0);
+            hasher.write_u32(match bond.policy {
+                DynamicConnectionPolicy::GraphOnly => 0,
+                DynamicConnectionPolicy::CustomHardConstraint => 1,
+            });
+            hasher.write_f32(bond.centroid.x);
+            hasher.write_f32(bond.centroid.y);
+            hasher.write_f32(bond.normal.x);
+            hasher.write_f32(bond.normal.y);
+            hasher.write_f32(bond.tangent.x);
+            hasher.write_f32(bond.tangent.y);
+            hasher.write_f32(bond.base_health);
+            hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.shear_limit);
+            hasher.write_f32(bond.runtime.health);
+            hasher.write_f32(bond.runtime.effective_length);
+            hasher.write_f32(bond.runtime.accumulated_damage);
+        }
         for actor in &self.dirty_actors {
             hasher.write_u32(actor.0);
         }
@@ -926,6 +1257,23 @@ impl FxFamily {
             self.dirty_actors.insert(*actor);
         }
         if let Some(actor) = self.node_owner.get(&bond.node_b) {
+            self.dirty_actors.insert(*actor);
+        }
+    }
+
+    fn validate_owned_node(&self, node: SupportNodeId) -> Result<(), ConnectionError> {
+        if self.asset.node(node).is_some() && self.node_owner.contains_key(&node) {
+            Ok(())
+        } else {
+            Err(ConnectionError::UnknownNode(node))
+        }
+    }
+
+    fn mark_connection_dirty(&mut self, node_a: SupportNodeId, node_b: SupportNodeId) {
+        if let Some(actor) = self.node_owner.get(&node_a) {
+            self.dirty_actors.insert(*actor);
+        }
+        if let Some(actor) = self.node_owner.get(&node_b) {
             self.dirty_actors.insert(*actor);
         }
     }
@@ -986,6 +1334,7 @@ impl FxFamily {
                 return Err(RepairError::MissingNodeState(*node));
             }
         }
+        self.validate_connection_endpoints_for_repair(&plan.asset, &node_owner)?;
 
         let mut grouped: BTreeMap<FxActorId, Vec<SupportNodeId>> = BTreeMap::new();
         for (node, actor) in &node_owner {
@@ -1030,6 +1379,8 @@ impl FxFamily {
             node_owner: node_owner.clone(),
             node_states: node_states.clone(),
             bond_states: plan.bond_states.clone(),
+            external_bonds: self.external_bonds.clone(),
+            dynamic_structural_bonds: self.dynamic_structural_bonds.clone(),
             dirty_actors: dirty_actors.clone(),
             next_actor_id: self.next_actor_id,
             next_event_id: self.next_event_id,
@@ -1059,6 +1410,36 @@ impl FxFamily {
             dirty_actors: self.dirty_actors.iter().copied().collect(),
             actor_order,
         })
+    }
+
+    fn validate_connection_endpoints_for_repair(
+        &self,
+        asset: &FxAsset,
+        node_owner: &BTreeMap<SupportNodeId, FxActorId>,
+    ) -> Result<(), RepairError> {
+        for bond in self.external_bonds.values() {
+            if asset.node(bond.node).is_none() || !node_owner.contains_key(&bond.node) {
+                return Err(RepairError::StaleExternalBondEndpoint {
+                    bond: bond.id,
+                    node: bond.node,
+                });
+            }
+        }
+        for bond in self.dynamic_structural_bonds.values() {
+            if asset.node(bond.node_a).is_none() || !node_owner.contains_key(&bond.node_a) {
+                return Err(RepairError::StaleDynamicConnectionEndpoint {
+                    connection: bond.id,
+                    node: bond.node_a,
+                });
+            }
+            if asset.node(bond.node_b).is_none() || !node_owner.contains_key(&bond.node_b) {
+                return Err(RepairError::StaleDynamicConnectionEndpoint {
+                    connection: bond.id,
+                    node: bond.node_b,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1108,6 +1489,41 @@ pub enum RepairError {
     DisconnectedActorNotDirty(FxActorId),
     #[error("repair plan bond state count mismatch: expected {expected}, got {actual}")]
     BondStateCountMismatch { expected: usize, actual: usize },
+    #[error("repair plan leaves external bond {bond:?} endpoint {node:?} stale")]
+    StaleExternalBondEndpoint {
+        bond: ExternalBondId,
+        node: SupportNodeId,
+    },
+    #[error("repair plan leaves dynamic connection {connection:?} endpoint {node:?} stale")]
+    StaleDynamicConnectionEndpoint {
+        connection: ConnectionId,
+        node: SupportNodeId,
+    },
+}
+
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum ConnectionError {
+    #[error("connection references unknown node {0:?}")]
+    UnknownNode(SupportNodeId),
+    #[error("external bond id {0:?} is already active")]
+    DuplicateExternalBond(ExternalBondId),
+    #[error("dynamic connection id {0:?} is already active")]
+    DuplicateConnection(ConnectionId),
+    #[error("connection cannot connect support node {0:?} to itself")]
+    SelfConnection(SupportNodeId),
+    #[error("external bond {0:?} has invalid finite nonnegative runtime values")]
+    InvalidExternalBondRuntime(ExternalBondId),
+    #[error("dynamic connection {0:?} has invalid finite nonnegative runtime values")]
+    InvalidConnectionRuntime(ConnectionId),
+    #[error("merge references unknown actor {0:?}")]
+    UnknownActor(FxActorId),
+    #[error("actor {0:?} cannot be merged with itself")]
+    SelfMerge(FxActorId),
+    #[error("actors {actor_a:?} and {actor_b:?} have no unbroken graph connection to merge")]
+    MissingMergeConnection {
+        actor_a: FxActorId,
+        actor_b: FxActorId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1149,6 +1565,8 @@ pub enum DamageSource {
 pub enum FractureTarget {
     Bond(BondId),
     Node(SupportNodeId),
+    ExternalBond(ExternalBondId),
+    Connection(ConnectionId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1232,6 +1650,70 @@ pub fn generate_damage_commands(family: &FxFamily, inputs: &[DamageInput]) -> Ve
                             source: input.source,
                         });
                     }
+                }
+                for bond in family.external_bonds.values() {
+                    let target = FractureTarget::ExternalBond(bond.id);
+                    if !bond.runtime.is_broken()
+                        && bond.node == node_id
+                        && actor_owns_target(family, input.actor, target)
+                    {
+                        out.push(FractureCommand {
+                            order_key: input.order_key,
+                            actor: input.actor,
+                            target,
+                            health_loss,
+                            effective_length_loss,
+                            source: input.source,
+                        });
+                    }
+                }
+                for bond in family.dynamic_structural_bonds.values() {
+                    let target = FractureTarget::Connection(bond.id);
+                    if !bond.runtime.is_broken()
+                        && (bond.node_a == node_id || bond.node_b == node_id)
+                        && actor_owns_target(family, input.actor, target)
+                    {
+                        out.push(FractureCommand {
+                            order_key: input.order_key,
+                            actor: input.actor,
+                            target,
+                            health_loss,
+                            effective_length_loss,
+                            source: input.source,
+                        });
+                    }
+                }
+            }
+            FractureTarget::ExternalBond(bond_id) => {
+                if family
+                    .external_bonds
+                    .get(&bond_id)
+                    .is_some_and(|bond| !bond.runtime.is_broken())
+                {
+                    out.push(FractureCommand {
+                        order_key: input.order_key,
+                        actor: input.actor,
+                        target: input.target,
+                        health_loss,
+                        effective_length_loss,
+                        source: input.source,
+                    });
+                }
+            }
+            FractureTarget::Connection(connection_id) => {
+                if family
+                    .dynamic_structural_bonds
+                    .get(&connection_id)
+                    .is_some_and(|bond| !bond.runtime.is_broken())
+                {
+                    out.push(FractureCommand {
+                        order_key: input.order_key,
+                        actor: input.actor,
+                        target: input.target,
+                        health_loss,
+                        effective_length_loss,
+                        source: input.source,
+                    });
                 }
             }
         }
@@ -1326,6 +1808,65 @@ pub fn apply_fracture_commands(
                     source: command.source,
                 });
             }
+            FractureTarget::ExternalBond(bond_id) => {
+                let Some(bond) = family.external_bonds.get_mut(&bond_id) else {
+                    continue;
+                };
+                if bond.runtime.is_broken() {
+                    continue;
+                }
+                let old_health = bond.runtime.health;
+                let old_effective_length = bond.runtime.effective_length;
+                bond.runtime.health = (bond.runtime.health - health_loss).max(0.0);
+                bond.runtime.effective_length =
+                    (bond.runtime.effective_length - effective_length_loss).max(0.0);
+                bond.runtime.accumulated_damage += health_loss;
+                let new_health = bond.runtime.health;
+                let new_effective_length = bond.runtime.effective_length;
+                events.push(FractureEvent {
+                    event_id: family.next_event_id(),
+                    order_key: command.order_key,
+                    family: family.id,
+                    actor: command.actor,
+                    target: command.target,
+                    old_health,
+                    new_health,
+                    old_effective_length,
+                    new_effective_length,
+                    source: command.source,
+                });
+            }
+            FractureTarget::Connection(connection_id) => {
+                let Some(bond) = family.dynamic_structural_bonds.get_mut(&connection_id) else {
+                    continue;
+                };
+                if bond.runtime.is_broken() {
+                    continue;
+                }
+                let node_a = bond.node_a;
+                let node_b = bond.node_b;
+                let old_health = bond.runtime.health;
+                let old_effective_length = bond.runtime.effective_length;
+                bond.runtime.health = (bond.runtime.health - health_loss).max(0.0);
+                bond.runtime.effective_length =
+                    (bond.runtime.effective_length - effective_length_loss).max(0.0);
+                bond.runtime.accumulated_damage += health_loss;
+                let new_health = bond.runtime.health;
+                let new_effective_length = bond.runtime.effective_length;
+                family.mark_connection_dirty(node_a, node_b);
+                events.push(FractureEvent {
+                    event_id: family.next_event_id(),
+                    order_key: command.order_key,
+                    family: family.id,
+                    actor: command.actor,
+                    target: command.target,
+                    old_health,
+                    new_health,
+                    old_effective_length,
+                    new_effective_length,
+                    source: command.source,
+                });
+            }
         }
     }
     events
@@ -1341,6 +1882,17 @@ fn actor_owns_target(family: &FxFamily, actor: FxActorId, target: FractureTarget
                 && family.node_owner.get(&bond.node_b) == Some(&actor)
         }
         FractureTarget::Node(node_id) => family.node_owner.get(&node_id) == Some(&actor),
+        FractureTarget::ExternalBond(bond_id) => family
+            .external_bonds
+            .get(&bond_id)
+            .is_some_and(|bond| family.node_owner.get(&bond.node) == Some(&actor)),
+        FractureTarget::Connection(connection_id) => family
+            .dynamic_structural_bonds
+            .get(&connection_id)
+            .is_some_and(|bond| {
+                family.node_owner.get(&bond.node_a) == Some(&actor)
+                    || family.node_owner.get(&bond.node_b) == Some(&actor)
+            }),
     }
 }
 
@@ -1395,6 +1947,30 @@ impl StressSolver2D {
                 .and_modify(|key| *key = (*key).min(input.order_key))
                 .or_insert(input.order_key);
             source_by_actor.entry(input.actor).or_insert(input.source);
+        }
+        let mut dynamic_connection_actor: BTreeMap<
+            ConnectionId,
+            (FxActorId, DeterministicOrderKey),
+        > = BTreeMap::new();
+        for bond in family.dynamic_structural_bonds.values() {
+            if bond.policy != DynamicConnectionPolicy::GraphOnly || bond.runtime.is_broken() {
+                continue;
+            }
+            let mut candidates = Vec::new();
+            for node in [bond.node_a, bond.node_b] {
+                let Some(actor) = family.node_owner.get(&node).copied() else {
+                    continue;
+                };
+                let Some(order_key) = first_key_by_actor.get(&actor).copied() else {
+                    continue;
+                };
+                candidates.push((order_key, actor));
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            if let Some((order_key, actor)) = candidates.first().copied() {
+                dynamic_connection_actor.insert(bond.id, (actor, order_key));
+            }
         }
 
         let mut commands = Vec::new();
@@ -1452,6 +2028,123 @@ impl StressSolver2D {
                         health_loss: self.settings.damage_per_overload,
                         effective_length_loss: if tension > tension_limit {
                             bond.length
+                        } else {
+                            0.0
+                        },
+                        source: *source_by_actor
+                            .get(actor_id)
+                            .unwrap_or(&DamageSource::Stress),
+                    });
+                }
+            }
+            for bond in family.dynamic_structural_bonds.values() {
+                if bond.policy != DynamicConnectionPolicy::GraphOnly {
+                    continue;
+                }
+                let Some((connection_actor, connection_order_key)) =
+                    dynamic_connection_actor.get(&bond.id).copied()
+                else {
+                    continue;
+                };
+                if connection_actor != *actor_id {
+                    continue;
+                }
+                let Some(owner_a) = family.node_owner.get(&bond.node_a).copied() else {
+                    continue;
+                };
+                let Some(owner_b) = family.node_owner.get(&bond.node_b).copied() else {
+                    continue;
+                };
+                let Some(actor_a) = family.actor(owner_a) else {
+                    continue;
+                };
+                let Some(actor_b) = family.actor(owner_b) else {
+                    continue;
+                };
+                let side_a = component_without_dynamic_connection(
+                    actor_a,
+                    family,
+                    bond.node_a,
+                    Some(bond.id),
+                );
+                let side_b = component_without_dynamic_connection(
+                    actor_b,
+                    family,
+                    bond.node_b,
+                    Some(bond.id),
+                );
+                let force_a = side_a.iter().fold(Vec2::ZERO, |acc, node| {
+                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+                });
+                let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
+                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+                });
+                let load_a = force_a
+                    .dot(bond.normal)
+                    .abs()
+                    .max(force_a.dot(bond.tangent).abs());
+                let load_b = force_b
+                    .dot(bond.normal)
+                    .abs()
+                    .max(force_b.dot(bond.tangent).abs());
+                let side_force = if load_b > load_a { force_b } else { force_a };
+                let tension = side_force.dot(bond.normal).abs();
+                let shear = side_force.dot(bond.tangent).abs();
+                let health_ratio = if bond.base_health > 0.0 {
+                    (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let tension_limit = bond.tension_limit
+                    * self.settings.tension_limit_scale
+                    * health_ratio.max(0.001);
+                let shear_limit =
+                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
+                if tension > tension_limit || shear > shear_limit {
+                    actor_commands.push(FractureCommand {
+                        order_key: connection_order_key,
+                        actor: connection_actor,
+                        target: FractureTarget::Connection(bond.id),
+                        health_loss: self.settings.damage_per_overload,
+                        effective_length_loss: if tension > tension_limit {
+                            bond.runtime.effective_length
+                        } else {
+                            0.0
+                        },
+                        source: *source_by_actor
+                            .get(&connection_actor)
+                            .unwrap_or(&DamageSource::Stress),
+                    });
+                }
+            }
+            for bond in family.external_bonds.values() {
+                if !owned.contains(&bond.node) || bond.runtime.is_broken() {
+                    continue;
+                }
+                let side = component_without_bond(actor, family, bond.node, None);
+                let force = side.iter().fold(Vec2::ZERO, |acc, node| {
+                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+                });
+                let tension = force.dot(bond.normal).abs();
+                let shear = force.dot(bond.tangent).abs();
+                let health_ratio = if bond.base_health > 0.0 {
+                    (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let tension_limit = bond.tension_limit
+                    * self.settings.tension_limit_scale
+                    * health_ratio.max(0.001);
+                let shear_limit =
+                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
+                if tension > tension_limit || shear > shear_limit {
+                    actor_commands.push(FractureCommand {
+                        order_key,
+                        actor: *actor_id,
+                        target: FractureTarget::ExternalBond(bond.id),
+                        health_loss: self.settings.damage_per_overload,
+                        effective_length_loss: if tension > tension_limit {
+                            bond.runtime.effective_length
                         } else {
                             0.0
                         },
@@ -1769,6 +2462,25 @@ fn component_without_bond(
     start: SupportNodeId,
     skipped_bond: Option<BondId>,
 ) -> Vec<SupportNodeId> {
+    component_graph_walk(actor, family, start, skipped_bond, None)
+}
+
+fn component_without_dynamic_connection(
+    actor: &FxActor,
+    family: &FxFamily,
+    start: SupportNodeId,
+    skipped_connection: Option<ConnectionId>,
+) -> Vec<SupportNodeId> {
+    component_graph_walk(actor, family, start, None, skipped_connection)
+}
+
+fn component_graph_walk(
+    actor: &FxActor,
+    family: &FxFamily,
+    start: SupportNodeId,
+    skipped_bond: Option<BondId>,
+    skipped_connection: Option<ConnectionId>,
+) -> Vec<SupportNodeId> {
     let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([start]);
@@ -1785,6 +2497,27 @@ fn component_without_bond(
                 continue;
             }
             let Some(other) = bond.other(node) else {
+                continue;
+            };
+            if owned.contains(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+        for bond in family.dynamic_structural_bonds.values() {
+            if Some(bond.id) == skipped_connection
+                || bond.policy != DynamicConnectionPolicy::GraphOnly
+                || bond.runtime.is_broken()
+            {
+                continue;
+            }
+            let other = if bond.node_a == node {
+                Some(bond.node_b)
+            } else if bond.node_b == node {
+                Some(bond.node_a)
+            } else {
+                None
+            };
+            let Some(other) = other else {
                 continue;
             };
             if owned.contains(&other) && seen.insert(other) {
@@ -1835,6 +2568,35 @@ fn compare_fragment_for_keep(
 
 fn valid_runtime_scalar(value: f32) -> bool {
     value.is_finite() && value >= 0.0
+}
+
+fn valid_vec2(value: Vec2) -> bool {
+    value.x.is_finite() && value.y.is_finite()
+}
+
+fn validate_direction(value: Vec2) -> Option<Vec2> {
+    if !valid_vec2(value) {
+        return None;
+    }
+    let normalized = value.normalized_or_zero();
+    (normalized.length() > 0.0).then_some(normalized)
+}
+
+fn validate_connection_scalars(
+    health: f32,
+    effective_length: f32,
+    tension_limit: f32,
+    shear_limit: f32,
+) -> Result<(), ()> {
+    if valid_runtime_scalar(health)
+        && valid_runtime_scalar(effective_length)
+        && valid_runtime_scalar(tension_limit)
+        && valid_runtime_scalar(shear_limit)
+    {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1907,6 +2669,41 @@ mod tests {
 
     fn family_for(asset: FxAsset) -> FxFamily {
         FxFamily::instantiate(FxFamilyId(3), asset)
+    }
+
+    fn static_anchor_desc(id: u32, node: u32) -> StaticAnchorDesc {
+        StaticAnchorDesc {
+            id: ExternalBondId(id),
+            node: SupportNodeId(node),
+            target: ExternalTarget2D {
+                kind: ExternalTargetKind::World,
+                token: ExternalTargetToken(0),
+            },
+            anchor: Vec2::new(node as f32 + 0.5, 0.5),
+            normal: Vec2::new(1.0, 0.0),
+            health: 1.0,
+            effective_length: 1.0,
+            tension_limit: 0.01,
+            shear_limit: 0.01,
+        }
+    }
+
+    fn dynamic_graph_only_desc(id: u32, node_a: u32, node_b: u32) -> DynamicStructuralBondDesc {
+        DynamicStructuralBondDesc {
+            id: ConnectionId(id),
+            node_a: SupportNodeId(node_a),
+            node_b: SupportNodeId(node_b),
+            centroid: Vec2::new((node_a + node_b) as f32 * 0.5, 0.5),
+            normal: Vec2::new(1.0, 0.0),
+            health: 1.0,
+            effective_length: 1.0,
+            tension_limit: 0.01,
+            shear_limit: 0.01,
+        }
+    }
+
+    fn disconnected_three_node_asset() -> FxAsset {
+        asset_from_rows(&["#.#.#"], &[Some(0), None, Some(1), None, Some(2)])
     }
 
     fn repair_plan_from_family(family: &FxFamily) -> RepairPlan {
@@ -2769,6 +3566,707 @@ mod tests {
         apply_fracture_commands(&mut family, &[command]);
         assert_eq!(family.next_event_id_for_test(), 1);
         assert_ne!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn static_anchor_stress_fixed_endpoint() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(1.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input.clone()]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        apply_fracture_commands(&mut family, &commands);
+        assert!(family.external_bond_state(anchor).unwrap().is_broken());
+        assert!(
+            solver.generate(&family, &[input]).is_empty(),
+            "broken external anchors must stop acting as fixed endpoints"
+        );
+    }
+
+    #[test]
+    fn dynamic_bond_graph_only() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        assert_eq!(family.actor_count(), 2);
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(11, 0, 1))
+            .unwrap();
+        assert_eq!(family.actor_count(), 2);
+        assert_eq!(
+            family.dynamic_structural_bond(connection).unwrap().policy,
+            DynamicConnectionPolicy::GraphOnly
+        );
+
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.5,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(1.0, 0.0),
+                source: DamageSource::Stress,
+            }],
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Connection(connection));
+        apply_fracture_commands(&mut family, &commands);
+        assert_eq!(
+            family
+                .dynamic_structural_bond_state(connection)
+                .unwrap()
+                .health,
+            0.5
+        );
+        assert!(family.is_dirty(FxActorId(0)));
+        assert!(family.is_dirty(FxActorId(1)));
+        assert!(split_dirty_actors(&mut family).is_empty());
+        assert_eq!(family.actor_count(), 2);
+    }
+
+    #[test]
+    fn connection_validation_rejects_invalid_inputs() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        assert_eq!(
+            family
+                .connect_static_anchor(static_anchor_desc(1, 99))
+                .unwrap_err(),
+            ConnectionError::UnknownNode(SupportNodeId(99))
+        );
+        let mut invalid_anchor = static_anchor_desc(1, 0);
+        invalid_anchor.health = f32::NAN;
+        assert_eq!(
+            family.connect_static_anchor(invalid_anchor).unwrap_err(),
+            ConnectionError::InvalidExternalBondRuntime(ExternalBondId(1))
+        );
+        family
+            .connect_static_anchor(static_anchor_desc(1, 0))
+            .unwrap();
+        assert_eq!(
+            family
+                .connect_static_anchor(static_anchor_desc(1, 1))
+                .unwrap_err(),
+            ConnectionError::DuplicateExternalBond(ExternalBondId(1))
+        );
+
+        assert_eq!(
+            family
+                .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(2, 0, 0))
+                .unwrap_err(),
+            ConnectionError::SelfConnection(SupportNodeId(0))
+        );
+        let mut invalid_dynamic = dynamic_graph_only_desc(2, 0, 1);
+        invalid_dynamic.effective_length = -1.0;
+        assert_eq!(
+            family
+                .connect_dynamic_structural_bond_graph_only(invalid_dynamic)
+                .unwrap_err(),
+            ConnectionError::InvalidConnectionRuntime(ConnectionId(2))
+        );
+        family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(2, 0, 1))
+            .unwrap();
+        assert_eq!(
+            family
+                .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(2, 1, 0))
+                .unwrap_err(),
+            ConnectionError::DuplicateConnection(ConnectionId(2))
+        );
+    }
+
+    #[test]
+    fn same_family_actor_merge_preserves_connection_state() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(3, 1))
+            .unwrap();
+        let family_id = family.id;
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(4, 0, 1))
+            .unwrap();
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Connection(connection),
+                health_loss: 0.25,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            }],
+        );
+
+        let result = family.merge_actors(FxActorId(1), FxActorId(0)).unwrap();
+        assert_eq!(result.kept_actor, FxActorId(0));
+        assert_eq!(result.removed_actor, FxActorId(1));
+        assert_eq!(family.actor_count(), 1);
+        assert_eq!(family.node_owner(SupportNodeId(0)), Some(FxActorId(0)));
+        assert_eq!(family.node_owner(SupportNodeId(1)), Some(FxActorId(0)));
+        assert!(!family.is_dirty(FxActorId(0)));
+        assert_eq!(
+            actor_components(family.actor(FxActorId(0)).unwrap(), &family).len(),
+            1
+        );
+        assert_eq!(
+            family
+                .external_bond_state(ExternalBondId(3))
+                .unwrap()
+                .health,
+            1.0
+        );
+        assert_eq!(
+            family
+                .dynamic_structural_bond_state(connection)
+                .unwrap()
+                .health,
+            0.75
+        );
+    }
+
+    #[test]
+    fn merge_preserves_dirty_split_obligation() {
+        let mut family = family_for(asset_from_rows(
+            &["##.#"],
+            &[Some(0), Some(1), None, Some(2)],
+        ));
+        let family_id = family.id;
+        family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(12, 0, 2))
+            .unwrap();
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Bond(BondId(0)),
+                health_loss: 10.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+        assert!(family.is_dirty(FxActorId(0)));
+
+        let result = family.merge_actors(FxActorId(0), FxActorId(1)).unwrap();
+        assert_eq!(result.kept_actor, FxActorId(0));
+        assert!(family.is_dirty(FxActorId(0)));
+        assert!(!family.is_dirty(FxActorId(1)));
+
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].parent_actor, FxActorId(0));
+        assert_eq!(events[0].fragments.len(), 2);
+    }
+
+    #[test]
+    fn graph_only_connection_stress_generates_once_for_two_endpoint_inputs() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(8, 0, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(-1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Connection(connection));
+        let events = apply_fracture_commands(&mut family, &commands);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            family
+                .dynamic_structural_bond_state(connection)
+                .unwrap()
+                .health,
+            0.75
+        );
+    }
+
+    #[test]
+    fn repair_plan_rejects_removed_external_bond_endpoint() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(3, 1))
+            .unwrap();
+        let asset = asset_from_rows(&["#"], &[Some(0)]);
+        let node_states = vec![(
+            SupportNodeId(0),
+            family.node_state(SupportNodeId(0)).unwrap().clone(),
+        )];
+        let err = family
+            .apply_repair_plan(RepairPlan {
+                asset,
+                node_owners: vec![(SupportNodeId(0), FxActorId(0))],
+                node_states,
+                bond_states: vec![],
+                dirty_actors: vec![FxActorId(0)],
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RepairError::StaleExternalBondEndpoint {
+                bond: ExternalBondId(3),
+                node: SupportNodeId(1),
+            }
+        );
+    }
+
+    #[test]
+    fn repair_plan_rejects_removed_dynamic_connection_endpoint() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(4, 0, 1))
+            .unwrap();
+        let asset = asset_from_rows(&["#"], &[Some(0)]);
+        let node_states = vec![(
+            SupportNodeId(0),
+            family.node_state(SupportNodeId(0)).unwrap().clone(),
+        )];
+        let err = family
+            .apply_repair_plan(RepairPlan {
+                asset,
+                node_owners: vec![(SupportNodeId(0), FxActorId(0))],
+                node_states,
+                bond_states: vec![],
+                dirty_actors: vec![FxActorId(0)],
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RepairError::StaleDynamicConnectionEndpoint {
+                connection: ConnectionId(4),
+                node: SupportNodeId(1),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_actors_requires_unbroken_graph_connection() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let before = family.deterministic_state_digest();
+        let err = family.merge_actors(FxActorId(0), FxActorId(1)).unwrap_err();
+        assert_eq!(
+            err,
+            ConnectionError::MissingMergeConnection {
+                actor_a: FxActorId(0),
+                actor_b: FxActorId(1),
+            }
+        );
+        assert_eq!(family.deterministic_state_digest(), before);
+        assert_eq!(family.actor_count(), 2);
+
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(9, 0, 1))
+            .unwrap();
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    FxFamilyId(3),
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::Connection(connection),
+                health_loss: 1.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+        let before_broken_merge = family.deterministic_state_digest();
+        let err = family.merge_actors(FxActorId(0), FxActorId(1)).unwrap_err();
+        assert_eq!(
+            err,
+            ConnectionError::MissingMergeConnection {
+                actor_a: FxActorId(0),
+                actor_b: FxActorId(1),
+            }
+        );
+        assert_eq!(family.deterministic_state_digest(), before_broken_merge);
+        assert_eq!(family.actor_count(), 2);
+    }
+
+    #[test]
+    fn broken_external_and_dynamic_connections_ignore_direct_damage() {
+        let mut external_family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let external = external_family
+            .connect_static_anchor(static_anchor_desc(1, 0))
+            .unwrap();
+        let external_family_id = external_family.id;
+        apply_fracture_commands(
+            &mut external_family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    external_family_id,
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::ExternalBond(external),
+                health_loss: 1.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+        assert!(
+            external_family
+                .external_bond_state(external)
+                .unwrap()
+                .is_broken()
+        );
+        let before = external_family.deterministic_state_digest();
+        let external_damage = DamageInput {
+            order_key: DeterministicOrderKey::new(
+                2,
+                1,
+                external_family.id,
+                FxActorId(0),
+                CommandId(0),
+            ),
+            actor: FxActorId(0),
+            target: FractureTarget::ExternalBond(external),
+            health_loss: 1.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+            position: Vec2::ZERO,
+            radius: 0.0,
+        };
+        assert!(generate_damage_commands(&external_family, &[external_damage.clone()]).is_empty());
+        assert!(
+            generate_damage_commands(
+                &external_family,
+                &[DamageInput {
+                    target: FractureTarget::Node(SupportNodeId(0)),
+                    ..external_damage.clone()
+                }],
+            )
+            .is_empty()
+        );
+        assert!(
+            apply_fracture_commands(
+                &mut external_family,
+                &[FractureCommand {
+                    order_key: DeterministicOrderKey::new(
+                        3,
+                        1,
+                        FxFamilyId(3),
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    target: FractureTarget::ExternalBond(external),
+                    health_loss: 1.0,
+                    effective_length_loss: 1.0,
+                    source: DamageSource::Script,
+                }],
+            )
+            .is_empty()
+        );
+        assert_eq!(external_family.deterministic_state_digest(), before);
+
+        let mut dynamic_family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let connection = dynamic_family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(2, 0, 1))
+            .unwrap();
+        let dynamic_family_id = dynamic_family.id;
+        apply_fracture_commands(
+            &mut dynamic_family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    dynamic_family_id,
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::Connection(connection),
+                health_loss: 1.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+        assert!(
+            dynamic_family
+                .dynamic_structural_bond_state(connection)
+                .unwrap()
+                .is_broken()
+        );
+        let before = dynamic_family.deterministic_state_digest();
+        let dynamic_damage = DamageInput {
+            order_key: DeterministicOrderKey::new(
+                2,
+                1,
+                dynamic_family.id,
+                FxActorId(0),
+                CommandId(0),
+            ),
+            actor: FxActorId(0),
+            target: FractureTarget::Connection(connection),
+            health_loss: 1.0,
+            effective_length_loss: 1.0,
+            source: DamageSource::Script,
+            position: Vec2::ZERO,
+            radius: 0.0,
+        };
+        assert!(generate_damage_commands(&dynamic_family, &[dynamic_damage.clone()]).is_empty());
+        assert!(
+            generate_damage_commands(
+                &dynamic_family,
+                &[DamageInput {
+                    target: FractureTarget::Node(SupportNodeId(0)),
+                    ..dynamic_damage.clone()
+                }],
+            )
+            .is_empty()
+        );
+        assert!(
+            apply_fracture_commands(
+                &mut dynamic_family,
+                &[FractureCommand {
+                    order_key: DeterministicOrderKey::new(
+                        3,
+                        1,
+                        FxFamilyId(3),
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    target: FractureTarget::Connection(connection),
+                    health_loss: 1.0,
+                    effective_length_loss: 1.0,
+                    source: DamageSource::Script,
+                }],
+            )
+            .is_empty()
+        );
+        assert_eq!(dynamic_family.deterministic_state_digest(), before);
+    }
+
+    #[test]
+    fn phase4_digest_includes_connection_state() {
+        fn digest_with_external(desc: StaticAnchorDesc) -> u64 {
+            let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+            family.connect_static_anchor(desc).unwrap();
+            family.deterministic_state_digest()
+        }
+
+        fn digest_with_dynamic(desc: DynamicStructuralBondDesc) -> u64 {
+            let mut family = family_for(disconnected_three_node_asset());
+            family
+                .connect_dynamic_structural_bond_graph_only(desc)
+                .unwrap();
+            family.deterministic_state_digest()
+        }
+
+        let external_base = static_anchor_desc(1, 0);
+        let external_base_digest = digest_with_external(external_base.clone());
+
+        let mut external_target = external_base.clone();
+        external_target.target = ExternalTarget2D {
+            kind: ExternalTargetKind::Static,
+            token: ExternalTargetToken(42),
+        };
+        assert_ne!(external_base_digest, digest_with_external(external_target));
+
+        let mut external_anchor = external_base.clone();
+        external_anchor.anchor = Vec2::new(9.0, 2.0);
+        assert_ne!(external_base_digest, digest_with_external(external_anchor));
+
+        let mut external_normal = external_base.clone();
+        external_normal.normal = Vec2::new(0.0, 1.0);
+        assert_ne!(external_base_digest, digest_with_external(external_normal));
+
+        let mut external_limits = external_base.clone();
+        external_limits.tension_limit = 0.5;
+        external_limits.shear_limit = 0.75;
+        assert_ne!(external_base_digest, digest_with_external(external_limits));
+
+        let mut external_runtime_family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        external_runtime_family
+            .connect_static_anchor(external_base)
+            .unwrap();
+        let before_external_runtime = external_runtime_family.deterministic_state_digest();
+        apply_fracture_commands(
+            &mut external_runtime_family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    FxFamilyId(3),
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::ExternalBond(ExternalBondId(1)),
+                health_loss: 0.25,
+                effective_length_loss: 0.25,
+                source: DamageSource::Script,
+            }],
+        );
+        assert_ne!(
+            before_external_runtime,
+            external_runtime_family.deterministic_state_digest()
+        );
+
+        let dynamic_base = dynamic_graph_only_desc(5, 0, 1);
+        let dynamic_base_digest = digest_with_dynamic(dynamic_base.clone());
+
+        let dynamic_endpoint = dynamic_graph_only_desc(5, 0, 2);
+        assert_ne!(dynamic_base_digest, digest_with_dynamic(dynamic_endpoint));
+
+        let mut dynamic_centroid = dynamic_base.clone();
+        dynamic_centroid.centroid = Vec2::new(4.0, 3.0);
+        assert_ne!(dynamic_base_digest, digest_with_dynamic(dynamic_centroid));
+
+        let mut dynamic_normal = dynamic_base.clone();
+        dynamic_normal.normal = Vec2::new(0.0, 1.0);
+        assert_ne!(dynamic_base_digest, digest_with_dynamic(dynamic_normal));
+
+        let mut dynamic_limits = dynamic_base.clone();
+        dynamic_limits.tension_limit = 0.5;
+        dynamic_limits.shear_limit = 0.75;
+        assert_ne!(dynamic_base_digest, digest_with_dynamic(dynamic_limits));
+
+        let mut dynamic_policy_family = family_for(disconnected_three_node_asset());
+        dynamic_policy_family
+            .connect_dynamic_structural_bond_graph_only(dynamic_base.clone())
+            .unwrap();
+        let before_dynamic_policy = dynamic_policy_family.deterministic_state_digest();
+        dynamic_policy_family
+            .dynamic_structural_bonds
+            .get_mut(&ConnectionId(5))
+            .unwrap()
+            .policy = DynamicConnectionPolicy::CustomHardConstraint;
+        assert_ne!(
+            before_dynamic_policy,
+            dynamic_policy_family.deterministic_state_digest()
+        );
+
+        let mut dynamic_runtime_family = family_for(disconnected_three_node_asset());
+        dynamic_runtime_family
+            .connect_dynamic_structural_bond_graph_only(dynamic_base)
+            .unwrap();
+        let before_dynamic_runtime = dynamic_runtime_family.deterministic_state_digest();
+        apply_fracture_commands(
+            &mut dynamic_runtime_family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    FxFamilyId(3),
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::Connection(ConnectionId(5)),
+                health_loss: 0.25,
+                effective_length_loss: 0.25,
+                source: DamageSource::Script,
+            }],
+        );
+        assert_ne!(
+            before_dynamic_runtime,
+            dynamic_runtime_family.deterministic_state_digest()
+        );
+
+        let build = |reverse: bool| {
+            let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+            let static_a = static_anchor_desc(2, 0);
+            let static_b = static_anchor_desc(1, 1);
+            let dynamic_a = dynamic_graph_only_desc(6, 0, 1);
+            let dynamic_b = dynamic_graph_only_desc(5, 0, 1);
+            if reverse {
+                family.connect_static_anchor(static_a).unwrap();
+                family
+                    .connect_dynamic_structural_bond_graph_only(dynamic_a)
+                    .unwrap();
+                family.connect_static_anchor(static_b).unwrap();
+                family
+                    .connect_dynamic_structural_bond_graph_only(dynamic_b)
+                    .unwrap();
+            } else {
+                family
+                    .connect_dynamic_structural_bond_graph_only(dynamic_b)
+                    .unwrap();
+                family.connect_static_anchor(static_b).unwrap();
+                family
+                    .connect_dynamic_structural_bond_graph_only(dynamic_a)
+                    .unwrap();
+                family.connect_static_anchor(static_a).unwrap();
+            }
+            family
+        };
+        let mut a = build(false);
+        let b = build(true);
+        assert_eq!(
+            a.deterministic_state_digest(),
+            b.deterministic_state_digest()
+        );
+
+        let before = a.deterministic_state_digest();
+        let family_id = a.id;
+        apply_fracture_commands(
+            &mut a,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, FxActorId(1), CommandId(0)),
+                actor: FxActorId(1),
+                target: FractureTarget::ExternalBond(ExternalBondId(1)),
+                health_loss: 0.25,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            }],
+        );
+        assert_ne!(before, a.deterministic_state_digest());
     }
 
     #[test]

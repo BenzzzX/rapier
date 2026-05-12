@@ -1,14 +1,19 @@
 use std::collections::BTreeSet;
 
 use fracture_core::{
-    BondId, CommandId, DamageSource, DeterministicOrderKey, FractureCommand, FractureTarget,
-    FxActorId, FxFamilyId, StressSettings, SupportNodeId,
+    BondId, CommandId, ConnectionError, ConnectionId, DamageSource, DeterministicOrderKey,
+    DynamicConnectionPolicy, DynamicStructuralBondDesc, ExternalBondId, ExternalTarget2D,
+    ExternalTargetKind, ExternalTargetToken, FractureCommand, FractureTarget, FxActorId,
+    FxFamilyId, StaticAnchorDesc, StressSettings, SupportNodeId, Vec2,
 };
 use fracture_voxel::{VoxelAuthoringInput, author_voxel_asset};
 use rapier2d::prelude::*;
 
 use crate::contact_map::{ContactPairSide, map_contact_pair};
-use crate::{ContactMaterialProperties, FxRapierError, FxRapierWorld2D};
+use crate::{
+    ContactMaterialProperties, DynamicStructuralConnectionDesc, FxRapierError, FxRapierWorld2D,
+    StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
+};
 
 fn two_node_asset(contact_material: u16) -> fracture_voxel::AuthoredVoxelAsset {
     two_node_multi_material_asset(contact_material, contact_material)
@@ -61,6 +66,20 @@ fn single_node_asset(contact_material: u16) -> fracture_voxel::AuthoredVoxelAsse
     .unwrap()
 }
 
+fn disconnected_two_node_asset() -> fracture_voxel::AuthoredVoxelAsset {
+    let mut input = VoxelAuthoringInput::new(
+        3,
+        1,
+        1.0,
+        vec![true, false, true],
+        vec![1, 0, 1],
+        vec![5, 0, 5],
+        vec![0, 0, 1],
+    );
+    input.support_node_hint = Some(vec![Some(0), None, Some(1)]);
+    author_voxel_asset(input).unwrap()
+}
+
 fn four_node_line_asset() -> fracture_voxel::AuthoredVoxelAsset {
     let mut input = VoxelAuthoringInput::new(
         4,
@@ -76,6 +95,37 @@ fn four_node_line_asset() -> fracture_voxel::AuthoredVoxelAsset {
     author_voxel_asset(input).unwrap()
 }
 
+fn static_anchor_desc(id: u32, node: u32) -> StaticAnchorDesc {
+    StaticAnchorDesc {
+        id: ExternalBondId(id),
+        node: SupportNodeId(node),
+        target: ExternalTarget2D {
+            kind: ExternalTargetKind::World,
+            token: ExternalTargetToken(0),
+        },
+        anchor: Vec2::new(node as f32 + 0.5, 0.5),
+        normal: Vec2::new(1.0, 0.0),
+        health: 1.0,
+        effective_length: 1.0,
+        tension_limit: 0.01,
+        shear_limit: 0.01,
+    }
+}
+
+fn dynamic_graph_only_desc(id: u32, node_a: u32, node_b: u32) -> DynamicStructuralBondDesc {
+    DynamicStructuralBondDesc {
+        id: ConnectionId(id),
+        node_a: SupportNodeId(node_a),
+        node_b: SupportNodeId(node_b),
+        centroid: Vec2::new((node_a + node_b) as f32 * 0.5, 0.5),
+        normal: Vec2::new(1.0, 0.0),
+        health: 1.0,
+        effective_length: 1.0,
+        tension_limit: 0.01,
+        shear_limit: 0.01,
+    }
+}
+
 fn break_bond_command(
     tick: u64,
     family: FxFamilyId,
@@ -86,6 +136,22 @@ fn break_bond_command(
         order_key: DeterministicOrderKey::new(tick, 0, family, actor, CommandId(tick as u32)),
         actor,
         target: FractureTarget::Bond(bond),
+        health_loss: 2.0,
+        effective_length_loss: 2.0,
+        source: DamageSource::Script,
+    }
+}
+
+fn break_external_bond_command(
+    tick: u64,
+    family: FxFamilyId,
+    actor: FxActorId,
+    bond: ExternalBondId,
+) -> FractureCommand {
+    FractureCommand {
+        order_key: DeterministicOrderKey::new(tick, 0, family, actor, CommandId(tick as u32)),
+        actor,
+        target: FractureTarget::ExternalBond(bond),
         health_loss: 2.0,
         effective_length_loss: 2.0,
         source: DamageSource::Script,
@@ -122,6 +188,328 @@ fn overlapping_side_contact_world() -> (FxRapierWorld2D, ColliderHandle, Collide
         1.0,
     );
     (world, destructible.collider, ordinary)
+}
+
+#[test]
+fn static_anchor_marks_actor_fixed_or_kinematic() {
+    let family = FxFamilyId(1);
+
+    let mut default_world = FxRapierWorld2D::new();
+    default_world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let default_handles = default_world.actor_handles(family, FxActorId(0)).unwrap();
+    assert!(
+        default_world
+            .rigid_bodies()
+            .get(default_handles.body)
+            .unwrap()
+            .is_dynamic()
+    );
+    default_world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(1, 0)),
+        )
+        .unwrap();
+    assert!(
+        default_world
+            .rigid_bodies()
+            .get(default_handles.body)
+            .unwrap()
+            .is_dynamic(),
+        "default static-anchor policy must preserve the dynamic body type"
+    );
+
+    let mut fixed_world = FxRapierWorld2D::new();
+    fixed_world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let fixed_handles = fixed_world.actor_handles(family, FxActorId(0)).unwrap();
+    fixed_world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(2, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    assert!(
+        fixed_world
+            .rigid_bodies()
+            .get(fixed_handles.body)
+            .unwrap()
+            .is_fixed()
+    );
+
+    let mut kinematic_world = FxRapierWorld2D::new();
+    kinematic_world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let kinematic_handles = kinematic_world.actor_handles(family, FxActorId(0)).unwrap();
+    kinematic_world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(3, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::KinematicVelocityBased),
+        )
+        .unwrap();
+    assert!(
+        kinematic_world
+            .rigid_bodies()
+            .get(kinematic_handles.body)
+            .unwrap()
+            .is_kinematic()
+    );
+}
+
+#[test]
+fn static_anchor_policy_moves_to_split_child() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(9, 3))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let before = world.actor_handles(family, FxActorId(0)).unwrap();
+    assert!(world.rigid_bodies().get(before.body).unwrap().is_fixed());
+
+    let split = world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(2))],
+        )
+        .unwrap();
+
+    assert_eq!(split.len(), 1);
+    assert_eq!(split[0].created_children, vec![FxActorId(1)]);
+    let kept = world.actor_handles(family, FxActorId(0)).unwrap();
+    let child = world.actor_handles(family, FxActorId(1)).unwrap();
+    assert!(
+        world.rigid_bodies().get(kept.body).unwrap().is_dynamic(),
+        "unanchored kept fragment must not keep stale fixed policy"
+    );
+    assert!(
+        world.rigid_bodies().get(child.body).unwrap().is_fixed(),
+        "anchored child fragment must receive the live anchor body policy"
+    );
+}
+
+#[test]
+fn broken_static_anchor_clears_body_policy() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(11, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let actor = world.actor_handles(family, FxActorId(0)).unwrap();
+    assert!(world.rigid_bodies().get(actor.body).unwrap().is_fixed());
+
+    let split = world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_external_bond_command(
+                0,
+                family,
+                FxActorId(0),
+                ExternalBondId(11),
+            )],
+        )
+        .unwrap();
+
+    assert!(split.is_empty());
+    assert!(
+        world.rigid_bodies().get(actor.body).unwrap().is_dynamic(),
+        "broken external bond must release the temporary anchor body policy"
+    );
+}
+
+#[test]
+fn dynamic_bond_graph_only() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(family, disconnected_two_node_asset())
+        .unwrap();
+    let actor0 = world.actor_handles(family, FxActorId(0)).unwrap();
+    let actor1 = world.actor_handles(family, FxActorId(1)).unwrap();
+    let before_joints = world.impulse_joints().len();
+
+    let connection = world
+        .connect_dynamic_structural_bond(
+            family,
+            DynamicStructuralConnectionDesc::graph_only(dynamic_graph_only_desc(4, 0, 1)),
+        )
+        .unwrap();
+
+    assert_eq!(connection, ConnectionId(4));
+    assert_eq!(world.impulse_joints().len(), before_joints);
+    assert_eq!(world.actor_handles(family, FxActorId(0)), Some(actor0));
+    assert_eq!(world.actor_handles(family, FxActorId(1)), Some(actor1));
+    assert_eq!(world.family(family).unwrap().actor_count(), 2);
+    assert_eq!(
+        world
+            .family(family)
+            .unwrap()
+            .dynamic_structural_bond(connection)
+            .unwrap()
+            .policy,
+        DynamicConnectionPolicy::GraphOnly
+    );
+}
+
+#[test]
+fn dynamic_bond_custom_hard_constraint_is_future_error() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(family, disconnected_two_node_asset())
+        .unwrap();
+    let before_joints = world.impulse_joints().len();
+    let before_digest = world.family(family).unwrap().deterministic_state_digest();
+
+    let err = world
+        .connect_dynamic_structural_bond(
+            family,
+            DynamicStructuralConnectionDesc::custom_hard_constraint(dynamic_graph_only_desc(
+                4, 0, 1,
+            )),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        FxRapierError::UnsupportedConnectionPolicy(DynamicConnectionPolicy::CustomHardConstraint)
+    );
+    assert_eq!(world.impulse_joints().len(), before_joints);
+    assert_eq!(
+        world.family(family).unwrap().deterministic_state_digest(),
+        before_digest
+    );
+    assert_eq!(
+        world
+            .family(family)
+            .unwrap()
+            .dynamic_structural_bonds()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn dynamic_merge_conserves_mass_com_velocity() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(family, disconnected_two_node_asset())
+        .unwrap();
+    world
+        .connect_dynamic_structural_bond(
+            family,
+            DynamicStructuralConnectionDesc::graph_only(dynamic_graph_only_desc(21, 0, 1)),
+        )
+        .unwrap();
+    let actor0 = world.actor_handles(family, FxActorId(0)).unwrap();
+    let actor1 = world.actor_handles(family, FxActorId(1)).unwrap();
+    {
+        let body0 = world.rigid_bodies_mut().get_mut(actor0.body).unwrap();
+        body0.set_position(Pose::from_translation(Vector::new(-4.0, 2.0)), true);
+        body0.set_linvel(Vector::new(3.0, -1.0), true);
+        body0.set_angvel(0.25, true);
+
+        let body1 = world.rigid_bodies_mut().get_mut(actor1.body).unwrap();
+        body1.set_position(Pose::from_translation(Vector::new(6.0, -2.0)), true);
+        body1.set_linvel(Vector::new(-1.0, 5.0), true);
+        body1.set_angvel(-0.5, true);
+    }
+    let mass0 = world.rigid_bodies().get(actor0.body).unwrap().mass();
+    let mass1 = world.rigid_bodies().get(actor1.body).unwrap().mass();
+    let vel0 = world.rigid_bodies().get(actor0.body).unwrap().linvel();
+    let vel1 = world.rigid_bodies().get(actor1.body).unwrap().linvel();
+    let com0 = world
+        .rigid_bodies()
+        .get(actor0.body)
+        .unwrap()
+        .center_of_mass();
+    let com1 = world
+        .rigid_bodies()
+        .get(actor1.body)
+        .unwrap()
+        .center_of_mass();
+    let expected_velocity = (vel0 * mass0 + vel1 * mass1) / (mass0 + mass1);
+    let expected_com = (com0 * mass0 + com1 * mass1) / (mass0 + mass1);
+    let before_joints = world.impulse_joints().len();
+
+    let result = world
+        .merge_actors(family, FxActorId(1), FxActorId(0))
+        .unwrap();
+
+    assert_eq!(result.kept_actor, FxActorId(0));
+    assert_eq!(result.removed_actor, FxActorId(1));
+    assert_eq!(world.impulse_joints().len(), before_joints);
+    assert!(world.actor_handles(family, FxActorId(1)).is_none());
+    assert!(world.rigid_bodies().get(actor1.body).is_none());
+    assert!(world.colliders().get(actor1.collider).is_none());
+    let merged = world.actor_handles(family, FxActorId(0)).unwrap();
+    assert_eq!(merged.body, actor0.body);
+    assert_ne!(merged.collider, actor0.collider);
+    let merged_body = world.rigid_bodies().get(merged.body).unwrap();
+    assert_vector_close(merged_body.center_of_mass(), expected_com);
+    assert_vector_close(merged_body.linvel(), expected_velocity);
+    assert_scalar_close(merged_body.mass(), mass0 + mass1);
+    assert_eq!(world.family(family).unwrap().actor_count(), 1);
+    assert!(!world.family(family).unwrap().is_dirty(FxActorId(0)));
+}
+
+#[test]
+fn dynamic_merge_requires_graph_connection_no_side_effects() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(family, disconnected_two_node_asset())
+        .unwrap();
+    let actor0 = world.actor_handles(family, FxActorId(0)).unwrap();
+    let actor1 = world.actor_handles(family, FxActorId(1)).unwrap();
+    let before_digest = world.family(family).unwrap().deterministic_state_digest();
+    let before_joints = world.impulse_joints().len();
+
+    let err = world
+        .merge_actors(family, FxActorId(0), FxActorId(1))
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        FxRapierError::Connection(ConnectionError::MissingMergeConnection {
+            actor_a: FxActorId(0),
+            actor_b: FxActorId(1),
+        })
+    );
+    assert_eq!(
+        world.family(family).unwrap().deterministic_state_digest(),
+        before_digest
+    );
+    assert_eq!(world.impulse_joints().len(), before_joints);
+    assert_eq!(world.actor_handles(family, FxActorId(0)), Some(actor0));
+    assert_eq!(world.actor_handles(family, FxActorId(1)), Some(actor1));
+    assert!(world.rigid_bodies().get(actor0.body).is_some());
+    assert!(world.rigid_bodies().get(actor1.body).is_some());
+    assert!(world.colliders().get(actor0.collider).is_some());
+    assert!(world.colliders().get(actor1.collider).is_some());
+    assert_eq!(world.family(family).unwrap().actor_count(), 2);
 }
 
 #[test]
@@ -656,6 +1044,13 @@ fn destructible_vs_destructible_generates_two_readbacks() {
 fn assert_vector_close(actual: Vector, expected: Vector) {
     assert!(
         (actual - expected).length() < 0.0001,
+        "actual={actual:?} expected={expected:?}"
+    );
+}
+
+fn assert_scalar_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() < 0.0001,
         "actual={actual:?} expected={expected:?}"
     );
 }
