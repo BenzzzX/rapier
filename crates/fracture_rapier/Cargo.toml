@@ -1,0 +1,16 @@
+[package]
+name = "fracture_rapier"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fracture_core = { path = "../fracture_core" }
+fracture_voxel = { path = "../fracture_voxel" }
+rapier2d = { path = "../rapier2d" }
+thiserror.workspace = true
