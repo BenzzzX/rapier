@@ -256,6 +256,8 @@ impl DenseOccupancy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SupportNode2D {
     pub id: SupportNodeId,
+    /// The chunk that owns this node in the support hierarchy. This is a
+    /// support chunk id, not necessarily a visible leaf chunk id.
     pub chunk_id: ChunkId,
     pub voxels: Vec<GridCoord>,
     pub material_id: u16,
@@ -267,7 +269,9 @@ pub struct SupportNode2D {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chunk2D {
     pub id: ChunkId,
-    pub support_node: SupportNodeId,
+    /// Non-empty for support chunks. Empty chunks are visible or grouping
+    /// chunks and do not participate in support exact-cover validation.
+    pub support_nodes: Vec<SupportNodeId>,
     pub parent: Option<ChunkId>,
 }
 
@@ -451,19 +455,19 @@ impl FxAsset {
                 .iter()
                 .map(|node| Chunk2D {
                     id: ChunkId(node.id.0),
-                    support_node: node.id,
+                    support_nodes: vec![node.id],
                     parent: None,
                 })
                 .collect()
         });
-        chunks.sort_by_key(|chunk| chunk.id);
+        normalize_chunks(&mut chunks);
         let node_ids = support_nodes
             .iter()
             .map(|node| node.id)
             .collect::<BTreeSet<_>>();
-        let leaf_chunks = validate_chunk_hierarchy(&chunks, &node_ids)?;
+        let support_chunks = validate_chunk_hierarchy(&chunks, &node_ids)?;
         for node in &mut support_nodes {
-            node.chunk_id = leaf_chunks
+            node.chunk_id = support_chunks
                 .get(&node.id)
                 .copied()
                 .ok_or(ValidationError::ChunkHierarchyNotExact)?;
@@ -508,6 +512,13 @@ impl FxAsset {
             .map(|idx| &self.internal_bonds[idx])
     }
 
+    pub fn chunk(&self, id: ChunkId) -> Option<&Chunk2D> {
+        self.chunks
+            .binary_search_by_key(&id, |chunk| chunk.id)
+            .ok()
+            .map(|idx| &self.chunks[idx])
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         let mut covered =
             vec![None; self.occupancy.width as usize * self.occupancy.height as usize];
@@ -543,9 +554,9 @@ impl FxAsset {
                 return Err(ValidationError::MissingSupportCoverage(coord));
             }
         }
-        let leaf_chunks = validate_chunk_hierarchy(&self.chunks, &node_ids)?;
+        let support_chunks = validate_chunk_hierarchy(&self.chunks, &node_ids)?;
         for node in &self.support_nodes {
-            if leaf_chunks.get(&node.id) != Some(&node.chunk_id) {
+            if support_chunks.get(&node.id) != Some(&node.chunk_id) {
                 return Err(ValidationError::ChunkHierarchyNotExact);
             }
         }
@@ -816,6 +827,12 @@ pub struct NodeRuntimeState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ChunkRuntimeState {
+    pub health: f32,
+    pub accumulated_damage: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FxActor {
     pub id: FxActorId,
     pub owned_nodes: Vec<SupportNodeId>,
@@ -838,6 +855,7 @@ pub struct FxFamily {
     actors: BTreeMap<FxActorId, FxActor>,
     node_owner: BTreeMap<SupportNodeId, FxActorId>,
     node_states: BTreeMap<SupportNodeId, NodeRuntimeState>,
+    chunk_states: BTreeMap<ChunkId, ChunkRuntimeState>,
     bond_states: Vec<BondRuntimeState>,
     external_bonds: BTreeMap<ExternalBondId, ExternalBond2D>,
     dynamic_structural_bonds: BTreeMap<ConnectionId, DynamicStructuralBond2D>,
@@ -871,6 +889,11 @@ impl FxFamily {
                 )
             })
             .collect();
+        let chunk_states = asset
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.id, initial_chunk_state()))
+            .collect();
 
         let mut family = Self {
             id,
@@ -878,6 +901,7 @@ impl FxFamily {
             actors: BTreeMap::new(),
             node_owner: BTreeMap::new(),
             node_states,
+            chunk_states,
             bond_states,
             external_bonds: BTreeMap::new(),
             dynamic_structural_bonds: BTreeMap::new(),
@@ -951,6 +975,16 @@ impl FxFamily {
 
     pub fn node_states(&self) -> impl Iterator<Item = (SupportNodeId, &NodeRuntimeState)> + '_ {
         self.node_states.iter().map(|(node, state)| (*node, state))
+    }
+
+    pub fn chunk_state(&self, chunk: ChunkId) -> Option<&ChunkRuntimeState> {
+        self.chunk_states.get(&chunk)
+    }
+
+    pub fn chunk_states(&self) -> impl Iterator<Item = (ChunkId, &ChunkRuntimeState)> + '_ {
+        self.chunk_states
+            .iter()
+            .map(|(chunk, state)| (*chunk, state))
     }
 
     pub fn dirty_actors(&self) -> impl Iterator<Item = FxActorId> + '_ {
@@ -1189,7 +1223,10 @@ impl FxFamily {
         }
         for chunk in &self.asset.chunks {
             hasher.write_u32(chunk.id.0);
-            hasher.write_u32(chunk.support_node.0);
+            hasher.write_u32(chunk.support_nodes.len() as u32);
+            for node in &chunk.support_nodes {
+                hasher.write_u32(node.0);
+            }
             hasher.write_u32(chunk.parent.map_or(u32::MAX, |parent| parent.0));
         }
         for bond in &self.asset.internal_bonds {
@@ -1233,6 +1270,11 @@ impl FxFamily {
         }
         for (node, state) in &self.node_states {
             hasher.write_u32(node.0);
+            hasher.write_f32(state.health);
+            hasher.write_f32(state.accumulated_damage);
+        }
+        for (chunk, state) in &self.chunk_states {
+            hasher.write_u32(chunk.0);
             hasher.write_f32(state.health);
             hasher.write_f32(state.accumulated_damage);
         }
@@ -1399,6 +1441,7 @@ impl FxFamily {
                 return Err(RepairError::InvalidBondState(BondId(idx as u32)));
             }
         }
+        let chunk_states = reconcile_chunk_states(&self.chunk_states, &plan.asset);
 
         let mut dirty_actors = BTreeSet::new();
         for actor in plan.dirty_actors {
@@ -1422,6 +1465,7 @@ impl FxFamily {
             actors: actors.clone(),
             node_owner: node_owner.clone(),
             node_states: node_states.clone(),
+            chunk_states: chunk_states.clone(),
             bond_states: plan.bond_states.clone(),
             external_bonds: self.external_bonds.clone(),
             dynamic_structural_bonds: self.dynamic_structural_bonds.clone(),
@@ -1440,6 +1484,7 @@ impl FxFamily {
         self.actors = actors;
         self.node_owner = node_owner;
         self.node_states = node_states;
+        self.chunk_states = chunk_states;
         self.bond_states = plan.bond_states;
         self.dirty_actors = dirty_actors;
         self.next_actor_id = self.next_actor_id.max(
@@ -1608,6 +1653,7 @@ pub enum DamageSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FractureTarget {
     Bond(BondId),
+    Chunk(ChunkId),
     Node(SupportNodeId),
     ExternalBond(ExternalBondId),
     Connection(ConnectionId),
@@ -1669,6 +1715,18 @@ pub fn generate_damage_commands(family: &FxFamily, inputs: &[DamageInput]) -> Ve
         match input.target {
             FractureTarget::Bond(bond_id) => {
                 if family.asset.bond(bond_id).is_some() {
+                    out.push(FractureCommand {
+                        order_key: input.order_key,
+                        actor: input.actor,
+                        target: input.target,
+                        health_loss,
+                        effective_length_loss,
+                        source: input.source,
+                    });
+                }
+            }
+            FractureTarget::Chunk(chunk_id) => {
+                if health_loss > 0.0 && family.chunk_states.contains_key(&chunk_id) {
                     out.push(FractureCommand {
                         order_key: input.order_key,
                         actor: input.actor,
@@ -1825,6 +1883,36 @@ pub fn apply_fracture_commands(
                     source: command.source,
                 });
             }
+            FractureTarget::Chunk(chunk_id) => {
+                if health_loss == 0.0 {
+                    continue;
+                }
+                let covered_nodes = chunk_target_support_nodes(&family.asset, chunk_id);
+                let Some(state) = family.chunk_states.get_mut(&chunk_id) else {
+                    continue;
+                };
+                let old_health = state.health;
+                state.health = (state.health - health_loss).max(0.0);
+                state.accumulated_damage += health_loss;
+                let new_health = state.health;
+                for node in covered_nodes {
+                    if let Some(actor) = family.node_owner.get(&node) {
+                        family.dirty_actors.insert(*actor);
+                    }
+                }
+                events.push(FractureEvent {
+                    event_id: family.next_event_id(),
+                    order_key: command.order_key,
+                    family: family.id,
+                    actor: command.actor,
+                    target: command.target,
+                    old_health,
+                    new_health,
+                    old_effective_length: 0.0,
+                    new_effective_length: 0.0,
+                    source: command.source,
+                });
+            }
             FractureTarget::Node(node_id) => {
                 if health_loss == 0.0 {
                     continue;
@@ -1931,6 +2019,14 @@ fn actor_owns_target(family: &FxFamily, actor: FxActorId, target: FractureTarget
             family.node_owner.get(&bond.node_a) == Some(&actor)
                 && family.node_owner.get(&bond.node_b) == Some(&actor)
         }
+        FractureTarget::Chunk(chunk_id) => {
+            let support_nodes = chunk_target_support_nodes(&family.asset, chunk_id);
+            family.chunk_states.contains_key(&chunk_id)
+                && !support_nodes.is_empty()
+                && support_nodes
+                    .iter()
+                    .all(|node| family.node_owner.get(node) == Some(&actor))
+        }
         FractureTarget::Node(node_id) => family.node_owner.get(&node_id) == Some(&actor),
         FractureTarget::ExternalBond(bond_id) => family
             .external_bonds
@@ -1944,6 +2040,61 @@ fn actor_owns_target(family: &FxFamily, actor: FxActorId, target: FractureTarget
                     || family.node_owner.get(&bond.node_b) == Some(&actor)
             }),
     }
+}
+
+fn chunk_target_support_nodes(asset: &FxAsset, chunk_id: ChunkId) -> BTreeSet<SupportNodeId> {
+    let Some(chunk) = asset.chunk(chunk_id) else {
+        return BTreeSet::new();
+    };
+    if !chunk.support_nodes.is_empty() {
+        return chunk.support_nodes.iter().copied().collect();
+    }
+
+    let children_by_parent = chunk_children_by_parent(asset.chunks());
+    let mut descendant_support_nodes = BTreeSet::new();
+    let mut stack = children_by_parent
+        .get(&chunk_id)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(child_id) = stack.pop() {
+        let Some(child) = asset.chunk(child_id) else {
+            continue;
+        };
+        descendant_support_nodes.extend(child.support_nodes.iter().copied());
+        if let Some(children) = children_by_parent.get(&child_id) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    if !descendant_support_nodes.is_empty() {
+        return descendant_support_nodes;
+    }
+
+    let parent_by_chunk = asset
+        .chunks()
+        .iter()
+        .map(|chunk| (chunk.id, chunk.parent))
+        .collect::<BTreeMap<_, _>>();
+    let mut current = chunk.parent;
+    while let Some(parent_id) = current {
+        let Some(parent) = asset.chunk(parent_id) else {
+            break;
+        };
+        if !parent.support_nodes.is_empty() {
+            return parent.support_nodes.iter().copied().collect();
+        }
+        current = parent_by_chunk.get(&parent_id).copied().flatten();
+    }
+    BTreeSet::new()
+}
+
+fn chunk_children_by_parent(chunks: &[Chunk2D]) -> BTreeMap<ChunkId, Vec<ChunkId>> {
+    let mut children = BTreeMap::<ChunkId, Vec<ChunkId>>::new();
+    for chunk in chunks {
+        if let Some(parent) = chunk.parent {
+            children.entry(parent).or_default().push(chunk.id);
+        }
+    }
+    children
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2489,13 +2640,23 @@ fn validate_chunk_hierarchy(
     let mut chunk_ids = BTreeSet::new();
     let mut parent_ids = BTreeSet::new();
     let mut parent_by_chunk = BTreeMap::new();
+    let mut support_chunks = BTreeSet::new();
     for chunk in chunks {
         if !chunk_ids.insert(chunk.id) {
             return Err(ValidationError::DuplicateChunkId(chunk.id));
         }
         parent_by_chunk.insert(chunk.id, chunk.parent);
-        if !node_ids.contains(&chunk.support_node) {
-            return Err(ValidationError::ChunkEndpointMissing(chunk.support_node));
+        if !chunk.support_nodes.is_empty() {
+            support_chunks.insert(chunk.id);
+        }
+        let mut chunk_node_ids = BTreeSet::new();
+        for &node in &chunk.support_nodes {
+            if !chunk_node_ids.insert(node) {
+                return Err(ValidationError::ChunkHierarchyNotExact);
+            }
+            if !node_ids.contains(&node) {
+                return Err(ValidationError::ChunkEndpointMissing(node));
+            }
         }
         if let Some(parent) = chunk.parent {
             parent_ids.insert(parent);
@@ -2517,19 +2678,43 @@ fn validate_chunk_hierarchy(
         }
     }
 
-    let mut leaf_chunks = BTreeMap::new();
     for chunk in chunks {
-        if parent_ids.contains(&chunk.id) {
+        if chunk.support_nodes.is_empty() {
             continue;
         }
-        if leaf_chunks.insert(chunk.support_node, chunk.id).is_some() {
-            return Err(ValidationError::ChunkHierarchyNotExact);
+        let mut current = chunk.parent;
+        while let Some(parent) = current {
+            if support_chunks.contains(&parent) {
+                return Err(ValidationError::ChunkHierarchyNotExact);
+            }
+            current = parent_by_chunk.get(&parent).copied().flatten();
         }
     }
-    if leaf_chunks.keys().copied().collect::<BTreeSet<_>>() != *node_ids {
+
+    let mut node_to_support_chunk = BTreeMap::new();
+    for chunk in chunks {
+        for &node in &chunk.support_nodes {
+            if node_to_support_chunk.insert(node, chunk.id).is_some() {
+                return Err(ValidationError::ChunkHierarchyNotExact);
+            }
+        }
+    }
+    if node_to_support_chunk
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != *node_ids
+    {
         return Err(ValidationError::ChunkHierarchyNotExact);
     }
-    Ok(leaf_chunks)
+    Ok(node_to_support_chunk)
+}
+
+fn normalize_chunks(chunks: &mut [Chunk2D]) {
+    for chunk in chunks.iter_mut() {
+        chunk.support_nodes.sort_unstable();
+    }
+    chunks.sort_by_key(|chunk| chunk.id);
 }
 
 fn validate_four_neighbor_connected(voxels: &[GridCoord]) -> Result<(), ValidationError> {
@@ -2821,6 +3006,32 @@ fn valid_runtime_scalar(value: f32) -> bool {
     value.is_finite() && value >= 0.0
 }
 
+fn initial_chunk_state() -> ChunkRuntimeState {
+    ChunkRuntimeState {
+        health: 1.0,
+        accumulated_damage: 0.0,
+    }
+}
+
+fn reconcile_chunk_states(
+    old_states: &BTreeMap<ChunkId, ChunkRuntimeState>,
+    asset: &FxAsset,
+) -> BTreeMap<ChunkId, ChunkRuntimeState> {
+    asset
+        .chunks()
+        .iter()
+        .map(|chunk| {
+            (
+                chunk.id,
+                old_states
+                    .get(&chunk.id)
+                    .cloned()
+                    .unwrap_or_else(initial_chunk_state),
+            )
+        })
+        .collect()
+}
+
 fn valid_vec2(value: Vec2) -> bool {
     value.x.is_finite() && value.y.is_finite()
 }
@@ -3059,48 +3270,72 @@ mod tests {
     }
 
     #[test]
-    fn authored_chunk_hierarchy_uses_leaf_chunks_as_exact_cover() {
+    fn chunk_hierarchy_allows_non_leaf_support_exact_cover() {
         let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
         let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
         desc.authored_chunks = Some(vec![
             Chunk2D {
                 id: ChunkId(10),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![],
                 parent: Some(ChunkId(20)),
             },
             Chunk2D {
                 id: ChunkId(11),
-                support_node: SupportNodeId(1),
+                support_nodes: vec![],
                 parent: Some(ChunkId(20)),
             },
             Chunk2D {
                 id: ChunkId(20),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![SupportNodeId(0), SupportNodeId(1)],
                 parent: None,
             },
         ]);
 
         let asset = FxAsset::from_desc(desc).unwrap();
 
-        assert_eq!(asset.support_nodes()[0].chunk_id, ChunkId(10));
-        assert_eq!(asset.support_nodes()[1].chunk_id, ChunkId(11));
+        assert_eq!(asset.support_nodes()[0].chunk_id, ChunkId(20));
+        assert_eq!(asset.support_nodes()[1].chunk_id, ChunkId(20));
         assert_eq!(asset.chunks().len(), 3);
+        assert!(asset.chunk(ChunkId(20)).unwrap().support_nodes.len() == 2);
         assert!(asset.validate().is_ok());
     }
 
     #[test]
-    fn authored_chunk_hierarchy_requires_leaf_exact_cover() {
+    fn authored_chunk_hierarchy_requires_support_exact_cover() {
         let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
         let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
         desc.authored_chunks = Some(vec![
             Chunk2D {
                 id: ChunkId(10),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![],
                 parent: Some(ChunkId(20)),
             },
             Chunk2D {
                 id: ChunkId(20),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![SupportNodeId(0)],
+                parent: None,
+            },
+        ]);
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::ChunkHierarchyNotExact
+        );
+    }
+
+    #[test]
+    fn chunk_hierarchy_rejects_overlapping_support_ancestors() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_nodes: vec![SupportNodeId(1)],
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_nodes: vec![SupportNodeId(0)],
                 parent: None,
             },
         ]);
@@ -3118,12 +3353,12 @@ mod tests {
         desc.authored_chunks = Some(vec![
             Chunk2D {
                 id: ChunkId(10),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![SupportNodeId(0)],
                 parent: Some(ChunkId(99)),
             },
             Chunk2D {
                 id: ChunkId(11),
-                support_node: SupportNodeId(1),
+                support_nodes: vec![SupportNodeId(1)],
                 parent: None,
             },
         ]);
@@ -3141,12 +3376,12 @@ mod tests {
         desc.authored_chunks = Some(vec![
             Chunk2D {
                 id: ChunkId(10),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![SupportNodeId(0)],
                 parent: Some(ChunkId(10)),
             },
             Chunk2D {
                 id: ChunkId(11),
-                support_node: SupportNodeId(1),
+                support_nodes: vec![SupportNodeId(1)],
                 parent: None,
             },
         ]);
@@ -3164,12 +3399,12 @@ mod tests {
         desc.authored_chunks = Some(vec![
             Chunk2D {
                 id: ChunkId(10),
-                support_node: SupportNodeId(0),
+                support_nodes: vec![SupportNodeId(0)],
                 parent: Some(ChunkId(11)),
             },
             Chunk2D {
                 id: ChunkId(11),
-                support_node: SupportNodeId(1),
+                support_nodes: vec![SupportNodeId(1)],
                 parent: Some(ChunkId(10)),
             },
         ]);
@@ -4055,6 +4290,80 @@ mod tests {
         assert!(events.is_empty());
         assert!(!family.is_dirty(FxActorId(0)));
         assert_eq!(before, family.deterministic_state_digest());
+    }
+
+    #[test]
+    fn apply_fracture_mutates_visible_chunk_health() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_nodes: vec![],
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_nodes: vec![SupportNodeId(0), SupportNodeId(1)],
+                parent: None,
+            },
+        ]);
+        let mut family = family_for(FxAsset::from_desc(desc).unwrap());
+        let family_id = family.id;
+
+        let events = apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Chunk(ChunkId(10)),
+                health_loss: 0.25,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target, FractureTarget::Chunk(ChunkId(10)));
+        assert_eq!(events[0].old_health, 1.0);
+        assert_eq!(events[0].new_health, 0.75);
+        assert_eq!(family.chunk_state(ChunkId(10)).unwrap().health, 0.75);
+        assert_eq!(family.node_state(SupportNodeId(0)).unwrap().health, 1.0);
+    }
+
+    #[test]
+    fn deterministic_digest_changes_when_chunk_health_changes() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_nodes: vec![],
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_nodes: vec![SupportNodeId(0), SupportNodeId(1)],
+                parent: None,
+            },
+        ]);
+        let mut family = family_for(FxAsset::from_desc(desc).unwrap());
+        let before = family.deterministic_state_digest();
+        let family_id = family.id;
+
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(1, 1, family_id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::Chunk(ChunkId(10)),
+                health_loss: 0.25,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            }],
+        );
+
+        assert_ne!(before, family.deterministic_state_digest());
     }
 
     #[test]

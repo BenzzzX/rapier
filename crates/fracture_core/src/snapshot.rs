@@ -6,7 +6,7 @@ use super::*;
 
 const MAGIC_ASSET: [u8; 8] = *b"RFXSCA\0\0";
 const MAGIC_FAMILY: [u8; 8] = *b"RFXSCF\0\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const DIMENSION_2D: u8 = 2;
 const SCALAR_F32: u8 = 4;
 const HEADER_LEN: usize = 34;
@@ -139,7 +139,10 @@ pub(crate) fn write_asset_payload(
     writer.vec_len(asset.chunks.len())?;
     for chunk in &asset.chunks {
         writer.u32(chunk.id.0);
-        writer.u32(chunk.support_node.0);
+        writer.vec_len(chunk.support_nodes.len())?;
+        for node in &chunk.support_nodes {
+            writer.u32(node.0);
+        }
         write_opt_id(writer, chunk.parent.map(|id| id.0));
     }
     writer.vec_len(asset.internal_bonds.len())?;
@@ -230,13 +233,20 @@ pub(crate) fn read_asset_payload(reader: &mut Reader<'_>) -> Result<FxAsset, FxC
     let chunk_count = reader.len("chunks")?;
     let mut chunks = Vec::with_capacity(chunk_count);
     for _ in 0..chunk_count {
+        let id = ChunkId(reader.u32("chunk.id")?);
+        let support_node_count = reader.len("chunk.support_nodes")?;
+        let mut support_nodes = Vec::with_capacity(support_node_count);
+        for _ in 0..support_node_count {
+            support_nodes.push(SupportNodeId(reader.u32("chunk.support_node")?));
+        }
+        support_nodes.sort_unstable();
         chunks.push(Chunk2D {
-            id: ChunkId(reader.u32("chunk.id")?),
-            support_node: SupportNodeId(reader.u32("chunk.support_node")?),
+            id,
+            support_nodes,
             parent: read_opt_id(reader, "chunk.parent")?.map(ChunkId),
         });
     }
-    chunks.sort_by_key(|chunk| chunk.id);
+    normalize_chunks(&mut chunks);
 
     let internal_bond_count = reader.len("internal_bonds")?;
     let mut internal_bonds = Vec::with_capacity(internal_bond_count);
@@ -317,6 +327,11 @@ pub(crate) fn write_family_payload(
     for (node, state) in &family.node_states {
         writer.u32(node.0);
         write_node_state(writer, state)?;
+    }
+    writer.vec_len(family.chunk_states.len())?;
+    for (chunk, state) in &family.chunk_states {
+        writer.u32(chunk.0);
+        write_chunk_state(writer, state)?;
     }
     writer.vec_len(family.bond_states.len())?;
     for state in &family.bond_states {
@@ -403,6 +418,15 @@ pub(crate) fn read_family_payload(
         }
     }
 
+    let mut chunk_states = BTreeMap::new();
+    for _ in 0..reader.len("family.chunk_states")? {
+        let chunk = ChunkId(reader.u32("chunk_state.chunk")?);
+        let state = read_chunk_state(reader)?;
+        if chunk_states.insert(chunk, state).is_some() {
+            return Err(FxCoreSnapshotError::StateMismatch("duplicate chunk state"));
+        }
+    }
+
     let bond_state_count = reader.len("family.bond_states")?;
     let mut bond_states = Vec::with_capacity(bond_state_count);
     for _ in 0..bond_state_count {
@@ -484,6 +508,7 @@ pub(crate) fn read_family_payload(
         actors,
         node_owner,
         node_states,
+        chunk_states,
         bond_states,
         external_bonds,
         dynamic_structural_bonds,
@@ -524,6 +549,17 @@ fn validate_family_snapshot(family: &FxFamily) -> Result<(), FxCoreSnapshotError
     if family.node_owner.keys().copied().collect::<BTreeSet<_>>() != node_ids {
         return Err(FxCoreSnapshotError::StateMismatch(
             "node owner keys mismatch",
+        ));
+    }
+    let chunk_ids = family
+        .asset
+        .chunks
+        .iter()
+        .map(|chunk| chunk.id)
+        .collect::<BTreeSet<_>>();
+    if family.chunk_states.keys().copied().collect::<BTreeSet<_>>() != chunk_ids {
+        return Err(FxCoreSnapshotError::StateMismatch(
+            "chunk state keys mismatch",
         ));
     }
     let mut built_node_owner = BTreeMap::new();
@@ -576,6 +612,16 @@ fn validate_family_snapshot(family: &FxFamily) -> Result<(), FxCoreSnapshotError
         if !node_ids.contains(node) {
             return Err(FxCoreSnapshotError::StateMismatch(
                 "node state references missing node",
+            ));
+        }
+    }
+    for (chunk, state) in &family.chunk_states {
+        if !valid_runtime_scalar(state.health) || !valid_runtime_scalar(state.accumulated_damage) {
+            return Err(FxCoreSnapshotError::InvalidValue("chunk_state"));
+        }
+        if !chunk_ids.contains(chunk) {
+            return Err(FxCoreSnapshotError::StateMismatch(
+                "chunk state references missing chunk",
             ));
         }
     }
@@ -666,6 +712,22 @@ fn read_node_state(reader: &mut Reader<'_>) -> Result<NodeRuntimeState, FxCoreSn
     Ok(NodeRuntimeState {
         health: reader.f32("node_state.health")?,
         accumulated_damage: reader.f32("node_state.accumulated_damage")?,
+    })
+}
+
+fn write_chunk_state(
+    writer: &mut Writer,
+    state: &ChunkRuntimeState,
+) -> Result<(), FxCoreSnapshotError> {
+    writer.f32(state.health, "chunk_state.health")?;
+    writer.f32(state.accumulated_damage, "chunk_state.accumulated_damage")?;
+    Ok(())
+}
+
+fn read_chunk_state(reader: &mut Reader<'_>) -> Result<ChunkRuntimeState, FxCoreSnapshotError> {
+    Ok(ChunkRuntimeState {
+        health: reader.f32("chunk_state.health")?,
+        accumulated_damage: reader.f32("chunk_state.accumulated_damage")?,
     })
 }
 
@@ -1083,6 +1145,29 @@ mod tests {
         .unwrap()
     }
 
+    fn non_leaf_support_asset() -> FxAsset {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(
+            FxAssetId(7),
+            1.0,
+            occupancy,
+            vec![Some(SupportNodeId(0)), Some(SupportNodeId(1))],
+        );
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_nodes: vec![],
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_nodes: vec![SupportNodeId(0), SupportNodeId(1)],
+                parent: None,
+            },
+        ]);
+        FxAsset::from_desc(desc).unwrap()
+    }
+
     fn family_snapshot_payload(family: &FxFamily) -> Vec<u8> {
         let bytes = family
             .to_snapshot_bytes(SnapshotMode::Deterministic)
@@ -1213,6 +1298,51 @@ mod tests {
     }
 
     #[test]
+    fn core_snapshot_roundtrip_preserves_non_leaf_support_chunks() {
+        let asset = non_leaf_support_asset();
+        let bytes = asset
+            .to_snapshot_bytes(SnapshotMode::Deterministic)
+            .unwrap();
+        let restored_asset = FxAsset::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restored_asset, asset);
+        assert_eq!(restored_asset.support_nodes()[0].chunk_id, ChunkId(20));
+        assert!(
+            restored_asset
+                .chunk(ChunkId(10))
+                .unwrap()
+                .support_nodes
+                .is_empty()
+        );
+
+        let mut family = FxFamily::instantiate(FxFamilyId(3), asset);
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(
+                    1,
+                    1,
+                    FxFamilyId(3),
+                    FxActorId(0),
+                    CommandId(0),
+                ),
+                actor: FxActorId(0),
+                target: FractureTarget::Chunk(ChunkId(10)),
+                health_loss: 0.25,
+                effective_length_loss: 0.0,
+                source: DamageSource::Script,
+            }],
+        );
+        let digest = family.deterministic_state_digest();
+        let bytes = family
+            .to_snapshot_bytes(SnapshotMode::Deterministic)
+            .unwrap();
+        let restored = FxFamily::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restored, family);
+        assert_eq!(restored.deterministic_state_digest(), digest);
+        assert_eq!(restored.chunk_state(ChunkId(10)).unwrap().health, 0.75);
+    }
+
+    #[test]
     fn core_snapshot_rejects_corrupt_header() {
         let asset = asset_from_rows(&["#"], &[Some(0)]);
         let mut bytes = asset
@@ -1248,6 +1378,18 @@ mod tests {
             FxAsset::from_snapshot_bytes(&wrapped_asset_payload(asset_snapshot_payload(&asset)))
                 .unwrap_err(),
             FxCoreSnapshotError::Validation(ValidationError::DuplicateChunkId(ChunkId(0)))
+        );
+    }
+
+    #[test]
+    fn asset_snapshot_rejects_overlapping_support_ancestors() {
+        let mut asset = asset_from_rows(&["##"], &[Some(0), Some(1)]);
+        asset.chunks[1].parent = Some(ChunkId(0));
+
+        assert_eq!(
+            FxAsset::from_snapshot_bytes(&wrapped_asset_payload(asset_snapshot_payload(&asset)))
+                .unwrap_err(),
+            FxCoreSnapshotError::Validation(ValidationError::ChunkHierarchyNotExact)
         );
     }
 

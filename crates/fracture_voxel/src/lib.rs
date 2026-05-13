@@ -1726,14 +1726,14 @@ fn build_authored_chunks(
                 parent_by_material.insert(*material, parent);
                 chunks.push(Chunk2D {
                     id: parent,
-                    support_node: nodes[0],
+                    support_nodes: nodes.clone(),
                     parent: None,
                 });
             }
             for (node, material) in material_by_node {
                 chunks.push(Chunk2D {
                     id: ChunkId(node.0),
-                    support_node: node,
+                    support_nodes: vec![],
                     parent: parent_by_material.get(&material).copied(),
                 });
             }
@@ -2670,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_authoring_parent_chunks_by_material_builds_hierarchy() {
+    fn voxel_authoring_parent_chunks_by_material_creates_non_leaf_support_chunks() {
         let input = input_from_rows(&["####", "####"], &[1, 1, 2, 2, 1, 1, 2, 2]);
         let options = VoxelAuthoringOptions {
             material_cluster_rules: BTreeMap::from([
@@ -2703,21 +2703,25 @@ mod tests {
         assert_eq!(asset.core().support_nodes().len(), 8);
         assert_eq!(leaves.len(), asset.core().support_nodes().len());
         assert_eq!(parents.len(), 2);
-        assert!(leaves.iter().all(|chunk| chunk.parent.is_some()));
+        assert!(
+            leaves
+                .iter()
+                .all(|chunk| chunk.parent.is_some() && chunk.support_nodes.is_empty())
+        );
         for node in asset.core().support_nodes() {
-            assert!(
-                leaves
-                    .iter()
-                    .any(|chunk| chunk.id == node.chunk_id && chunk.support_node == node.id)
-            );
+            assert!(parents.iter().any(|chunk| {
+                chunk.id == node.chunk_id && chunk.support_nodes.contains(&node.id)
+            }));
         }
         for parent in parents {
-            let covered_materials = leaves
+            assert!(!parent.support_nodes.is_empty());
+            let covered_materials = parent
+                .support_nodes
                 .iter()
-                .filter(|leaf| leaf.parent == Some(parent.id))
-                .map(|leaf| asset.core().node(leaf.support_node).unwrap().material_id)
+                .map(|node| asset.core().node(*node).unwrap().material_id)
                 .collect::<BTreeSet<_>>();
             assert_eq!(covered_materials.len(), 1);
+            assert!(leaves.iter().any(|leaf| leaf.parent == Some(parent.id)));
         }
         asset.core().validate().unwrap();
         asset.validate_exact_cover().unwrap();

@@ -3,7 +3,7 @@ use thiserror::Error;
 use super::*;
 
 const MAGIC: [u8; 8] = *b"RFXSVX\0\0";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 34;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -286,7 +286,10 @@ fn write_chunks(writer: &mut Writer, chunks: &[Chunk2D]) -> Result<(), VoxelSnap
     writer.len(chunks.len())?;
     for chunk in chunks {
         writer.u32(chunk.id.0);
-        writer.u32(chunk.support_node.0);
+        writer.len(chunk.support_nodes.len())?;
+        for node in &chunk.support_nodes {
+            writer.u32(node.0);
+        }
         match chunk.parent {
             Some(parent) => {
                 writer.u8(1);
@@ -515,7 +518,12 @@ impl<'a> Reader<'a> {
         let mut out = Vec::with_capacity(len);
         for _ in 0..len {
             let id = ChunkId(self.u32("chunk.id")?);
-            let support_node = SupportNodeId(self.u32("chunk.support_node")?);
+            let support_node_count = self.len("chunk.support_nodes")?;
+            let mut support_nodes = Vec::with_capacity(support_node_count);
+            for _ in 0..support_node_count {
+                support_nodes.push(SupportNodeId(self.u32("chunk.support_node")?));
+            }
+            support_nodes.sort_unstable();
             let parent = match self.u8("chunk.parent.tag")? {
                 0 => None,
                 1 => Some(ChunkId(self.u32("chunk.parent")?)),
@@ -523,7 +531,7 @@ impl<'a> Reader<'a> {
             };
             out.push(Chunk2D {
                 id,
-                support_node,
+                support_nodes,
                 parent,
             });
         }
@@ -596,6 +604,21 @@ impl<'a> Reader<'a> {
         for _ in 0..len {
             cursor = cursor
                 .checked_add(8)
+                .ok_or(VoxelSnapshotError::UnexpectedEof(field))?;
+            if cursor > self.bytes.len() {
+                return Err(VoxelSnapshotError::UnexpectedEof(field));
+            }
+            let support_node_count = u32::from_le_bytes([
+                self.bytes[cursor - 4],
+                self.bytes[cursor - 3],
+                self.bytes[cursor - 2],
+                self.bytes[cursor - 1],
+            ]) as usize;
+            let support_node_bytes = support_node_count
+                .checked_mul(4)
+                .ok_or(VoxelSnapshotError::UnexpectedEof(field))?;
+            cursor = cursor
+                .checked_add(support_node_bytes)
                 .ok_or(VoxelSnapshotError::UnexpectedEof(field))?;
             if cursor >= self.bytes.len() {
                 return Err(VoxelSnapshotError::UnexpectedEof(field));
@@ -675,7 +698,7 @@ mod tests {
             .into_iter()
             .map(|node| Chunk2D {
                 id: ChunkId(node.0),
-                support_node: node,
+                support_nodes: vec![node],
                 parent: None,
             })
             .collect::<Vec<_>>();
@@ -719,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn voxel_asset_snapshot_roundtrip_preserves_parent_chunks() {
+    fn voxel_snapshot_roundtrip_preserves_visible_and_support_chunks() {
         let input = VoxelAuthoringInput::new(
             4,
             2,
@@ -741,6 +764,35 @@ mod tests {
         let bytes = asset.to_snapshot_bytes().unwrap();
         let restored = AuthoredVoxelAsset::from_snapshot_bytes(&bytes).unwrap();
 
+        let parent_ids = restored
+            .core()
+            .chunks()
+            .iter()
+            .filter_map(|chunk| chunk.parent)
+            .collect::<BTreeSet<_>>();
+        let visible_leaves = restored
+            .core()
+            .chunks()
+            .iter()
+            .filter(|chunk| !parent_ids.contains(&chunk.id))
+            .collect::<Vec<_>>();
+        let support_parents = restored
+            .core()
+            .chunks()
+            .iter()
+            .filter(|chunk| parent_ids.contains(&chunk.id))
+            .collect::<Vec<_>>();
+        assert!(
+            visible_leaves
+                .iter()
+                .all(|chunk| chunk.support_nodes.is_empty() && chunk.parent.is_some())
+        );
+        assert_eq!(support_parents.len(), 2);
+        assert!(
+            support_parents
+                .iter()
+                .all(|chunk| !chunk.support_nodes.is_empty())
+        );
         assert_eq!(restored.core().chunks(), asset.core().chunks());
         assert_eq!(restored.core(), asset.core());
         assert_eq!(restored.node_summaries(), asset.node_summaries());

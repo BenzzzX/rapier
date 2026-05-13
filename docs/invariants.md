@@ -35,7 +35,10 @@ Required for Phase 1:
 - No empty voxel is covered by a `SupportNode2D`.
 - `support_nodes` have stable IDs. Serialization/deserialization or deterministic rebuild of the same input must not renumber nodes arbitrarily.
 - `internal_bonds` only reference valid support node IDs from the same asset.
-- `chunk_hierarchy` must represent an exact cover over support nodes: no support node is missing from the hierarchy and no support node is owned twice.
+- `chunk_hierarchy` distinguishes support chunks from visible/non-support chunks. A chunk with a non-empty support-node set is a support chunk; a chunk with an empty support-node set is a visible or grouping chunk.
+- Support chunks must represent an exact cover over support nodes: no support node is missing from support chunks and no support node is owned by two support chunks.
+- A support chunk may be non-leaf and have visible/non-support descendants. A support chunk must not have a support chunk ancestor, because that would make support ownership ambiguous.
+- Visible/non-support chunks may carry runtime chunk health and may be fracture targets, but they do not participate in support graph connectivity by themselves.
 - Material/contact/external/orientation maps, when present, must have the same dimensions as `occupancy_grid`.
 
 Suggested tests:
@@ -93,6 +96,7 @@ Required for Phase 1:
 - A support node contains at least one occupied voxel.
 - Voxels inside one support node are 4-neighbor connected unless a future authoring flag explicitly records an allowed exception. Diagonal contact alone is not connectivity.
 - A support node has one stable `node_id`, one `chunk_id` or equivalent hierarchy association, and a deterministic voxel span/bounds.
+- `SupportNode2D.chunk_id` is the owning support chunk id. It is not required to be a visible leaf chunk id, and multiple support nodes may reference the same non-leaf support chunk when that chunk covers them exactly.
 - `material_summary`, anisotropy frame, and stable seed are deterministic functions of source maps and authoring parameters.
 - Runtime repair must not reuse a `node_id` to mean a completely unrelated region.
 
@@ -156,9 +160,10 @@ Required for Phase 1:
 
 - `DamageCommand` collection is deterministic before generation. Each command has a deterministic order key: `(tick, source_priority, family_id, actor_id, command_id)` or a stricter stable equivalent.
 - Generate stage reads actor/family/material/stress context and writes `FractureCommand` values only. It must not mutate family state, actor ownership, health, or split state.
-- `FractureCommand` values identify targets by stable IDs, not transient iteration positions.
+- `FractureCommand` values identify targets by stable IDs, not transient iteration positions. Chunk targets use stable `ChunkId` values and may refer to visible/non-support chunks.
 - Apply stage is the only stage that mutates bond/chunk/node health and effective length.
 - Apply stage clamps health/effective length at zero and emits old/new health events in deterministic order.
+- Applying a chunk target mutates chunk runtime health, affects deterministic state digest, and emits a `FractureEvent` with `FractureTarget::Chunk`.
 - Split stage runs after apply, not during generate or apply.
 - Multiple apply passes may occur before split only if the command ordering and dirty actor set remain deterministic and tests cover the sequence.
 
@@ -176,7 +181,7 @@ Required for Phase 1:
 
 - `EventStream` event order is deterministic in deterministic mode and follows the same sorted command/apply/split order as state mutation.
 - Every emitted event has a stable `event_id`, source command/input ID, family ID, actor ID where applicable, and deterministic tick/sequence metadata.
-- `FractureEvent` records target kind and stable target ID, source, old health/effective length, new health/effective length, and enough position/material context for gameplay/debug consumers.
+- `FractureEvent` records target kind and stable target ID, source, old health/effective length, new health/effective length, and enough position/material context for gameplay/debug consumers. Chunk target events report the affected `ChunkId` and the old/new chunk health.
 - `SplitEvent` records parent actor, kept actor, created child actors, deterministic node sets per fragment, and parent-retention reason/key.
 - Event emission is a consequence of apply/split stages; generate stage may produce debug traces but must not emit committed health/split events.
 
