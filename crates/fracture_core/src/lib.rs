@@ -316,6 +316,7 @@ pub struct FxAssetDesc {
     pub voxel_size: f32,
     pub occupancy: DenseOccupancy,
     pub support_node_map: Vec<Option<SupportNodeId>>,
+    pub authored_chunks: Option<Vec<Chunk2D>>,
     pub material_map: Option<Vec<u16>>,
     pub orientation_map: Option<Vec<u16>>,
     pub default_bond_health: f32,
@@ -335,6 +336,7 @@ impl FxAssetDesc {
             voxel_size,
             occupancy,
             support_node_map,
+            authored_chunks: None,
             material_map: None,
             orientation_map: None,
             default_bond_health: 1.0,
@@ -423,13 +425,11 @@ impl FxAsset {
         }
 
         let mut support_nodes = Vec::with_capacity(grouped.len());
-        let mut chunks = Vec::with_capacity(grouped.len());
         for (node_id, mut voxels) in grouped {
             voxels.sort_unstable();
             validate_four_neighbor_connected(&voxels)?;
             let material_id =
                 dominant_material(&voxels, &desc.occupancy, desc.material_map.as_ref());
-            let chunk_id = ChunkId(node_id.0);
             let orientation_summary =
                 dominant_orientation(&voxels, &desc.occupancy, desc.orientation_map.as_ref());
             let anisotropy_axis = orientation_summary
@@ -438,18 +438,35 @@ impl FxAsset {
             let stable_seed = stable_node_seed(node_id, &voxels, material_id, orientation_summary);
             support_nodes.push(SupportNode2D {
                 id: node_id,
-                chunk_id,
+                chunk_id: ChunkId(node_id.0),
                 voxels,
                 material_id,
                 orientation_summary,
                 anisotropy_axis,
                 stable_seed,
             });
-            chunks.push(Chunk2D {
-                id: chunk_id,
-                support_node: node_id,
-                parent: None,
-            });
+        }
+        let mut chunks = desc.authored_chunks.unwrap_or_else(|| {
+            support_nodes
+                .iter()
+                .map(|node| Chunk2D {
+                    id: ChunkId(node.id.0),
+                    support_node: node.id,
+                    parent: None,
+                })
+                .collect()
+        });
+        chunks.sort_by_key(|chunk| chunk.id);
+        let node_ids = support_nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        let leaf_chunks = validate_chunk_hierarchy(&chunks, &node_ids)?;
+        for node in &mut support_nodes {
+            node.chunk_id = leaf_chunks
+                .get(&node.id)
+                .copied()
+                .ok_or(ValidationError::ChunkHierarchyNotExact)?;
         }
 
         let mut asset = Self {
@@ -526,18 +543,11 @@ impl FxAsset {
                 return Err(ValidationError::MissingSupportCoverage(coord));
             }
         }
-        let mut chunk_ids = BTreeSet::new();
-        for chunk in &self.chunks {
-            if !chunk_ids.insert(chunk.id) {
-                return Err(ValidationError::DuplicateChunkId(chunk.id));
+        let leaf_chunks = validate_chunk_hierarchy(&self.chunks, &node_ids)?;
+        for node in &self.support_nodes {
+            if leaf_chunks.get(&node.id) != Some(&node.chunk_id) {
+                return Err(ValidationError::ChunkHierarchyNotExact);
             }
-            if !node_ids.contains(&chunk.support_node) {
-                return Err(ValidationError::ChunkEndpointMissing(chunk.support_node));
-            }
-        }
-        let chunk_nodes: BTreeSet<_> = self.chunks.iter().map(|chunk| chunk.support_node).collect();
-        if chunk_nodes != node_ids {
-            return Err(ValidationError::ChunkHierarchyNotExact);
         }
         let mut bond_ids = BTreeSet::new();
         for (index, bond) in self.internal_bonds.iter().enumerate() {
@@ -2349,6 +2359,10 @@ pub enum ValidationError {
     DuplicateChunkId(ChunkId),
     #[error("chunk references missing support node {0:?}")]
     ChunkEndpointMissing(SupportNodeId),
+    #[error("chunk references missing parent chunk {0:?}")]
+    ChunkParentMissing(ChunkId),
+    #[error("chunk parent hierarchy contains a cycle at {0:?}")]
+    ChunkParentCycle(ChunkId),
     #[error("chunk hierarchy is not an exact cover over support nodes")]
     ChunkHierarchyNotExact,
     #[error("duplicate internal bond id {0:?}")]
@@ -2434,6 +2448,56 @@ fn stable_node_seed(
         hasher.write_u32(voxel.y);
     }
     hasher.finish()
+}
+
+fn validate_chunk_hierarchy(
+    chunks: &[Chunk2D],
+    node_ids: &BTreeSet<SupportNodeId>,
+) -> Result<BTreeMap<SupportNodeId, ChunkId>, ValidationError> {
+    let mut chunk_ids = BTreeSet::new();
+    let mut parent_ids = BTreeSet::new();
+    let mut parent_by_chunk = BTreeMap::new();
+    for chunk in chunks {
+        if !chunk_ids.insert(chunk.id) {
+            return Err(ValidationError::DuplicateChunkId(chunk.id));
+        }
+        parent_by_chunk.insert(chunk.id, chunk.parent);
+        if !node_ids.contains(&chunk.support_node) {
+            return Err(ValidationError::ChunkEndpointMissing(chunk.support_node));
+        }
+        if let Some(parent) = chunk.parent {
+            parent_ids.insert(parent);
+        }
+    }
+    for parent in &parent_ids {
+        if !chunk_ids.contains(parent) {
+            return Err(ValidationError::ChunkParentMissing(*parent));
+        }
+    }
+    for chunk in chunks {
+        let mut seen = BTreeSet::new();
+        let mut current = Some(chunk.id);
+        while let Some(chunk_id) = current {
+            if !seen.insert(chunk_id) {
+                return Err(ValidationError::ChunkParentCycle(chunk_id));
+            }
+            current = parent_by_chunk.get(&chunk_id).copied().flatten();
+        }
+    }
+
+    let mut leaf_chunks = BTreeMap::new();
+    for chunk in chunks {
+        if parent_ids.contains(&chunk.id) {
+            continue;
+        }
+        if leaf_chunks.insert(chunk.support_node, chunk.id).is_some() {
+            return Err(ValidationError::ChunkHierarchyNotExact);
+        }
+    }
+    if leaf_chunks.keys().copied().collect::<BTreeSet<_>>() != *node_ids {
+        return Err(ValidationError::ChunkHierarchyNotExact);
+    }
+    Ok(leaf_chunks)
 }
 
 fn validate_four_neighbor_connected(voxels: &[GridCoord]) -> Result<(), ValidationError> {
@@ -2866,6 +2930,128 @@ mod tests {
         assert_eq!(bond.node_b, SupportNodeId(1));
         assert_eq!(bond.interface_edges.len(), 2);
         assert_eq!(bond.length, 2.0);
+    }
+
+    #[test]
+    fn authored_chunk_hierarchy_uses_leaf_chunks_as_exact_cover() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_node: SupportNodeId(0),
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(11),
+                support_node: SupportNodeId(1),
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_node: SupportNodeId(0),
+                parent: None,
+            },
+        ]);
+
+        let asset = FxAsset::from_desc(desc).unwrap();
+
+        assert_eq!(asset.support_nodes()[0].chunk_id, ChunkId(10));
+        assert_eq!(asset.support_nodes()[1].chunk_id, ChunkId(11));
+        assert_eq!(asset.chunks().len(), 3);
+        assert!(asset.validate().is_ok());
+    }
+
+    #[test]
+    fn authored_chunk_hierarchy_requires_leaf_exact_cover() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_node: SupportNodeId(0),
+                parent: Some(ChunkId(20)),
+            },
+            Chunk2D {
+                id: ChunkId(20),
+                support_node: SupportNodeId(0),
+                parent: None,
+            },
+        ]);
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::ChunkHierarchyNotExact
+        );
+    }
+
+    #[test]
+    fn authored_chunk_hierarchy_rejects_missing_parent() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_node: SupportNodeId(0),
+                parent: Some(ChunkId(99)),
+            },
+            Chunk2D {
+                id: ChunkId(11),
+                support_node: SupportNodeId(1),
+                parent: None,
+            },
+        ]);
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::ChunkParentMissing(ChunkId(99))
+        );
+    }
+
+    #[test]
+    fn authored_chunk_hierarchy_rejects_self_parent() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_node: SupportNodeId(0),
+                parent: Some(ChunkId(10)),
+            },
+            Chunk2D {
+                id: ChunkId(11),
+                support_node: SupportNodeId(1),
+                parent: None,
+            },
+        ]);
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::ChunkParentCycle(ChunkId(10))
+        );
+    }
+
+    #[test]
+    fn authored_chunk_hierarchy_rejects_parent_cycle() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.authored_chunks = Some(vec![
+            Chunk2D {
+                id: ChunkId(10),
+                support_node: SupportNodeId(0),
+                parent: Some(ChunkId(11)),
+            },
+            Chunk2D {
+                id: ChunkId(11),
+                support_node: SupportNodeId(1),
+                parent: Some(ChunkId(10)),
+            },
+        ]);
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::ChunkParentCycle(ChunkId(10))
+        );
     }
 
     #[test]

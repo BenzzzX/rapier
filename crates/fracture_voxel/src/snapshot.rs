@@ -3,7 +3,7 @@ use thiserror::Error;
 use super::*;
 
 const MAGIC: [u8; 8] = *b"RFXSVX\0\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 34;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +65,7 @@ impl AuthoredVoxelAsset {
                 None => writer.u8(0),
             }
         }
+        write_chunks(&mut writer, self.core.chunks())?;
         writer.f32(self.default_bond_health, "default_bond_health")?;
         writer.f32(self.default_tension_limit, "default_tension_limit")?;
         writer.f32(self.default_shear_limit, "default_shear_limit")?;
@@ -89,6 +90,7 @@ impl AuthoredVoxelAsset {
         };
         let support_node_hint =
             reader.support_node_hint_vec_exact("support_node_hint", cell_count)?;
+        let chunks = reader.chunk_vec("chunks")?;
         let default_bond_health = reader.f32("default_bond_health")?;
         let default_tension_limit = reader.f32("default_tension_limit")?;
         let default_shear_limit = reader.f32("default_shear_limit")?;
@@ -100,6 +102,7 @@ impl AuthoredVoxelAsset {
         let encoded_external_id = external_id.clone();
         let encoded_orientation = orientation.clone();
         let encoded_support_node_hint = support_node_hint.clone();
+        let encoded_chunks = chunks.clone();
         let mut input = VoxelAuthoringInput::new(
             width,
             height,
@@ -114,7 +117,52 @@ impl AuthoredVoxelAsset {
         input.default_bond_health = default_bond_health;
         input.default_tension_limit = default_tension_limit;
         input.default_shear_limit = default_shear_limit;
-        let asset = author_voxel_asset(input)?;
+        let canonical_asset = author_voxel_asset(input)?;
+        let encoded_node_map = encoded_support_node_hint
+            .iter()
+            .map(|hint| hint.map(SupportNodeId))
+            .collect::<Vec<_>>();
+        if canonical_asset.core.voxel_to_node_map() != encoded_node_map {
+            return Err(VoxelSnapshotError::StateMismatch);
+        }
+        let core = make_core_asset(
+            width,
+            height,
+            voxel_size,
+            encoded_occupancy.clone(),
+            encoded_fracture_material.clone(),
+            encoded_orientation.clone(),
+            encoded_node_map,
+            Some(chunks),
+            default_bond_health,
+            default_tension_limit,
+            default_shear_limit,
+        )?;
+        let asset = AuthoredVoxelAsset {
+            summaries: node_summaries(
+                &core,
+                &encoded_contact_material,
+                &encoded_external_id,
+                width,
+            ),
+            bond_summaries: bond_summaries(
+                &core,
+                &encoded_contact_material,
+                &encoded_external_id,
+                width,
+                height,
+            ),
+            core,
+            width,
+            height,
+            contact_material: encoded_contact_material.clone(),
+            fracture_material: encoded_fracture_material.clone(),
+            external_id: encoded_external_id.clone(),
+            orientation: encoded_orientation.clone(),
+            default_bond_health,
+            default_tension_limit,
+            default_shear_limit,
+        };
         validate_finite(&asset)?;
         validate_restored_matches_encoded(
             &asset,
@@ -127,6 +175,7 @@ impl AuthoredVoxelAsset {
             &encoded_external_id,
             encoded_orientation.as_deref(),
             &encoded_support_node_hint,
+            &encoded_chunks,
             default_bond_health,
             default_tension_limit,
             default_shear_limit,
@@ -146,6 +195,7 @@ fn validate_restored_matches_encoded(
     external_id: &[u32],
     orientation: Option<&[u16]>,
     support_node_hint: &[Option<u32>],
+    chunks: &[Chunk2D],
     default_bond_health: f32,
     default_tension_limit: f32,
     default_shear_limit: f32,
@@ -163,6 +213,7 @@ fn validate_restored_matches_encoded(
         || asset.external_id_map() != external_id
         || asset.orientation_map() != orientation
         || asset.core.voxel_to_node_map() != encoded_node_map
+        || asset.core.chunks() != chunks
         || asset.default_bond_health.to_bits() != default_bond_health.to_bits()
         || asset.default_tension_limit.to_bits() != default_tension_limit.to_bits()
         || asset.default_shear_limit.to_bits() != default_shear_limit.to_bits()
@@ -185,6 +236,7 @@ fn validate_restored_matches_encoded(
         default_shear_limit,
     };
     if asset.core.support_nodes() != expected.core.support_nodes()
+        || asset.core.chunks() != expected.core.chunks()
         || asset.core.internal_bonds() != expected.core.internal_bonds()
         || asset.node_summaries() != expected.node_summaries()
         || asset.bond_summaries() != expected.bond_summaries()
@@ -226,6 +278,22 @@ fn write_u32_vec(writer: &mut Writer, values: &[u32]) -> Result<(), VoxelSnapsho
     writer.len(values.len())?;
     for value in values {
         writer.u32(*value);
+    }
+    Ok(())
+}
+
+fn write_chunks(writer: &mut Writer, chunks: &[Chunk2D]) -> Result<(), VoxelSnapshotError> {
+    writer.len(chunks.len())?;
+    for chunk in chunks {
+        writer.u32(chunk.id.0);
+        writer.u32(chunk.support_node.0);
+        match chunk.parent {
+            Some(parent) => {
+                writer.u8(1);
+                writer.u32(parent.0);
+            }
+            None => writer.u8(0),
+        }
     }
     Ok(())
 }
@@ -441,6 +509,27 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn chunk_vec(&mut self, field: &'static str) -> Result<Vec<Chunk2D>, VoxelSnapshotError> {
+        let len = self.len(field)?;
+        self.ensure_chunks_available(len, field)?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let id = ChunkId(self.u32("chunk.id")?);
+            let support_node = SupportNodeId(self.u32("chunk.support_node")?);
+            let parent = match self.u8("chunk.parent.tag")? {
+                0 => None,
+                1 => Some(ChunkId(self.u32("chunk.parent")?)),
+                _ => return Err(VoxelSnapshotError::InvalidValue("chunk.parent.tag")),
+            };
+            out.push(Chunk2D {
+                id,
+                support_node,
+                parent,
+            });
+        }
+        Ok(out)
+    }
+
     fn exact_len(
         &mut self,
         field: &'static str,
@@ -498,6 +587,35 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    fn ensure_chunks_available(
+        &self,
+        len: usize,
+        field: &'static str,
+    ) -> Result<(), VoxelSnapshotError> {
+        let mut cursor = self.pos;
+        for _ in 0..len {
+            cursor = cursor
+                .checked_add(8)
+                .ok_or(VoxelSnapshotError::UnexpectedEof(field))?;
+            if cursor >= self.bytes.len() {
+                return Err(VoxelSnapshotError::UnexpectedEof(field));
+            }
+            match self.bytes[cursor] {
+                0 => cursor += 1,
+                1 => {
+                    cursor = cursor
+                        .checked_add(5)
+                        .ok_or(VoxelSnapshotError::UnexpectedEof(field))?;
+                    if cursor > self.bytes.len() {
+                        return Err(VoxelSnapshotError::UnexpectedEof(field));
+                    }
+                }
+                _ => return Err(VoxelSnapshotError::InvalidValue("chunk.parent.tag")),
+            }
+        }
+        Ok(())
+    }
+
     fn take(&mut self, len: usize, field: &'static str) -> Result<&'a [u8], VoxelSnapshotError> {
         let end = self
             .pos
@@ -523,6 +641,8 @@ fn checksum(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
 
     fn encoded_asset_bytes(
@@ -539,15 +659,27 @@ mod tests {
         write_u32_vec(&mut writer, &[42, 43]).unwrap();
         writer.u8(0);
         writer.len(support_node_hint.len()).unwrap();
-        for hint in support_node_hint {
+        for hint in &support_node_hint {
             match hint {
                 Some(id) => {
                     writer.u8(1);
-                    writer.u32(id);
+                    writer.u32(*id);
                 }
                 None => writer.u8(0),
             }
         }
+        let chunks = support_node_hint
+            .iter()
+            .filter_map(|hint| hint.map(SupportNodeId))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|node| Chunk2D {
+                id: ChunkId(node.0),
+                support_node: node,
+                parent: None,
+            })
+            .collect::<Vec<_>>();
+        write_chunks(&mut writer, &chunks).unwrap();
         writer.f32(1.0, "default_bond_health").unwrap();
         writer.f32(10.0, "default_tension_limit").unwrap();
         writer.f32(10.0, "default_shear_limit").unwrap();
@@ -584,6 +716,35 @@ mod tests {
         assert_eq!(restored.node_summaries(), asset.node_summaries());
         assert_eq!(restored.bond_summaries(), asset.bond_summaries());
         assert_eq!(restored.core(), asset.core());
+    }
+
+    #[test]
+    fn voxel_asset_snapshot_roundtrip_preserves_parent_chunks() {
+        let input = VoxelAuthoringInput::new(
+            4,
+            2,
+            0.5,
+            vec![true; 8],
+            vec![1, 1, 2, 2, 1, 1, 2, 2],
+            vec![7, 7, 8, 8, 7, 7, 8, 8],
+            vec![42, 43, 44, 45, 46, 47, 48, 49],
+        );
+        let options = VoxelAuthoringOptions {
+            material_cluster_rules: BTreeMap::from([
+                (1, VoxelClusterPolicy::isotropic(1, 1)),
+                (2, VoxelClusterPolicy::isotropic(1, 1)),
+            ]),
+            hierarchy_policy: VoxelHierarchyPolicy::ParentChunksByMaterial,
+        };
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        let bytes = asset.to_snapshot_bytes().unwrap();
+        let restored = AuthoredVoxelAsset::from_snapshot_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.core().chunks(), asset.core().chunks());
+        assert_eq!(restored.core(), asset.core());
+        assert_eq!(restored.node_summaries(), asset.node_summaries());
+        assert_eq!(restored.bond_summaries(), asset.bond_summaries());
     }
 
     #[test]

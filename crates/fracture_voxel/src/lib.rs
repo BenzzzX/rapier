@@ -7,9 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fracture_core::{
-    BondId, BondRuntimeState, FxActorId, FxAsset, FxAssetDesc, FxFamily, FxFamilyId, GridAabb,
-    GridCoord, NodeRuntimeState, RepairError, RepairPlan, SplitEvent, SupportNodeId,
-    ValidationError, Vec2,
+    BondId, BondRuntimeState, Chunk2D, ChunkId, FxActorId, FxAsset, FxAssetDesc, FxFamily,
+    FxFamilyId, GridAabb, GridCoord, NodeRuntimeState, RepairError, RepairPlan, SplitEvent,
+    SupportNodeId, ValidationError, Vec2,
 };
 use thiserror::Error;
 
@@ -30,6 +30,103 @@ pub struct VoxelAuthoringInput {
     pub default_bond_health: f32,
     pub default_tension_limit: f32,
     pub default_shear_limit: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoxelAuthoringOptions {
+    pub material_cluster_rules: BTreeMap<u16, VoxelClusterPolicy>,
+    pub hierarchy_policy: VoxelHierarchyPolicy,
+}
+
+impl VoxelAuthoringOptions {
+    pub fn with_material_rule(mut self, material: u16, rule: VoxelClusterPolicy) -> Self {
+        self.material_cluster_rules.insert(material, rule);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoxelClusterPolicy {
+    pub mode: VoxelClusterMode,
+}
+
+impl VoxelClusterPolicy {
+    pub fn material_components() -> Self {
+        Self {
+            mode: VoxelClusterMode::MaterialComponents,
+        }
+    }
+
+    pub fn isotropic(max_extent: u32, max_voxels: usize) -> Self {
+        Self {
+            mode: VoxelClusterMode::Isotropic {
+                max_extent,
+                max_voxels,
+            },
+        }
+    }
+
+    pub fn brittle_isotropic(max_extent: u32, max_voxels: usize) -> Self {
+        Self::isotropic(max_extent, max_voxels)
+    }
+
+    pub fn fiber(along_extent: u32, cross_extent: u32) -> Self {
+        Self {
+            mode: VoxelClusterMode::Fiber {
+                along_extent,
+                cross_extent,
+            },
+        }
+    }
+
+    pub fn structural_beam(axis: VoxelClusterAxis, along_extent: u32, cross_extent: u32) -> Self {
+        Self {
+            mode: VoxelClusterMode::StructuralBeam {
+                axis,
+                along_extent,
+                cross_extent,
+            },
+        }
+    }
+}
+
+impl Default for VoxelClusterPolicy {
+    fn default() -> Self {
+        Self::material_components()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VoxelHierarchyPolicy {
+    #[default]
+    Flat,
+    ParentChunksByMaterial,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoxelClusterMode {
+    MaterialComponents,
+    Isotropic {
+        max_extent: u32,
+        max_voxels: usize,
+    },
+    Fiber {
+        along_extent: u32,
+        cross_extent: u32,
+    },
+    /// Phase 2 structural authoring uses material metadata to describe beam or
+    /// column direction. Runtime stress still propagates through the bond graph.
+    StructuralBeam {
+        axis: VoxelClusterAxis,
+        along_extent: u32,
+        cross_extent: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VoxelClusterAxis {
+    X,
+    Y,
 }
 
 impl VoxelAuthoringInput {
@@ -487,48 +584,21 @@ impl VoxelRuntime {
 }
 
 pub fn author_voxel_asset(input: VoxelAuthoringInput) -> Result<AuthoredVoxelAsset, VoxelError> {
+    author_voxel_asset_with_options(input, VoxelAuthoringOptions::default())
+}
+
+pub fn author_voxel_asset_with_options(
+    input: VoxelAuthoringInput,
+    options: VoxelAuthoringOptions,
+) -> Result<AuthoredVoxelAsset, VoxelError> {
     validate_input_maps(&input)?;
-    let mut support_node_map = vec![None; cell_count(input.width, input.height)];
-    if let Some(hints) = &input.support_node_hint {
-        let components = connected_components_by_key(input.width, input.height, |coord| {
-            let idx = index(input.width, coord);
-            input.occupancy[idx].then_some(((hints[idx]?, input.fracture_material[idx]), None))
-        });
-        let mut used_ids = BTreeSet::new();
-        let mut next_id = hints
-            .iter()
-            .filter_map(|hint| hint.map(|id| id + 1))
-            .max()
-            .unwrap_or(0);
-        for component in components {
-            let hint_id = SupportNodeId(component.key.0);
-            let node = if used_ids.insert(hint_id) {
-                hint_id
-            } else {
-                while used_ids.contains(&SupportNodeId(next_id)) {
-                    next_id += 1;
-                }
-                let node = SupportNodeId(next_id);
-                used_ids.insert(node);
-                next_id += 1;
-                node
-            };
-            for coord in component.voxels {
-                support_node_map[index(input.width, coord)] = Some(node);
-            }
-        }
-    } else {
-        let components = connected_components_by_key(input.width, input.height, |coord| {
-            let idx = index(input.width, coord);
-            input.occupancy[idx].then_some((input.fracture_material[idx], None))
-        });
-        for (node_idx, component) in components.iter().enumerate() {
-            let node = SupportNodeId(node_idx as u32);
-            for &coord in &component.voxels {
-                support_node_map[index(input.width, coord)] = Some(node);
-            }
-        }
-    }
+    let support_node_map = build_authoring_support_node_map(&input, &options);
+    let authored_chunks = build_authored_chunks(
+        input.width,
+        &input.fracture_material,
+        &support_node_map,
+        &options,
+    );
     let core = make_core_asset(
         input.width,
         input.height,
@@ -537,6 +607,7 @@ pub fn author_voxel_asset(input: VoxelAuthoringInput) -> Result<AuthoredVoxelAss
         input.fracture_material.clone(),
         input.orientation.clone(),
         support_node_map,
+        authored_chunks,
         input.default_bond_health,
         input.default_tension_limit,
         input.default_shear_limit,
@@ -568,6 +639,23 @@ pub fn author_voxel_asset(input: VoxelAuthoringInput) -> Result<AuthoredVoxelAss
     };
     asset.validate_exact_cover()?;
     Ok(asset)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthorClusterKey {
+    material: u16,
+    bin: ClusterBin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ClusterBin {
+    MaterialComponent,
+    Tile {
+        axis: VoxelClusterAxis,
+        direction: u8,
+        x: u32,
+        y: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -762,6 +850,7 @@ fn build_repaired_topology(input: RepairBuildInput<'_>) -> Result<RepairBuildOut
         input.fracture_material.to_vec(),
         input.orientation.cloned(),
         support_node_map,
+        None,
         input.default_bond_health,
         input.default_tension_limit,
         input.default_shear_limit,
@@ -1120,6 +1209,215 @@ fn lineage_pair(
     if la <= lb { (la, lb) } else { (lb, la) }
 }
 
+fn build_authoring_support_node_map(
+    input: &VoxelAuthoringInput,
+    options: &VoxelAuthoringOptions,
+) -> Vec<Option<SupportNodeId>> {
+    let mut support_node_map = vec![None; cell_count(input.width, input.height)];
+    if let Some(hints) = &input.support_node_hint {
+        let components = connected_components_by_key(input.width, input.height, |coord| {
+            let idx = index(input.width, coord);
+            input.occupancy[idx].then_some(((hints[idx]?, input.fracture_material[idx]), None))
+        });
+        let mut used_ids = BTreeSet::new();
+        let mut next_id = hints
+            .iter()
+            .filter_map(|hint| hint.map(|id| id + 1))
+            .max()
+            .unwrap_or(0);
+        for component in components {
+            let hint_id = SupportNodeId(component.key.0);
+            let node = if used_ids.insert(hint_id) {
+                hint_id
+            } else {
+                while used_ids.contains(&SupportNodeId(next_id)) {
+                    next_id += 1;
+                }
+                let node = SupportNodeId(next_id);
+                used_ids.insert(node);
+                next_id += 1;
+                node
+            };
+            for coord in component.voxels {
+                support_node_map[index(input.width, coord)] = Some(node);
+            }
+        }
+    } else {
+        let components = connected_components_by_key(input.width, input.height, |coord| {
+            let idx = index(input.width, coord);
+            if !input.occupancy[idx] {
+                return None;
+            }
+            Some((
+                AuthorClusterKey {
+                    material: input.fracture_material[idx],
+                    bin: cluster_bin_for_voxel(input, coord, options),
+                },
+                None,
+            ))
+        });
+        for (node_idx, component) in components.iter().enumerate() {
+            let node = SupportNodeId(node_idx as u32);
+            for &coord in &component.voxels {
+                support_node_map[index(input.width, coord)] = Some(node);
+            }
+        }
+    }
+    support_node_map
+}
+
+fn cluster_bin_for_voxel(
+    input: &VoxelAuthoringInput,
+    coord: GridCoord,
+    options: &VoxelAuthoringOptions,
+) -> ClusterBin {
+    let idx = index(input.width, coord);
+    let material = input.fracture_material[idx];
+    let rule = options
+        .material_cluster_rules
+        .get(&material)
+        .unwrap_or(&VoxelClusterPolicy {
+            mode: VoxelClusterMode::MaterialComponents,
+        });
+    match &rule.mode {
+        VoxelClusterMode::MaterialComponents => ClusterBin::MaterialComponent,
+        VoxelClusterMode::Isotropic {
+            max_extent,
+            max_voxels,
+        } => {
+            let extent = bounded_isotropic_extent(*max_extent, *max_voxels);
+            ClusterBin::Tile {
+                axis: VoxelClusterAxis::X,
+                direction: 0,
+                x: coord.x / extent,
+                y: coord.y / extent,
+            }
+        }
+        VoxelClusterMode::Fiber {
+            along_extent,
+            cross_extent,
+        } => {
+            let angle = input.orientation.as_ref().map(|map| map[idx]).unwrap_or(0);
+            let axis = orientation_major_axis(angle);
+            elongated_cluster_bin(
+                coord,
+                axis,
+                orientation_direction_bucket(angle),
+                *along_extent,
+                *cross_extent,
+            )
+        }
+        VoxelClusterMode::StructuralBeam {
+            axis,
+            along_extent,
+            cross_extent,
+        } => elongated_cluster_bin(coord, *axis, 0, *along_extent, *cross_extent),
+    }
+}
+
+fn bounded_isotropic_extent(max_extent: u32, max_voxels: usize) -> u32 {
+    let max_voxels = max_voxels.max(1);
+    let mut extent = max_extent.max(1);
+    while (extent as usize).saturating_mul(extent as usize) > max_voxels && extent > 1 {
+        extent -= 1;
+    }
+    extent
+}
+
+fn elongated_cluster_bin(
+    coord: GridCoord,
+    axis: VoxelClusterAxis,
+    direction: u8,
+    along_extent: u32,
+    cross_extent: u32,
+) -> ClusterBin {
+    let along_extent = along_extent.max(1);
+    let cross_extent = cross_extent.max(1);
+    match axis {
+        VoxelClusterAxis::X => ClusterBin::Tile {
+            axis,
+            direction,
+            x: coord.x / along_extent,
+            y: coord.y / cross_extent,
+        },
+        VoxelClusterAxis::Y => ClusterBin::Tile {
+            axis,
+            direction,
+            x: coord.x / cross_extent,
+            y: coord.y / along_extent,
+        },
+    }
+}
+
+fn orientation_direction_bucket(angle: u16) -> u8 {
+    ((u32::from(angle) * 8) / (u32::from(u16::MAX) + 1)) as u8
+}
+
+fn orientation_major_axis(angle: u16) -> VoxelClusterAxis {
+    let radians = (angle as f32 / u16::MAX as f32) * std::f32::consts::TAU;
+    if radians.cos().abs() >= radians.sin().abs() {
+        VoxelClusterAxis::X
+    } else {
+        VoxelClusterAxis::Y
+    }
+}
+
+fn build_authored_chunks(
+    _width: u32,
+    fracture_material: &[u16],
+    support_node_map: &[Option<SupportNodeId>],
+    options: &VoxelAuthoringOptions,
+) -> Option<Vec<Chunk2D>> {
+    match options.hierarchy_policy {
+        VoxelHierarchyPolicy::Flat => None,
+        VoxelHierarchyPolicy::ParentChunksByMaterial => {
+            let mut material_by_node = BTreeMap::<SupportNodeId, u16>::new();
+            for (idx, node) in support_node_map.iter().enumerate() {
+                let Some(node) = *node else {
+                    continue;
+                };
+                material_by_node
+                    .entry(node)
+                    .or_insert(fracture_material[idx]);
+            }
+            if material_by_node.is_empty() {
+                return Some(Vec::new());
+            }
+
+            let mut nodes_by_material = BTreeMap::<u16, Vec<SupportNodeId>>::new();
+            for (node, material) in &material_by_node {
+                nodes_by_material.entry(*material).or_default().push(*node);
+            }
+            let mut next_chunk_id = material_by_node
+                .keys()
+                .map(|node| node.0)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut parent_by_material = BTreeMap::<u16, ChunkId>::new();
+            let mut chunks = Vec::new();
+            for (material, nodes) in &nodes_by_material {
+                let parent = ChunkId(next_chunk_id);
+                next_chunk_id += 1;
+                parent_by_material.insert(*material, parent);
+                chunks.push(Chunk2D {
+                    id: parent,
+                    support_node: nodes[0],
+                    parent: None,
+                });
+            }
+            for (node, material) in material_by_node {
+                chunks.push(Chunk2D {
+                    id: ChunkId(node.0),
+                    support_node: node,
+                    parent: parent_by_material.get(&material).copied(),
+                });
+            }
+            Some(chunks)
+        }
+    }
+}
+
 fn make_core_asset(
     width: u32,
     height: u32,
@@ -1128,6 +1426,7 @@ fn make_core_asset(
     fracture_material: Vec<u16>,
     orientation: Option<Vec<u16>>,
     support_node_map: Vec<Option<SupportNodeId>>,
+    authored_chunks: Option<Vec<Chunk2D>>,
     default_bond_health: f32,
     default_tension_limit: f32,
     default_shear_limit: f32,
@@ -1141,6 +1440,7 @@ fn make_core_asset(
     );
     desc.material_map = Some(fracture_material);
     desc.orientation_map = orientation;
+    desc.authored_chunks = authored_chunks;
     desc.default_bond_health = default_bond_health;
     desc.default_tension_limit = default_tension_limit;
     desc.default_shear_limit = default_shear_limit;
@@ -1497,6 +1797,17 @@ mod tests {
         (a - b).abs() <= 0.000_01
     }
 
+    fn voxel_bbox_size(voxels: &[GridCoord]) -> (u32, u32) {
+        let first = voxels[0];
+        let mut min = first;
+        let mut max = first;
+        for &coord in voxels.iter().skip(1) {
+            min = GridCoord::new(min.x.min(coord.x), min.y.min(coord.y));
+            max = GridCoord::new(max.x.max(coord.x), max.y.max(coord.y));
+        }
+        (max.x - min.x + 1, max.y - min.y + 1)
+    }
+
     #[test]
     fn authoring_exact_cover_property_small_grids() {
         for width in 1..=3 {
@@ -1530,6 +1841,299 @@ mod tests {
     }
 
     #[test]
+    fn cluster_authoring_brittle_isotropic_splits_large_material_component() {
+        let input = input_from_rows(&["####", "####", "####", "####"], &[1; 16]);
+        let options = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::brittle_isotropic(2, 4));
+
+        let asset = author_voxel_asset_with_options(input.clone(), options.clone()).unwrap();
+        let repeated = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(asset.core().support_nodes().len(), 4);
+        assert!(
+            asset
+                .core()
+                .support_nodes()
+                .iter()
+                .all(|node| node.voxels.len() == 4 && voxel_bbox_size(&node.voxels) == (2, 2))
+        );
+        asset.validate_exact_cover().unwrap();
+        assert_eq!(
+            asset.core().support_nodes(),
+            repeated.core().support_nodes()
+        );
+        assert_eq!(
+            asset.core().internal_bonds(),
+            repeated.core().internal_bonds()
+        );
+        assert_eq!(asset.core().internal_bonds().len(), 4);
+        assert!(
+            asset
+                .core()
+                .internal_bonds()
+                .iter()
+                .all(|bond| !bond.interface_edges.is_empty())
+        );
+    }
+
+    #[test]
+    fn cluster_authoring_generates_bonds_from_policy_node_boundaries() {
+        let input = input_from_rows(&["####"], &[1, 1, 1, 1]);
+        let options = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::isotropic(2, 4));
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(asset.core().support_nodes().len(), 2);
+        assert_eq!(asset.core().internal_bonds().len(), 1);
+        let bond = &asset.core().internal_bonds()[0];
+        assert_eq!(bond.node_a, SupportNodeId(0));
+        assert_eq!(bond.node_b, SupportNodeId(1));
+        assert_eq!(bond.length, 1.0);
+        assert_eq!(bond.interface_edges.len(), 1);
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn cluster_authoring_fiber_orientation_elongs_clusters() {
+        let mut horizontal = input_from_rows(&["####", "####", "####", "####"], &[1; 16]);
+        horizontal.orientation = Some(vec![0; 16]);
+        let mut vertical = horizontal.clone();
+        vertical.orientation = Some(vec![u16::MAX / 4; 16]);
+        let options =
+            VoxelAuthoringOptions::default().with_material_rule(1, VoxelClusterPolicy::fiber(4, 1));
+
+        let horizontal = author_voxel_asset_with_options(horizontal, options.clone()).unwrap();
+        let vertical = author_voxel_asset_with_options(vertical, options).unwrap();
+
+        assert_eq!(horizontal.core().support_nodes().len(), 4);
+        assert!(
+            horizontal
+                .core()
+                .support_nodes()
+                .iter()
+                .all(|node| voxel_bbox_size(&node.voxels) == (4, 1))
+        );
+        assert_eq!(
+            horizontal.core().node_at(GridCoord::new(0, 0)),
+            horizontal.core().node_at(GridCoord::new(3, 0))
+        );
+        assert_ne!(
+            horizontal.core().node_at(GridCoord::new(0, 0)),
+            horizontal.core().node_at(GridCoord::new(0, 1))
+        );
+
+        assert_eq!(vertical.core().support_nodes().len(), 4);
+        assert!(
+            vertical
+                .core()
+                .support_nodes()
+                .iter()
+                .all(|node| voxel_bbox_size(&node.voxels) == (1, 4))
+        );
+        assert_eq!(
+            vertical.core().node_at(GridCoord::new(0, 0)),
+            vertical.core().node_at(GridCoord::new(0, 3))
+        );
+        assert_ne!(
+            vertical.core().node_at(GridCoord::new(0, 0)),
+            vertical.core().node_at(GridCoord::new(1, 0))
+        );
+        horizontal.validate_exact_cover().unwrap();
+        vertical.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn cluster_authoring_structural_beam_keeps_column_clusters() {
+        let input = input_from_rows(&["##", "##", "##", "##", "##", "##"], &[1; 12]);
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy::structural_beam(VoxelClusterAxis::Y, 8, 1),
+        );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(asset.core().support_nodes().len(), 2);
+        assert!(
+            asset
+                .core()
+                .support_nodes()
+                .iter()
+                .all(|node| node.voxels.len() == 6 && voxel_bbox_size(&node.voxels) == (1, 6))
+        );
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(0, 0)),
+            asset.core().node_at(GridCoord::new(0, 5))
+        );
+        assert_ne!(
+            asset.core().node_at(GridCoord::new(0, 0)),
+            asset.core().node_at(GridCoord::new(1, 0))
+        );
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn cluster_authoring_material_rules_mix_without_cross_material_merge() {
+        let materials = [
+            1, 1, 1, 1, 2, 2, 2, 3, 1, 1, 1, 1, 2, 2, 2, 3, 1, 1, 1, 1, 2, 2, 2, 3, 1, 1, 1, 1, 2,
+            2, 2, 3,
+        ];
+        let mut input = input_from_rows(
+            &["########", "########", "########", "########"],
+            &materials,
+        );
+        input.orientation = Some(
+            materials
+                .iter()
+                .map(|material| if *material == 2 { u16::MAX / 4 } else { 0 })
+                .collect(),
+        );
+        let options = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::brittle_isotropic(2, 4))
+            .with_material_rule(2, VoxelClusterPolicy::fiber(8, 1))
+            .with_material_rule(
+                3,
+                VoxelClusterPolicy::structural_beam(VoxelClusterAxis::Y, 8, 1),
+            );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        let material1 = asset
+            .core()
+            .support_nodes()
+            .iter()
+            .filter(|node| node.material_id == 1)
+            .collect::<Vec<_>>();
+        let material2 = asset
+            .core()
+            .support_nodes()
+            .iter()
+            .filter(|node| node.material_id == 2)
+            .collect::<Vec<_>>();
+        let material3 = asset
+            .core()
+            .support_nodes()
+            .iter()
+            .filter(|node| node.material_id == 3)
+            .collect::<Vec<_>>();
+
+        assert_eq!(material1.len(), 4);
+        assert!(
+            material1
+                .iter()
+                .all(|node| voxel_bbox_size(&node.voxels) == (2, 2))
+        );
+        assert_eq!(material2.len(), 3);
+        assert!(
+            material2
+                .iter()
+                .all(|node| voxel_bbox_size(&node.voxels) == (1, 4))
+        );
+        assert_eq!(material3.len(), 1);
+        assert_eq!(voxel_bbox_size(&material3[0].voxels), (1, 4));
+        assert!(
+            asset
+                .core()
+                .support_nodes()
+                .iter()
+                .all(
+                    |node| node.voxels.iter().all(|coord| asset.fracture_material_map()
+                        [index(asset.width, *coord)]
+                        == node.material_id)
+                )
+        );
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn cluster_authoring_fiber_orientation_discontinuity_splits_growth() {
+        let mut input = input_from_rows(&["####", "####"], &[1; 8]);
+        input.orientation = Some(vec![
+            u16::MAX / 8,
+            u16::MAX / 8,
+            3 * (u16::MAX / 8),
+            3 * (u16::MAX / 8),
+            u16::MAX / 8,
+            u16::MAX / 8,
+            3 * (u16::MAX / 8),
+            3 * (u16::MAX / 8),
+        ]);
+        let options =
+            VoxelAuthoringOptions::default().with_material_rule(1, VoxelClusterPolicy::fiber(8, 2));
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(0, 0)),
+            asset.core().node_at(GridCoord::new(1, 0))
+        );
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(2, 0)),
+            asset.core().node_at(GridCoord::new(3, 0))
+        );
+        assert_ne!(
+            asset.core().node_at(GridCoord::new(1, 0)),
+            asset.core().node_at(GridCoord::new(2, 0))
+        );
+        assert_eq!(asset.core().support_nodes().len(), 2);
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn cluster_authoring_parent_chunks_by_material_builds_hierarchy() {
+        let input = input_from_rows(&["####", "####"], &[1, 1, 2, 2, 1, 1, 2, 2]);
+        let options = VoxelAuthoringOptions {
+            material_cluster_rules: BTreeMap::from([
+                (1, VoxelClusterPolicy::isotropic(1, 1)),
+                (2, VoxelClusterPolicy::isotropic(1, 1)),
+            ]),
+            hierarchy_policy: VoxelHierarchyPolicy::ParentChunksByMaterial,
+        };
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+        let parent_ids = asset
+            .core()
+            .chunks()
+            .iter()
+            .filter_map(|chunk| chunk.parent)
+            .collect::<BTreeSet<_>>();
+        let leaves = asset
+            .core()
+            .chunks()
+            .iter()
+            .filter(|chunk| !parent_ids.contains(&chunk.id))
+            .collect::<Vec<_>>();
+        let parents = asset
+            .core()
+            .chunks()
+            .iter()
+            .filter(|chunk| parent_ids.contains(&chunk.id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(asset.core().support_nodes().len(), 8);
+        assert_eq!(leaves.len(), asset.core().support_nodes().len());
+        assert_eq!(parents.len(), 2);
+        assert!(leaves.iter().all(|chunk| chunk.parent.is_some()));
+        for node in asset.core().support_nodes() {
+            assert!(
+                leaves
+                    .iter()
+                    .any(|chunk| chunk.id == node.chunk_id && chunk.support_node == node.id)
+            );
+        }
+        for parent in parents {
+            let covered_materials = leaves
+                .iter()
+                .filter(|leaf| leaf.parent == Some(parent.id))
+                .map(|leaf| asset.core().node(leaf.support_node).unwrap().material_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(covered_materials.len(), 1);
+        }
+        asset.core().validate().unwrap();
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
     fn asset_metrics_count_occupied_voxels_and_support_nodes() {
         let asset =
             author_voxel_asset(input_from_rows(&["#.#", "###"], &[1, 0, 2, 1, 1, 2])).unwrap();
@@ -1551,6 +2155,38 @@ mod tests {
         assert_eq!(asset.core().support_nodes()[0].material_id, 1);
         assert_eq!(asset.core().support_nodes()[1].material_id, 2);
         assert_eq!(asset.core().internal_bonds().len(), 1);
+    }
+
+    #[test]
+    fn cluster_authoring_support_node_hint_forces_map_without_cross_material_merge() {
+        let mut input = input_from_rows(&["####"], &[1, 1, 2, 2]);
+        input.support_node_hint = Some(vec![Some(7), Some(7), Some(7), Some(7)]);
+        let options = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::isotropic(1, 1))
+            .with_material_rule(2, VoxelClusterPolicy::isotropic(1, 1));
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(asset.core().support_nodes().len(), 2);
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(0, 0)),
+            Some(SupportNodeId(7))
+        );
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(1, 0)),
+            Some(SupportNodeId(7))
+        );
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(2, 0)),
+            Some(SupportNodeId(8))
+        );
+        assert_eq!(
+            asset.core().node_at(GridCoord::new(3, 0)),
+            Some(SupportNodeId(8))
+        );
+        assert_eq!(asset.core().support_nodes()[0].material_id, 1);
+        assert_eq!(asset.core().support_nodes()[1].material_id, 2);
+        asset.validate_exact_cover().unwrap();
     }
 
     #[test]
