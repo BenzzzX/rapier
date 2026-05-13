@@ -1104,7 +1104,7 @@ fn transfer_node_state(
         0.0
     };
     NodeRuntimeState {
-        health: old_state.health,
+        health: old_state.health * ratio,
         accumulated_damage: old_state.accumulated_damage * ratio,
     }
 }
@@ -2121,6 +2121,21 @@ mod tests {
         (a - b).abs() <= 0.000_01
     }
 
+    #[test]
+    fn transfer_node_state_weights_health_and_damage_by_overlap() {
+        let old_state = NodeRuntimeState {
+            health: 0.6,
+            accumulated_damage: 0.4,
+        };
+        let half = transfer_node_state(&old_state, 1, 2);
+        assert!(approx_eq(half.health, 0.3));
+        assert!(approx_eq(half.accumulated_damage, 0.2));
+
+        let zero = transfer_node_state(&old_state, 0, 2);
+        assert_eq!(zero.health, 0.0);
+        assert_eq!(zero.accumulated_damage, 0.0);
+    }
+
     fn voxel_bbox_size(voxels: &[GridCoord]) -> (u32, u32) {
         let first = voxels[0];
         let mut min = first;
@@ -2931,7 +2946,7 @@ mod tests {
         assert_eq!(
             healths
                 .iter()
-                .filter(|(health, damage)| *health == 0.6 && *damage == 0.2)
+                .filter(|(health, damage)| approx_eq(*health, 0.3) && approx_eq(*damage, 0.2))
                 .count(),
             2
         );

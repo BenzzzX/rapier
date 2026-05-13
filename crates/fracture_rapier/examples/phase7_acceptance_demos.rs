@@ -590,7 +590,7 @@ fn run_runtime_dig_hole_demo() -> Result<RuntimeDigHoleDemo, Box<dyn Error>> {
         .family()
         .node_states()
         .filter(|(_, state)| {
-            (state.health - 0.6).abs() < 0.0001 && (state.accumulated_damage - 0.2).abs() < 0.0001
+            (state.health - 0.3).abs() < 0.0001 && (state.accumulated_damage - 0.2).abs() < 0.0001
         })
         .map(|(node, state)| (node, state.health, state.accumulated_damage))
         .collect::<Vec<_>>();
