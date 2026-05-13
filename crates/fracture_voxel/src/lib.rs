@@ -88,6 +88,21 @@ impl VoxelClusterPolicy {
             },
         }
     }
+
+    pub fn natural_voronoi(seeds: Vec<GridCoord>) -> Self {
+        Self {
+            mode: VoxelClusterMode::NaturalVoronoi(NaturalVoronoi::explicit(seeds)),
+        }
+    }
+
+    pub fn natural_voronoi_generated(seed_count: usize, random_seed: u64) -> Self {
+        Self {
+            mode: VoxelClusterMode::NaturalVoronoi(NaturalVoronoi::generated(
+                seed_count,
+                random_seed,
+            )),
+        }
+    }
 }
 
 impl Default for VoxelClusterPolicy {
@@ -121,6 +136,94 @@ pub enum VoxelClusterMode {
         along_extent: u32,
         cross_extent: u32,
     },
+    NaturalVoronoi(NaturalVoronoi),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NaturalVoronoi {
+    pub seeds: NaturalVoronoiSeeds,
+    pub noise: NaturalVoronoiNoise,
+    pub fields: Vec<NaturalVoronoiClusterField>,
+}
+
+impl NaturalVoronoi {
+    pub const DISTANCE_SCALE_ONE: u32 = 1024;
+
+    pub fn explicit(seeds: Vec<GridCoord>) -> Self {
+        Self {
+            seeds: NaturalVoronoiSeeds::Explicit(seeds),
+            noise: NaturalVoronoiNoise::default(),
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn generated(seed_count: usize, random_seed: u64) -> Self {
+        Self {
+            seeds: NaturalVoronoiSeeds::Generated {
+                seed_count,
+                random_seed,
+            },
+            noise: NaturalVoronoiNoise::default(),
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn with_noise(mut self, seed: u64, amplitude: i64) -> Self {
+        self.noise = NaturalVoronoiNoise { seed, amplitude };
+        self
+    }
+
+    pub fn with_field(mut self, field: NaturalVoronoiClusterField) -> Self {
+        self.fields.push(field);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NaturalVoronoiSeeds {
+    Explicit(Vec<GridCoord>),
+    Generated { seed_count: usize, random_seed: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NaturalVoronoiNoise {
+    pub seed: u64,
+    pub amplitude: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NaturalVoronoiClusterField {
+    pub center: GridCoord,
+    pub radius: u32,
+    pub extra_seed_count: usize,
+    pub random_seed: u64,
+    pub distance_scale: u32,
+    pub distance_bias: i64,
+}
+
+impl NaturalVoronoiClusterField {
+    pub fn new(center: GridCoord, radius: u32) -> Self {
+        Self {
+            center,
+            radius,
+            extra_seed_count: 0,
+            random_seed: 0,
+            distance_scale: NaturalVoronoi::DISTANCE_SCALE_ONE,
+            distance_bias: 0,
+        }
+    }
+
+    pub fn with_extra_seeds(mut self, seed_count: usize, random_seed: u64) -> Self {
+        self.extra_seed_count = seed_count;
+        self.random_seed = random_seed;
+        self
+    }
+
+    pub fn with_distance_bias(mut self, distance_scale: u32, distance_bias: i64) -> Self {
+        self.distance_scale = distance_scale;
+        self.distance_bias = distance_bias;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -655,6 +758,9 @@ enum ClusterBin {
         direction: u8,
         x: u32,
         y: u32,
+    },
+    NaturalVoronoi {
+        seed: u32,
     },
 }
 
@@ -1243,6 +1349,7 @@ fn build_authoring_support_node_map(
             }
         }
     } else {
+        let natural_voronoi_bins = build_natural_voronoi_bins(input, options);
         let components = connected_components_by_key(input.width, input.height, |coord| {
             let idx = index(input.width, coord);
             if !input.occupancy[idx] {
@@ -1251,7 +1358,12 @@ fn build_authoring_support_node_map(
             Some((
                 AuthorClusterKey {
                     material: input.fracture_material[idx],
-                    bin: cluster_bin_for_voxel(input, coord, options),
+                    bin: cluster_bin_for_voxel(
+                        input,
+                        coord,
+                        options,
+                        natural_voronoi_bins.as_deref(),
+                    ),
                 },
                 None,
             ))
@@ -1266,10 +1378,217 @@ fn build_authoring_support_node_map(
     support_node_map
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NaturalVoronoiRuntimeSeed {
+    position: GridCoord,
+}
+
+fn build_natural_voronoi_bins(
+    input: &VoxelAuthoringInput,
+    options: &VoxelAuthoringOptions,
+) -> Option<Vec<Option<u32>>> {
+    let has_natural_rule = options
+        .material_cluster_rules
+        .values()
+        .any(|rule| matches!(rule.mode, VoxelClusterMode::NaturalVoronoi(_)));
+    if !has_natural_rule {
+        return None;
+    }
+
+    let mut bins = vec![None; cell_count(input.width, input.height)];
+    for (material, rule) in &options.material_cluster_rules {
+        let VoxelClusterMode::NaturalVoronoi(natural) = &rule.mode else {
+            continue;
+        };
+        let seeds = natural_voronoi_seeds(input, *material, natural);
+        if seeds.is_empty() {
+            continue;
+        }
+        for coord in all_coords(input.width, input.height) {
+            let idx = index(input.width, coord);
+            if input.occupancy[idx] && input.fracture_material[idx] == *material {
+                bins[idx] = Some(assign_natural_voronoi_seed(coord, &seeds, natural));
+            }
+        }
+    }
+
+    Some(bins)
+}
+
+fn natural_voronoi_seeds(
+    input: &VoxelAuthoringInput,
+    material: u16,
+    natural: &NaturalVoronoi,
+) -> Vec<NaturalVoronoiRuntimeSeed> {
+    let occupied = all_coords(input.width, input.height)
+        .filter(|&coord| {
+            let idx = index(input.width, coord);
+            input.occupancy[idx] && input.fracture_material[idx] == material
+        })
+        .collect::<Vec<_>>();
+    if occupied.is_empty() {
+        return Vec::new();
+    }
+
+    let occupied_set = occupied.iter().copied().collect::<BTreeSet<_>>();
+    let mut used = BTreeSet::new();
+    let mut seeds = Vec::new();
+    match &natural.seeds {
+        NaturalVoronoiSeeds::Explicit(explicit) => {
+            for &position in explicit {
+                if occupied_set.contains(&position) && used.insert(position) {
+                    seeds.push(NaturalVoronoiRuntimeSeed { position });
+                }
+            }
+        }
+        NaturalVoronoiSeeds::Generated {
+            seed_count,
+            random_seed,
+        } => {
+            append_sampled_natural_seeds(
+                &occupied,
+                *seed_count,
+                *random_seed ^ u64::from(material),
+                &mut used,
+                &mut seeds,
+            );
+        }
+    }
+
+    for (field_idx, field) in natural.fields.iter().enumerate() {
+        let radius_sq = squared_u32(field.radius);
+        let eligible = occupied
+            .iter()
+            .copied()
+            .filter(|&coord| grid_distance_sq(coord, field.center) <= radius_sq)
+            .collect::<Vec<_>>();
+        append_sampled_natural_seeds(
+            &eligible,
+            field.extra_seed_count,
+            field.random_seed ^ (u64::from(material) << 32) ^ field_idx as u64,
+            &mut used,
+            &mut seeds,
+        );
+    }
+
+    if seeds.is_empty() {
+        seeds.push(NaturalVoronoiRuntimeSeed {
+            position: occupied[0],
+        });
+    }
+    seeds
+}
+
+fn append_sampled_natural_seeds(
+    eligible: &[GridCoord],
+    seed_count: usize,
+    random_seed: u64,
+    used: &mut BTreeSet<GridCoord>,
+    seeds: &mut Vec<NaturalVoronoiRuntimeSeed>,
+) {
+    if seed_count == 0 || eligible.is_empty() {
+        return;
+    }
+    let mut weighted = eligible
+        .iter()
+        .copied()
+        .map(|coord| (hash_grid_coord(random_seed, coord, 0), coord))
+        .collect::<Vec<_>>();
+    weighted.sort_unstable();
+    for (_, position) in weighted.into_iter().take(seed_count) {
+        if used.insert(position) {
+            seeds.push(NaturalVoronoiRuntimeSeed { position });
+        }
+    }
+}
+
+fn assign_natural_voronoi_seed(
+    coord: GridCoord,
+    seeds: &[NaturalVoronoiRuntimeSeed],
+    natural: &NaturalVoronoi,
+) -> u32 {
+    seeds
+        .iter()
+        .enumerate()
+        .min_by_key(|(seed_idx, seed)| {
+            (
+                natural_voronoi_score(coord, seed, *seed_idx, natural),
+                *seed_idx,
+            )
+        })
+        .map(|(seed_idx, _)| seed_idx as u32)
+        .unwrap_or(0)
+}
+
+fn natural_voronoi_score(
+    coord: GridCoord,
+    seed: &NaturalVoronoiRuntimeSeed,
+    seed_idx: usize,
+    natural: &NaturalVoronoi,
+) -> i128 {
+    let mut score = grid_distance_sq(coord, seed.position)
+        .saturating_mul(i128::from(NaturalVoronoi::DISTANCE_SCALE_ONE));
+    for field in &natural.fields {
+        let radius_sq = squared_u32(field.radius);
+        if grid_distance_sq(coord, field.center) <= radius_sq
+            && grid_distance_sq(seed.position, field.center) <= radius_sq
+        {
+            let scale = i128::from(field.distance_scale.max(1));
+            score = score.saturating_mul(scale) / i128::from(NaturalVoronoi::DISTANCE_SCALE_ONE);
+            score = score.saturating_sub(i128::from(field.distance_bias));
+        }
+    }
+    let amplitude = natural.noise.amplitude.saturating_abs();
+    if amplitude > 0 {
+        score = score.saturating_add(i128::from(signed_hash_noise(
+            hash_grid_coord(
+                natural.noise.seed ^ seed_idx as u64,
+                coord,
+                hash_grid_coord(natural.noise.seed, seed.position, 1),
+            ),
+            amplitude,
+        )));
+    }
+    score
+}
+
+fn grid_distance_sq(a: GridCoord, b: GridCoord) -> i128 {
+    let dx = i128::from(a.x) - i128::from(b.x);
+    let dy = i128::from(a.y) - i128::from(b.y);
+    dx * dx + dy * dy
+}
+
+fn squared_u32(value: u32) -> i128 {
+    let value = i128::from(value);
+    value * value
+}
+
+fn signed_hash_noise(hash: u64, amplitude: i64) -> i64 {
+    let span = (i128::from(amplitude) * 2) + 1;
+    let value = i128::from(hash) % span;
+    (value - i128::from(amplitude)) as i64
+}
+
+fn hash_grid_coord(seed: u64, coord: GridCoord, salt: u64) -> u64 {
+    splitmix64(
+        seed ^ salt.rotate_left(17)
+            ^ (u64::from(coord.x).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ (u64::from(coord.y).wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+    )
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 fn cluster_bin_for_voxel(
     input: &VoxelAuthoringInput,
     coord: GridCoord,
     options: &VoxelAuthoringOptions,
+    natural_voronoi_bins: Option<&[Option<u32>]>,
 ) -> ClusterBin {
     let idx = index(input.width, coord);
     let material = input.fracture_material[idx];
@@ -1312,6 +1631,11 @@ fn cluster_bin_for_voxel(
             along_extent,
             cross_extent,
         } => elongated_cluster_bin(coord, *axis, 0, *along_extent, *cross_extent),
+        VoxelClusterMode::NaturalVoronoi(_) => ClusterBin::NaturalVoronoi {
+            seed: natural_voronoi_bins
+                .and_then(|bins| bins[index(input.width, coord)])
+                .unwrap_or(0),
+        },
     }
 }
 
@@ -1808,6 +2132,12 @@ mod tests {
         (max.x - min.x + 1, max.y - min.y + 1)
     }
 
+    fn node_assignment(asset: &AuthoredVoxelAsset) -> Vec<Option<SupportNodeId>> {
+        all_coords(asset.width, asset.height)
+            .map(|coord| asset.core().node_at(coord))
+            .collect()
+    }
+
     #[test]
     fn authoring_exact_cover_property_small_grids() {
         for width in 1..=3 {
@@ -1891,6 +2221,251 @@ mod tests {
         assert_eq!(bond.node_b, SupportNodeId(1));
         assert_eq!(bond.length, 1.0);
         assert_eq!(bond.interface_edges.len(), 1);
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_generates_non_rectangular_support_node() {
+        let input = input_from_rows(&["#..", "#..", "###"], &[1, 0, 0, 1, 0, 0, 1, 1, 1]);
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy::natural_voronoi(vec![GridCoord::new(0, 0)]),
+        );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(asset.core().support_nodes().len(), 1);
+        let node = &asset.core().support_nodes()[0];
+        let (bbox_width, bbox_height) = voxel_bbox_size(&node.voxels);
+        assert!(bbox_width as usize * bbox_height as usize > node.voxels.len());
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_is_shape_aware_on_shape_with_hole() {
+        let input = input_from_rows(&["###", "#.#", "###"], &[1, 1, 1, 1, 0, 1, 1, 1, 1]);
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy::natural_voronoi(vec![
+                GridCoord::new(0, 0),
+                GridCoord::new(2, 0),
+                GridCoord::new(0, 2),
+                GridCoord::new(2, 2),
+            ]),
+        );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        asset.validate_exact_cover().unwrap();
+        assert_eq!(asset.core().node_at(GridCoord::new(1, 1)), None);
+        let covered = asset
+            .core()
+            .support_nodes()
+            .iter()
+            .flat_map(|node| node.voxels.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let occupied = all_coords(asset.width, asset.height)
+            .filter(|&coord| asset.core().occupancy().is_occupied(coord))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered, occupied);
+    }
+
+    #[test]
+    fn natural_voronoi_repeat_is_deterministic() {
+        let input = input_from_rows(&["######", "######", "######"], &[1; 18]);
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(
+                    NaturalVoronoi::generated(5, 1234).with_noise(77, 600),
+                ),
+            },
+        );
+
+        let first = author_voxel_asset_with_options(input.clone(), options.clone()).unwrap();
+        let second = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(node_assignment(&first), node_assignment(&second));
+        assert_eq!(first.core().support_nodes(), second.core().support_nodes());
+        assert_eq!(
+            first.core().internal_bonds(),
+            second.core().internal_bonds()
+        );
+    }
+
+    #[test]
+    fn natural_voronoi_noise_seed_or_amplitude_changes_assignment() {
+        let input = input_from_rows(&["#####", "#####", "#####"], &[1; 15]);
+        let base = NaturalVoronoi::explicit(vec![GridCoord::new(1, 1), GridCoord::new(3, 1)]);
+        let quiet = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(base.clone()),
+            },
+        );
+        let noisy_a = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(base.clone().with_noise(11, 4096)),
+            },
+        );
+        let noisy_b = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(base.with_noise(12, 4096)),
+            },
+        );
+
+        let quiet = author_voxel_asset_with_options(input.clone(), quiet).unwrap();
+        let noisy_a = author_voxel_asset_with_options(input.clone(), noisy_a).unwrap();
+        let noisy_b = author_voxel_asset_with_options(input, noisy_b).unwrap();
+
+        assert_ne!(node_assignment(&quiet), node_assignment(&noisy_a));
+        assert_ne!(node_assignment(&noisy_a), node_assignment(&noisy_b));
+        quiet.validate_exact_cover().unwrap();
+        noisy_a.validate_exact_cover().unwrap();
+        noisy_b.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_cluster_field_adds_local_fragments() {
+        let input = input_from_rows(&["########", "########", "########", "########"], &[1; 32]);
+        let base = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::natural_voronoi_generated(2, 91));
+        let with_field = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(
+                    NaturalVoronoi::generated(2, 91).with_field(
+                        NaturalVoronoiClusterField::new(GridCoord::new(1, 1), 2)
+                            .with_extra_seeds(4, 333)
+                            .with_distance_bias(512, 256),
+                    ),
+                ),
+            },
+        );
+
+        let base = author_voxel_asset_with_options(input.clone(), base).unwrap();
+        let with_field = author_voxel_asset_with_options(input, with_field).unwrap();
+
+        assert!(with_field.core().support_nodes().len() > base.core().support_nodes().len());
+        assert_ne!(node_assignment(&base), node_assignment(&with_field));
+        with_field.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_per_material_seed_indices_do_not_merge_across_boundary() {
+        let input = input_from_rows(&["AABB", "AABB"], &[1, 1, 2, 2, 1, 1, 2, 2]);
+        let options = VoxelAuthoringOptions::default()
+            .with_material_rule(1, VoxelClusterPolicy::natural_voronoi_generated(2, 77))
+            .with_material_rule(2, VoxelClusterPolicy::natural_voronoi_generated(2, 77));
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert!(asset.core().support_nodes().len() >= 4);
+        assert!(
+            asset
+                .core()
+                .support_nodes()
+                .iter()
+                .all(
+                    |node| node.voxels.iter().all(|coord| asset.fracture_material_map()
+                        [index(asset.width, *coord)]
+                        == node.material_id)
+                )
+        );
+        assert!(asset.core().internal_bonds().iter().any(|bond| {
+            let material_a = asset.core().node(bond.node_a).unwrap().material_id;
+            let material_b = asset.core().node(bond.node_b).unwrap().material_id;
+            material_a != material_b
+        }));
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_distance_only_field_changes_ownership() {
+        let input = input_from_rows(&["#####"], &[1; 5]);
+        let base_rule = NaturalVoronoi::explicit(vec![GridCoord::new(0, 0), GridCoord::new(4, 0)]);
+        let base = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(base_rule.clone()),
+            },
+        );
+        let with_field = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(
+                    base_rule.with_field(
+                        NaturalVoronoiClusterField::new(GridCoord::new(0, 0), 3)
+                            .with_distance_bias(1, 0),
+                    ),
+                ),
+            },
+        );
+
+        let base = author_voxel_asset_with_options(input.clone(), base).unwrap();
+        let with_field = author_voxel_asset_with_options(input, with_field).unwrap();
+
+        assert_eq!(base.core().support_nodes().len(), 2);
+        assert_eq!(with_field.core().support_nodes().len(), 2);
+        assert_ne!(node_assignment(&base), node_assignment(&with_field));
+        assert_eq!(
+            base.core().node_at(GridCoord::new(3, 0)),
+            base.core().node_at(GridCoord::new(4, 0))
+        );
+        assert_eq!(
+            with_field.core().node_at(GridCoord::new(3, 0)),
+            with_field.core().node_at(GridCoord::new(0, 0))
+        );
+        base.validate_exact_cover().unwrap();
+        with_field.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_multi_seed_noise_can_generate_non_rectangular_node() {
+        let input = input_from_rows(
+            &["######", "#....#", "######"],
+            &[1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
+        );
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(
+                    NaturalVoronoi::generated(4, 901).with_noise(444, 300),
+                ),
+            },
+        );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert!(asset.core().support_nodes().len() > 1);
+        assert!(asset.core().support_nodes().iter().any(|node| {
+            let (bbox_width, bbox_height) = voxel_bbox_size(&node.voxels);
+            bbox_width as usize * bbox_height as usize > node.voxels.len()
+        }));
+        asset.validate_exact_cover().unwrap();
+    }
+
+    #[test]
+    fn natural_voronoi_generates_bonds_from_cell_boundaries() {
+        let input = input_from_rows(&["####", "####"], &[1; 8]);
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy::natural_voronoi(vec![GridCoord::new(0, 0), GridCoord::new(3, 1)]),
+        );
+
+        let asset = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert!(asset.core().support_nodes().len() >= 2);
+        assert!(!asset.core().internal_bonds().is_empty());
+        assert!(
+            asset
+                .core()
+                .internal_bonds()
+                .iter()
+                .all(|bond| !bond.interface_edges.is_empty())
+        );
         asset.validate_exact_cover().unwrap();
     }
 
