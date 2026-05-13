@@ -2370,6 +2370,8 @@ struct StressGraphEdge {
     key: StressEdgeKey,
     node_a: SupportNodeId,
     node_b: Option<SupportNodeId>,
+    rest_position_a: Option<Vec2>,
+    rest_position_b: Option<Vec2>,
     normal: Vec2,
     tangent: Vec2,
     base_health: f32,
@@ -2905,6 +2907,17 @@ fn stress_accumulate_edge_load(
     }
 }
 
+fn asset_support_node_center(asset: &FxAsset, node: SupportNodeId) -> Option<Vec2> {
+    let node = asset.node(node)?;
+    if node.voxels.is_empty() {
+        return None;
+    }
+    let weighted_position = node.voxels.iter().fold(Vec2::ZERO, |position, voxel| {
+        position + voxel.center(asset.voxel_size())
+    });
+    Some(weighted_position * (1.0 / node.voxels.len() as f32))
+}
+
 fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<StressGraphEdge> {
     let mut edges = Vec::new();
     for bond in &family.asset.internal_bonds {
@@ -2916,6 +2929,8 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             continue;
         }
         profile.internal_bonds_tested += 1;
+        let rest_position_a = asset_support_node_center(&family.asset, bond.node_a);
+        let rest_position_b = asset_support_node_center(&family.asset, bond.node_b);
         edges.push(StressGraphEdge {
             key: StressEdgeKey {
                 kind: StressEdgeKind::Internal,
@@ -2923,6 +2938,8 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             },
             node_a: bond.node_a,
             node_b: Some(bond.node_b),
+            rest_position_a,
+            rest_position_b,
             normal: bond.normal,
             tangent: bond.tangent,
             base_health: bond.base_health,
@@ -2947,6 +2964,8 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             },
             node_a: bond.node,
             node_b: None,
+            rest_position_a: None,
+            rest_position_b: None,
             normal: bond.normal,
             tangent: bond.tangent,
             base_health: bond.base_health,
@@ -2970,6 +2989,8 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             },
             node_a: bond.node_a,
             node_b: Some(bond.node_b),
+            rest_position_a: None,
+            rest_position_b: None,
             normal: bond.normal,
             tangent: bond.tangent,
             base_health: bond.base_health,
@@ -2992,21 +3013,65 @@ fn stress_edge_axes(
     if edge.node_b.is_none() {
         return (edge.normal, edge.tangent);
     }
+    if edge.key.kind == StressEdgeKind::Internal {
+        if let Some(axes) = stress_internal_edge_authored_axes(edge, node_context_by_id) {
+            return axes;
+        }
+    }
+    stress_edge_center_to_center_axes(edge, node_context_by_id)
+        .unwrap_or((edge.normal, edge.tangent))
+}
+
+fn stress_internal_edge_authored_axes(
+    edge: &StressGraphEdge,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> Option<(Vec2, Vec2)> {
+    let rest_delta = edge.rest_position_b? - edge.rest_position_a?;
+    let current_delta = stress_edge_current_delta(edge, node_context_by_id)?;
+    let rest_dir = normalized_valid(rest_delta)?;
+    let current_dir = normalized_valid(current_delta)?;
+    let cos = rest_dir.dot(current_dir);
+    let sin = rest_dir.perp().dot(current_dir);
+    let normal = rotate_vec2(edge.normal, cos, sin);
+    let tangent = rotate_vec2(edge.tangent, cos, sin);
+    normalized_valid(normal).zip(normalized_valid(tangent))
+}
+
+fn stress_edge_center_to_center_axes(
+    edge: &StressGraphEdge,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> Option<(Vec2, Vec2)> {
+    let normal = normalized_valid(stress_edge_current_delta(edge, node_context_by_id)?)?;
+    Some((normal, normal.perp()))
+}
+
+fn stress_edge_current_delta(
+    edge: &StressGraphEdge,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> Option<Vec2> {
     let position_a = node_context_by_id
         .get(&edge.node_a)
         .map(|node| node.position);
     let position_b = edge
         .node_b
         .and_then(|node| node_context_by_id.get(&node).map(|node| node.position));
-    let Some((position_a, position_b)) = position_a.zip(position_b) else {
-        return (edge.normal, edge.tangent);
-    };
-    let normal = (position_b - position_a).normalized_or_zero();
-    if normal == Vec2::ZERO {
-        (edge.normal, edge.tangent)
-    } else {
-        (normal, normal.perp())
+    position_a.zip(position_b).map(|(a, b)| b - a)
+}
+
+fn normalized_valid(value: Vec2) -> Option<Vec2> {
+    if !valid_vec2(value) {
+        return None;
     }
+    let normalized = value.normalized_or_zero();
+    if normalized == Vec2::ZERO {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn rotate_vec2(value: Vec2, cos: f32, sin: f32) -> Vec2 {
+    Vec2::new(value.x * cos - value.y * sin, value.x * sin + value.y * cos)
 }
 
 fn stress_command_actor_and_order(
@@ -3790,6 +3855,59 @@ mod tests {
         }
     }
 
+    fn assert_vec2_approx(actual: Vec2, expected: Vec2) {
+        let epsilon = 0.0001;
+        assert!(
+            (actual.x - expected.x).abs() <= epsilon && (actual.y - expected.y).abs() <= epsilon,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    fn stress_test_edge(
+        kind: StressEdgeKind,
+        node_b: Option<SupportNodeId>,
+        normal: Vec2,
+        tangent: Vec2,
+    ) -> StressGraphEdge {
+        StressGraphEdge {
+            key: StressEdgeKey { kind, id: 0 },
+            node_a: SupportNodeId(0),
+            node_b,
+            rest_position_a: None,
+            rest_position_b: None,
+            normal,
+            tangent,
+            base_health: 1.0,
+            tension_limit: 1.0,
+            compression_limit: 1.0,
+            shear_limit: 1.0,
+            effective_length: 1.0,
+            health: 1.0,
+            target: match kind {
+                StressEdgeKind::Internal => StressEdgeTarget::Bond(BondId(0)),
+                StressEdgeKind::External => StressEdgeTarget::ExternalBond(ExternalBondId(0)),
+                StressEdgeKind::DynamicStructural => StressEdgeTarget::Connection(ConnectionId(0)),
+            },
+        }
+    }
+
+    fn stress_node_contexts(nodes: &[(u32, Vec2)]) -> BTreeMap<SupportNodeId, StressNodeContext2D> {
+        nodes
+            .iter()
+            .map(|(node, position)| {
+                (
+                    SupportNodeId(*node),
+                    StressNodeContext2D {
+                        node: SupportNodeId(*node),
+                        mass: 1.0,
+                        position: *position,
+                        fixed: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn break_bond_command(
         tick: u64,
         family: FxFamilyId,
@@ -4134,6 +4252,112 @@ mod tests {
         let commands = solver.generate(&family, &[input]);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_internal_authored_axes_take_priority() {
+        let family = family_for(asset_from_rows_with_limits(
+            &["#.", "##"],
+            &[Some(0), None, Some(0), Some(1)],
+            11.5,
+            100.0,
+        ));
+        let bond = &family.asset.internal_bonds()[0];
+        assert_vec2_approx(bond.normal, Vec2::new(1.0, 0.0));
+
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(12.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_internal_authored_axes_rotate_into_world_context() {
+        let family = family_for(asset_from_rows_with_limits(
+            &["#.", "##"],
+            &[Some(0), None, Some(0), Some(1)],
+            11.5,
+            100.0,
+        ));
+        let mut context = StressContext2D::from_family(&family);
+        for node in &mut context.nodes {
+            node.position = match node.node {
+                SupportNodeId(0) => Vec2::new(10.0, 10.0),
+                SupportNodeId(1) => Vec2::new(9.5, 11.0),
+                _ => node.position,
+            };
+        }
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(0.0, 12.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate_with_context(&family, &context, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_internal_axes_fallback_to_center_delta() {
+        let edge = stress_test_edge(
+            StressEdgeKind::Internal,
+            Some(SupportNodeId(1)),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(-1.0, 0.0),
+        );
+        let context = stress_node_contexts(&[(0, Vec2::new(2.0, 2.0)), (1, Vec2::new(3.0, 2.0))]);
+
+        let (normal, tangent) = stress_edge_axes(&edge, &context);
+        assert_vec2_approx(normal, Vec2::new(1.0, 0.0));
+        assert_vec2_approx(tangent, Vec2::new(0.0, 1.0));
+    }
+
+    #[test]
+    fn stress_dynamic_graph_only_axes_use_center_delta() {
+        let edge = stress_test_edge(
+            StressEdgeKind::DynamicStructural,
+            Some(SupportNodeId(1)),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(-1.0, 0.0),
+        );
+        let context = stress_node_contexts(&[(0, Vec2::new(2.0, 2.0)), (1, Vec2::new(3.0, 2.0))]);
+
+        let (normal, tangent) = stress_edge_axes(&edge, &context);
+        assert_vec2_approx(normal, Vec2::new(1.0, 0.0));
+        assert_vec2_approx(tangent, Vec2::new(0.0, 1.0));
+    }
+
+    #[test]
+    fn stress_external_axes_use_stored_axes() {
+        let edge = stress_test_edge(
+            StressEdgeKind::External,
+            None,
+            Vec2::new(0.0, 1.0),
+            Vec2::new(-1.0, 0.0),
+        );
+        let context = stress_node_contexts(&[(0, Vec2::new(2.0, 2.0))]);
+
+        let (normal, tangent) = stress_edge_axes(&edge, &context);
+        assert_vec2_approx(normal, Vec2::new(0.0, 1.0));
+        assert_vec2_approx(tangent, Vec2::new(-1.0, 0.0));
     }
 
     #[test]
