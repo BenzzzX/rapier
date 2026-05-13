@@ -17,6 +17,12 @@ pub struct ActorPhysicsHandles {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImpulseJointHandleReplacement {
+    pub old: ImpulseJointHandle,
+    pub new: ImpulseJointHandle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VoxelContact {
     pub coord: GridCoord,
     pub node: SupportNodeId,
@@ -71,6 +77,7 @@ pub struct FxPhysicsSyncReport {
     pub rebuilt_colliders: usize,
     pub untouched_actor_count: usize,
     pub primitive_lod_replacements: usize,
+    pub impulse_joint_handle_replacements: Vec<ImpulseJointHandleReplacement>,
 }
 
 impl FxPhysicsSyncReport {
@@ -80,6 +87,8 @@ impl FxPhysicsSyncReport {
         self.rebuilt_colliders += other.rebuilt_colliders;
         self.untouched_actor_count += other.untouched_actor_count;
         self.primitive_lod_replacements += other.primitive_lod_replacements;
+        self.impulse_joint_handle_replacements
+            .extend(other.impulse_joint_handle_replacements);
     }
 
     pub(crate) fn record_kind(&mut self, kind: ActorColliderBuildKind) {

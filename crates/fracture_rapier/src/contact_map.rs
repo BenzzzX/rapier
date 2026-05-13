@@ -3,7 +3,9 @@ use rapier2d::prelude::*;
 use crate::collider_sync::{DestructibleActorRef, VoxelContact};
 use crate::hooks::ContactMaterialRegistry;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub type ContactPairKey = ((u32, u32), (u32, u32));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContactPairSide {
     Collider1,
     Collider2,
@@ -17,11 +19,27 @@ pub struct ContactPairMapping {
     pub side: ContactPairSide,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ContactVoxelMapping {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PreSolverContactKey {
+    pub pair: ContactPairKey,
+    pub sequence: u64,
+    pub side: ContactPairSide,
+    pub destructible_subshape: u32,
+    pub other_subshape: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreSolverContactMapping {
+    pub stable_key: PreSolverContactKey,
     pub pair: ContactPairMapping,
+    pub destructible_subshape: u32,
+    pub other_subshape: u32,
+    pub material: u16,
     pub voxel: Option<VoxelContact>,
+    pub node: Option<fracture_core::SupportNodeId>,
     pub used_fallback: bool,
+    pub solver_contact_count: usize,
+    pub solver_contact_ids: Vec<u32>,
 }
 
 pub fn collider_key(handle: ColliderHandle) -> (u32, u32) {
@@ -30,6 +48,15 @@ pub fn collider_key(handle: ColliderHandle) -> (u32, u32) {
 
 pub fn rigid_body_key(handle: RigidBodyHandle) -> (u32, u32) {
     handle.into_raw_parts()
+}
+
+pub(crate) fn contact_pair_key(
+    collider1: ColliderHandle,
+    collider2: ColliderHandle,
+) -> ContactPairKey {
+    let a = collider_key(collider1);
+    let b = collider_key(collider2);
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 #[cfg(test)]
@@ -74,29 +101,6 @@ pub(crate) fn map_contact_pair_destructibles(
     out
 }
 
-pub(crate) fn map_contact_voxel(
-    mapping: ContactPairMapping,
-    manifold: &ContactManifold,
-    registry: &ContactMaterialRegistry,
-) -> ContactVoxelMapping {
-    let subshape = match mapping.side {
-        ContactPairSide::Collider1 => manifold.subshape1,
-        ContactPairSide::Collider2 => manifold.subshape2,
-    };
-    let voxel = registry
-        .collider_voxels
-        .get(&collider_key(mapping.destructible_collider))
-        .and_then(|voxels| voxels.iter().find(|voxel| voxel.subshape == subshape))
-        .copied();
-    ContactVoxelMapping {
-        pair: mapping,
-        voxel,
-        used_fallback: voxel.is_none(),
-    }
-}
-
-pub(crate) fn stable_pair_key(pair: &ContactPair) -> ((u32, u32), (u32, u32)) {
-    let a = collider_key(pair.collider1);
-    let b = collider_key(pair.collider2);
-    if a <= b { (a, b) } else { (b, a) }
+pub(crate) fn stable_pair_key(pair: &ContactPair) -> ContactPairKey {
+    contact_pair_key(pair.collider1, pair.collider2)
 }

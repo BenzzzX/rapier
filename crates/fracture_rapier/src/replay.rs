@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use fracture_core::{FractureEvent, FxFamilyId, SplitEvent};
 use rapier2d::prelude::*;
 
-use crate::{FxRapierError, FxRapierWorld2D};
+use crate::{FxRapierError, FxRapierWorld2D, ImpulseJointHandleReplacement};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxRapierReplayCommand {
@@ -33,6 +33,7 @@ impl FxRapierReplayCommand {
 pub struct FxRapierReplayTickReport {
     pub fracture_events: Vec<FractureEvent>,
     pub split_events: Vec<SplitEvent>,
+    pub impulse_joint_handle_replacements: Vec<ImpulseJointHandleReplacement>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

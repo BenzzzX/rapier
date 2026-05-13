@@ -582,8 +582,13 @@ fn tracked_impulse_readback() {
 
     let mut hits = Vec::new();
     for _ in 0..12 {
-        let report = world.step().unwrap();
-        hits = report
+        let step = world.step_with_diagnostics().unwrap();
+        assert_eq!(
+            step.diagnostics.contact_impulse_readback_miss_count, 0,
+            "tracked contact impulses must be sourced through the pre-solver cache"
+        );
+        hits = step
+            .report
             .contact_impulses
             .into_iter()
             .filter(|input| input.impulse.normal_impulse > 0.0)
@@ -607,6 +612,10 @@ fn tracked_impulse_readback() {
     assert!(
         hits.iter()
             .all(|input| input.impulse.source_tracked_geometric_contact)
+    );
+    assert!(
+        hits.iter()
+            .all(|input| input.impulse.source_pre_solver_cache)
     );
     assert!(hits.iter().all(|input| !input.impulse.used_fallback));
     assert!(hits.iter().all(|input| input.impulse.voxel.is_some()));
@@ -1023,6 +1032,7 @@ fn same_step_split_sync() {
     }
     let report = report.expect("same-step stress split");
     assert_eq!(report.report.split_events.len(), 1);
+    assert_eq!(report.diagnostics.contact_impulse_readback_miss_count, 0);
     assert!(report.diagnostics.budget.unwrap().within_budget());
     assert!(
         report
@@ -1067,6 +1077,62 @@ fn same_step_split_sync() {
     assert!((child_body.translation() - kept_body.translation()).length() > 0.2);
     assert!(child_body.linvel().length() > 0.0);
     assert!(child_body.angvel().abs() > 0.0);
+}
+
+#[test]
+fn split_remaps_impulse_joint_endpoint_to_child_fragment() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    let parent = world.actor_handles(family, FxActorId(0)).unwrap();
+    let anchor =
+        world.insert_rigid_body(RigidBodyBuilder::fixed().translation(Vector::new(3.5, 0.5)));
+    let old_joint = world.insert_impulse_joint(
+        parent.body,
+        anchor,
+        FixedJointBuilder::new()
+            .local_anchor1(Vector::new(1.5, 0.0))
+            .local_anchor2(Vector::ZERO),
+        true,
+    );
+
+    let report = world
+        .apply_fracture_commands_to_family(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(2))],
+        )
+        .unwrap();
+    let split = &report.report.split_events;
+
+    assert_eq!(split.len(), 1);
+    assert_eq!(split[0].created_children, vec![FxActorId(1)]);
+    assert_eq!(report.report.impulse_joint_handle_replacements.len(), 1);
+    assert_eq!(
+        report
+            .diagnostics
+            .physics_sync
+            .impulse_joint_handle_replacements,
+        report.report.impulse_joint_handle_replacements
+    );
+    let replacement = report.report.impulse_joint_handle_replacements[0];
+    assert_eq!(replacement.old, old_joint);
+    assert!(!world.impulse_joints().contains(old_joint));
+    assert!(world.impulse_joints().contains(replacement.new));
+    let kept = world.actor_handles(family, FxActorId(0)).unwrap();
+    let child = world.actor_handles(family, FxActorId(1)).unwrap();
+    assert_eq!(kept.body, parent.body);
+    let joints = world.impulse_joints().iter().collect::<Vec<_>>();
+    assert_eq!(joints.len(), 1);
+    let (new_joint, joint) = joints[0];
+    assert_eq!(new_joint, replacement.new);
+    assert_eq!(joint.body1, child.body);
+    assert_eq!(joint.body2, anchor);
+    assert_ne!(joint.body1, kept.body);
+    assert_vector_close(joint.data.local_anchor1(), Vector::ZERO);
+    assert_vector_close(joint.data.local_anchor2(), Vector::ZERO);
 }
 
 #[test]

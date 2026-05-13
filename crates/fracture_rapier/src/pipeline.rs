@@ -1,6 +1,8 @@
 use fracture_core::{FractureEvent, SplitEvent, StressInput, StressProfile};
 
-use crate::{ContactImpulseInput, FxPhysicsSyncReport, JointFeedbackStress};
+use crate::{
+    ContactImpulseInput, FxPhysicsSyncReport, ImpulseJointHandleReplacement, JointFeedbackStress,
+};
 
 pub const OCCUPIED_VOXEL_BUDGET: usize = 10_000;
 pub const SUPPORT_NODE_BUDGET: usize = 200;
@@ -31,6 +33,7 @@ pub struct FxStepReport {
     pub stress_inputs: Vec<StressInput>,
     pub fracture_events: Vec<FractureEvent>,
     pub split_events: Vec<SplitEvent>,
+    pub impulse_joint_handle_replacements: Vec<ImpulseJointHandleReplacement>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -46,6 +49,7 @@ pub struct FxGlobalStressCapReport {
 pub struct FxStepDiagnostics {
     pub stress_profiles: Vec<StressProfile>,
     pub global_stress_cap: FxGlobalStressCapReport,
+    pub contact_impulse_readback_miss_count: usize,
     pub physics_sync: FxPhysicsSyncReport,
     pub budget: Option<FxPerformanceBudgetReport>,
 }

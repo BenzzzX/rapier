@@ -22,7 +22,7 @@ pub mod world;
 
 pub use collider_sync::{
     ActorColliderBuildKind, ActorPhysicsHandles, ColliderLodSettings, DestructibleActorRef,
-    FxPhysicsSyncReport, VoxelContact,
+    FxPhysicsSyncReport, ImpulseJointHandleReplacement, VoxelContact,
 };
 pub use connect_api::{
     DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,

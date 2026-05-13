@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fracture_core::{
     ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FractureCommand,
-    FxActorId, FxFamily, FxFamilyId, MergeActorsResult, SplitEvent, StressSettings, StressSolver2D,
-    Vec2, apply_fracture_commands,
+    FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult, SplitEvent, StressSettings,
+    StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::collider_sync::{
     ActorColliderBuildKind, ActorPhysicsHandles, ColliderLodSettings, DestructibleActorRef,
-    FxPhysicsSyncReport, VoxelContact, actor_body_builder_at, actor_collider_build,
-    actor_default_contact_material,
+    FxPhysicsSyncReport, ImpulseJointHandleReplacement, VoxelContact, actor_body_builder_at,
+    actor_collider_build, actor_default_contact_material,
 };
 use crate::connect_api::{
     DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
@@ -153,6 +153,21 @@ struct BodySnapshot {
     soft_ccd_prediction: f32,
     was_sleeping: bool,
     body_local_origin_in_asset: Vec2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JointEndpoint {
+    Body1,
+    Body2,
+}
+
+#[derive(Clone, Debug)]
+struct SplitJointEndpointRemap {
+    joint: ImpulseJointHandle,
+    endpoint: JointEndpoint,
+    old_body: RigidBodyHandle,
+    new_actor: FxActorId,
+    asset_anchor: Vec2,
 }
 
 impl Default for FxRapierWorld2D {
@@ -543,6 +558,7 @@ impl FxRapierWorld2D {
             self.sync_family_actors(family_id)?;
         }
 
+        self.hooks.clear_pre_solver_contact_cache();
         self.pipeline.step(
             self.gravity,
             &self.integration_parameters,
@@ -568,12 +584,14 @@ impl FxRapierWorld2D {
             .read()
             .expect("contact material registry poisoned")
             .clone();
-        let contact_impulses = collect_contact_impulse_inputs(
+        let pre_solver_contact_cache = self.hooks.pre_solver_contact_cache_snapshot();
+        let contact_readback = collect_contact_impulse_inputs(
             self.tick,
             self.integration_parameters.dt,
             &self.narrow_phase,
             &families,
             &registry,
+            &pre_solver_contact_cache,
         );
         let joint_feedback = collect_joint_feedback_stress(
             self.tick,
@@ -582,6 +600,8 @@ impl FxRapierWorld2D {
             &self.body_actors,
             &families,
         );
+        let contact_impulses = contact_readback.inputs;
+        let contact_impulse_readback_miss_count = contact_readback.cache_misses.len();
 
         let mut report = FxStepReport {
             stress_inputs: contact_impulses
@@ -598,6 +618,7 @@ impl FxRapierWorld2D {
             ..FxStepReport::default()
         };
         let mut diagnostics = FxStepDiagnostics::default();
+        diagnostics.contact_impulse_readback_miss_count = contact_impulse_readback_miss_count;
 
         self.apply_step_stress_inputs(&mut report, &mut diagnostics)?;
 
@@ -690,6 +711,12 @@ impl FxRapierWorld2D {
             if !split_events.is_empty() {
                 let sync_report =
                     self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+                report.impulse_joint_handle_replacements.extend(
+                    sync_report
+                        .impulse_joint_handle_replacements
+                        .iter()
+                        .copied(),
+                );
                 diagnostics.physics_sync.absorb(sync_report);
             } else {
                 self.reconcile_static_anchor_body_policies(family_id)?;
@@ -735,7 +762,7 @@ impl FxRapierWorld2D {
             (fracture_events, split_events)
         };
         let (fracture_events, split_events) = split_events;
-        let report = FxStepReport {
+        let mut report = FxStepReport {
             fracture_events,
             split_events: split_events.clone(),
             ..FxStepReport::default()
@@ -744,6 +771,12 @@ impl FxRapierWorld2D {
         if !split_events.is_empty() {
             let sync_report =
                 self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+            report.impulse_joint_handle_replacements.extend(
+                sync_report
+                    .impulse_joint_handle_replacements
+                    .iter()
+                    .copied(),
+            );
             diagnostics.physics_sync.absorb(sync_report);
         } else {
             self.reconcile_static_anchor_body_policies(family_id)?;
@@ -804,8 +837,11 @@ impl FxRapierWorld2D {
                 split_dirty_actors(&mut entry.family)
             };
             if !split_events.is_empty() {
-                let _sync_report =
+                let sync_report =
                     self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+                report
+                    .impulse_joint_handle_replacements
+                    .extend(sync_report.impulse_joint_handle_replacements);
             } else {
                 self.reconcile_static_anchor_body_policies(family_id)?;
             }
@@ -1597,6 +1633,7 @@ impl FxRapierWorld2D {
         let mut child_snapshots = BTreeMap::new();
         let mut touched_existing = BTreeSet::new();
         let mut touched_created = BTreeSet::new();
+        let joint_remaps = self.collect_split_joint_endpoint_remaps(family_id, split_events);
         for event in split_events {
             let Some(parent_snapshot) = parent_snapshots.get(&event.parent_actor).copied() else {
                 if let Some(child) = event.created_children.first().copied() {
@@ -1666,7 +1703,127 @@ impl FxRapierWorld2D {
             }
         }
         self.reconcile_static_anchor_body_policies(family_id)?;
+        report.impulse_joint_handle_replacements =
+            self.apply_split_joint_endpoint_remaps(family_id, &joint_remaps)?;
         Ok(report)
+    }
+
+    fn collect_split_joint_endpoint_remaps(
+        &self,
+        family_id: FxFamilyId,
+        split_events: &[SplitEvent],
+    ) -> Vec<SplitJointEndpointRemap> {
+        let Some(entry) = self.families.get(&family_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for event in split_events {
+            let Some(parent_state) = entry.physics.get(&event.parent_actor) else {
+                continue;
+            };
+            let candidate_nodes = event
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.iter().copied())
+                .collect::<Vec<_>>();
+            let parent_body = parent_state.handles.body;
+            for (_, _, handle, joint) in self.impulse_joints.attached_joints(parent_body) {
+                let Some((endpoint, local_anchor)) = joint_endpoint_for_body(joint, parent_body)
+                else {
+                    continue;
+                };
+                let asset_anchor = parent_state.body_local_origin_in_asset
+                    + Vec2::new(local_anchor.x, local_anchor.y);
+                let Some(node) =
+                    support_node_for_asset_point(&entry.asset, &candidate_nodes, asset_anchor)
+                else {
+                    continue;
+                };
+                let Some(new_actor) = entry.family.node_owner(node) else {
+                    continue;
+                };
+                if new_actor == event.parent_actor {
+                    continue;
+                }
+                out.push(SplitJointEndpointRemap {
+                    joint: handle,
+                    endpoint,
+                    old_body: parent_body,
+                    new_actor,
+                    asset_anchor,
+                });
+            }
+        }
+        out
+    }
+
+    fn apply_split_joint_endpoint_remaps(
+        &mut self,
+        family_id: FxFamilyId,
+        remaps: &[SplitJointEndpointRemap],
+    ) -> Result<Vec<ImpulseJointHandleReplacement>, FxRapierError> {
+        let mut replacements = Vec::new();
+        for remap in remaps {
+            if !self.impulse_joints.contains(remap.joint) {
+                continue;
+            }
+            let Some(new_handles) = self.actor_handles(family_id, remap.new_actor) else {
+                continue;
+            };
+            let Some(new_state) = self
+                .families
+                .get(&family_id)
+                .and_then(|entry| entry.physics.get(&remap.new_actor))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(mut joint) = self.impulse_joints.remove(remap.joint, true) else {
+                continue;
+            };
+            let new_local_anchor = Vector::new(
+                remap.asset_anchor.x - new_state.body_local_origin_in_asset.x,
+                remap.asset_anchor.y - new_state.body_local_origin_in_asset.y,
+            );
+            match remap.endpoint {
+                JointEndpoint::Body1 => {
+                    if joint.body1 != remap.old_body {
+                        let new =
+                            self.impulse_joints
+                                .insert(joint.body1, joint.body2, joint.data, true);
+                        replacements.push(ImpulseJointHandleReplacement {
+                            old: remap.joint,
+                            new,
+                        });
+                        continue;
+                    }
+                    joint.body1 = new_handles.body;
+                    joint.data.set_local_anchor1(new_local_anchor);
+                }
+                JointEndpoint::Body2 => {
+                    if joint.body2 != remap.old_body {
+                        let new =
+                            self.impulse_joints
+                                .insert(joint.body1, joint.body2, joint.data, true);
+                        replacements.push(ImpulseJointHandleReplacement {
+                            old: remap.joint,
+                            new,
+                        });
+                        continue;
+                    }
+                    joint.body2 = new_handles.body;
+                    joint.data.set_local_anchor2(new_local_anchor);
+                }
+            }
+            let new = self
+                .impulse_joints
+                .insert(joint.body1, joint.body2, joint.data, true);
+            replacements.push(ImpulseJointHandleReplacement {
+                old: remap.joint,
+                new,
+            });
+        }
+        Ok(replacements)
     }
 
     fn rebuild_actor_handles(
@@ -2228,6 +2385,56 @@ fn child_world_translation(snapshot: BodySnapshot, child_local_com: Vec2) -> Vec
         child_local_com.y - snapshot.body_local_origin_in_asset.y,
     );
     snapshot.position.translation + snapshot.position.rotation * delta
+}
+
+fn joint_endpoint_for_body(
+    joint: &ImpulseJoint,
+    body: RigidBodyHandle,
+) -> Option<(JointEndpoint, Vector)> {
+    if joint.body1 == body {
+        Some((JointEndpoint::Body1, joint.data.local_anchor1()))
+    } else if joint.body2 == body {
+        Some((JointEndpoint::Body2, joint.data.local_anchor2()))
+    } else {
+        None
+    }
+}
+
+fn support_node_for_asset_point(
+    asset: &AuthoredVoxelAsset,
+    candidates: &[SupportNodeId],
+    point: Vec2,
+) -> Option<SupportNodeId> {
+    let candidate_set = candidates.iter().copied().collect::<BTreeSet<_>>();
+    let voxel_size = asset.core().voxel_size();
+    if point.x >= 0.0 && point.y >= 0.0 {
+        let coord = GridCoord::new(
+            (point.x / voxel_size).floor() as u32,
+            (point.y / voxel_size).floor() as u32,
+        );
+        if let Some(node) = asset.core().node_at(coord)
+            && candidate_set.contains(&node)
+        {
+            return Some(node);
+        }
+    }
+
+    let mut best = None;
+    for node_id in candidates {
+        let Some(node) = asset.core().node(*node_id) else {
+            continue;
+        };
+        for voxel in &node.voxels {
+            let center = voxel.center(voxel_size);
+            let delta = center - point;
+            let distance2 = delta.dot(delta);
+            match best {
+                Some((_, old_distance2)) if old_distance2 <= distance2 => {}
+                _ => best = Some((*node_id, distance2)),
+            }
+        }
+    }
+    best.map(|(node, _)| node)
 }
 
 fn merged_body_snapshot(
