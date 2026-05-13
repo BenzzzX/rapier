@@ -15,6 +15,7 @@ mod debug_intersection2;
 mod debug_total_overlap2;
 mod debug_vertical_column2;
 mod drum2;
+mod fracture2;
 mod heightfield2;
 mod inv_pyramid2;
 mod inverse_kinematics2;
@@ -56,6 +57,7 @@ pub async fn main() {
     const CONTROLS: &str = "Controls";
     const DEBUG: &str = "Debug";
     const S2D: &str = "Inspired by Solver 2D";
+    const FRACTURE: &str = "Fracture";
 
     let mut builders: Vec<Example> = vec![
         // ── Demos ──────────────────────────────────────────────────────────
@@ -105,6 +107,23 @@ pub async fn main() {
             CONTROLS,
             "Character controller",
             character_controller2::init_world,
+        ),
+        // ── Fracture ─────────────────────────────────────────────────────
+        Example::new(
+            FRACTURE,
+            "High-speed wall impact",
+            fracture2::init_high_speed_wall,
+        ),
+        Example::new(
+            FRACTURE,
+            "Bridge cantilever collapse",
+            fracture2::init_bridge_collapse,
+        ),
+        Example::new(FRACTURE, "Joint pull", fracture2::init_joint_pull),
+        Example::new(
+            FRACTURE,
+            "Voxel-vs-voxel impact",
+            fracture2::init_voxel_collision,
         ),
         // ── Debug ──────────────────────────────────────────────────────────
         Example::new(DEBUG, "Box ball", debug_box_ball2::init_world),

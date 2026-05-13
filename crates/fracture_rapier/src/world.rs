@@ -352,8 +352,24 @@ impl FxRapierWorld2D {
         &mut self.impulse_joints
     }
 
+    pub fn multibody_joints(&self) -> &MultibodyJointSet {
+        &self.multibody_joints
+    }
+
+    pub fn islands(&self) -> &IslandManager {
+        &self.islands
+    }
+
+    pub fn broad_phase(&self) -> &BroadPhaseBvh {
+        &self.broad_phase
+    }
+
     pub fn narrow_phase(&self) -> &NarrowPhase {
         &self.narrow_phase
+    }
+
+    pub fn ccd_solver(&self) -> &CCDSolver {
+        &self.ccd_solver
     }
 
     pub fn drain_contact_hook_observations(&self) -> Vec<HookObservation> {

@@ -6,9 +6,9 @@ edition = "2024"
 default-run = "all_examples2"
 
 [features]
-parallel = ["rapier2d/parallel", "rapier_testbed2d/parallel"]
-simd-stable = ["rapier2d/simd-stable"]
-simd-nightly = ["rapier2d/simd-nightly"]
+parallel = ["rapier2d/parallel", "rapier_testbed2d/parallel", "fracture_rapier/parallel"]
+simd-stable = ["rapier2d/simd-stable", "fracture_rapier/simd-stable"]
+simd-nightly = ["rapier2d/simd-nightly", "fracture_rapier/simd-nightly"]
 other-backends = ["rapier_testbed2d/other-backends"]
 enhanced-determinism = ["rapier2d/enhanced-determinism"]
 
@@ -27,6 +27,15 @@ path = "../crates/rapier_testbed2d"
 
 [dependencies.rapier2d]
 path = "../crates/rapier2d"
+
+[dependencies.fracture_core]
+path = "../crates/fracture_core"
+
+[dependencies.fracture_rapier]
+path = "../crates/fracture_rapier"
+
+[dependencies.fracture_voxel]
+path = "../crates/fracture_voxel"
 
 [[bin]]
 name = "all_examples2"
