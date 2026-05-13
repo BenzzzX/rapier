@@ -6,8 +6,8 @@ use fracture_core::{
 use rapier2d::prelude::*;
 
 use crate::contact_map::{
-    ContactPairKey, ContactPairMapping, ContactPairSide, PreSolverContactMapping, collider_key,
-    map_contact_pair_destructibles, stable_pair_key,
+    ContactPairKey, ContactPairMapping, ContactPairSide, PreSolverContactMapping,
+    QuickImpactEstimate, collider_key, map_contact_pair_destructibles, stable_pair_key,
 };
 use crate::hooks::ContactMaterialRegistry;
 
@@ -30,6 +30,22 @@ pub struct TrackedContactImpulse {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContactImpulseInput {
     pub impulse: TrackedContactImpulse,
+    pub stress: StressInput,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackedQuickImpact {
+    pub pre_solver_pair_key: ((u32, u32), (u32, u32)),
+    pub pre_solver_sequence: u64,
+    pub mapping: ContactPairMapping,
+    pub voxel: Option<crate::collider_sync::VoxelContact>,
+    pub material: u16,
+    pub estimate: QuickImpactEstimate,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuickImpactInput {
+    pub impact: TrackedQuickImpact,
     pub stress: StressInput,
 }
 
@@ -102,6 +118,9 @@ pub(crate) fn collect_contact_impulse_inputs(
                         continue;
                     }
                     let cached = cached.expect("checked above");
+                    if cached.quick_impact.is_some() {
+                        continue;
+                    }
                     let fallback_node = actor.owned_nodes.first().copied();
                     let Some(node) = cached.node.or(fallback_node) else {
                         continue;
@@ -180,6 +199,70 @@ pub(crate) fn collect_contact_impulse_inputs(
         inputs: out,
         cache_misses: misses,
     }
+}
+
+pub(crate) fn collect_quick_impact_inputs(
+    tick: u64,
+    dt: f32,
+    families: &[(FxFamilyId, &FxFamily)],
+    pre_solver_cache: &[PreSolverContactMapping],
+    stress_force_scale: f32,
+) -> Vec<QuickImpactInput> {
+    let mut out = Vec::new();
+    let mut command_id = 0u32;
+    let mut sorted = pre_solver_cache.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|mapping| mapping.stable_key);
+    for cached in sorted {
+        let Some(estimate) = cached.quick_impact else {
+            continue;
+        };
+        let Some((_, family)) = families
+            .iter()
+            .find(|(id, _)| *id == cached.pair.destructible.family)
+        else {
+            continue;
+        };
+        let Some(actor) = family.actor(cached.pair.destructible.actor) else {
+            continue;
+        };
+        let fallback_node = actor.owned_nodes.first().copied();
+        let Some(node) = cached.node.or(fallback_node) else {
+            continue;
+        };
+        let force = estimate.impulse * (stress_force_scale / dt.max(f32::EPSILON));
+        let stress = StressInput {
+            order_key: DeterministicOrderKey::new(
+                tick,
+                5,
+                cached.pair.destructible.family,
+                cached.pair.destructible.actor,
+                CommandId(command_id),
+            ),
+            actor: cached.pair.destructible.actor,
+            node,
+            force: Vec2::new(force.x, force.y),
+            source: DamageSource::ContactImpulse,
+        };
+        command_id += 1;
+        out.push(QuickImpactInput {
+            impact: TrackedQuickImpact {
+                pre_solver_pair_key: cached.stable_key.pair,
+                pre_solver_sequence: cached.stable_key.sequence,
+                mapping: cached.pair,
+                voxel: cached.voxel,
+                material: cached.material,
+                estimate,
+            },
+            stress,
+        });
+    }
+    out.sort_by_key(|input| {
+        (
+            input.stress.order_key,
+            collider_key(input.impact.mapping.destructible_collider),
+        )
+    });
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

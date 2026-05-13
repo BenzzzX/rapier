@@ -17,8 +17,10 @@ use crate::snapshot::{
     PrestressBaselineTargetSnapshot, decode_world_snapshot, encode_world_snapshot,
 };
 use crate::{
-    ColliderLodSettings, ContactMaterialProperties, DynamicStructuralConnectionDesc, FxRapierError,
-    FxRapierSnapshotError, FxRapierWorld2D, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
+    ActorPhysicsHandles, ColliderLodSettings, ContactMaterialProperties,
+    DynamicStructuralConnectionDesc, FractureField2D, FractureFieldMode, FxRapierError,
+    FxRapierSnapshotError, FxRapierWorld2D, QuickImpactAction, QuickImpactSettings,
+    StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
 
 #[cfg(feature = "deterministic-replay")]
@@ -236,6 +238,92 @@ fn overlapping_side_contact_world() -> (FxRapierWorld2D, ColliderHandle, Collide
         1.0,
     );
     (world, destructible.collider, ordinary)
+}
+
+fn quick_impact_settings(
+    static_soften: f32,
+    static_suppress: f32,
+    dynamic_soften: f32,
+    dynamic_suppress: f32,
+) -> QuickImpactSettings {
+    QuickImpactSettings {
+        enabled: true,
+        static_soften_impulse_threshold: static_soften,
+        static_suppress_impulse_threshold: static_suppress,
+        dynamic_soften_impulse_threshold: dynamic_soften,
+        dynamic_suppress_impulse_threshold: dynamic_suppress,
+        penetration_impulse_scale: 0.0,
+        stress_force_scale: 1.0,
+        softened_friction_scale: 0.2,
+        softened_restitution_scale: 0.0,
+        ..QuickImpactSettings::default()
+    }
+}
+
+fn quick_impact_wall_world(
+    settings: QuickImpactSettings,
+    speed: f32,
+) -> (FxRapierWorld2D, ActorPhysicsHandles) {
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.integration_parameters_mut().dt = 1.0 / 60.0;
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 2.0,
+        max_iterations: 2,
+        ..StressSettings::default()
+    });
+    world.set_quick_impact_settings(settings);
+    world.set_material_impact_hardness(7, 1.0);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    let handles = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    world
+        .rigid_bodies_mut()
+        .get_mut(handles.body)
+        .unwrap()
+        .set_linvel(Vector::new(speed, 0.0), true);
+    add_fixed_box(
+        &mut world,
+        Vector::new(2.0, 0.5),
+        Vector::new(0.5, 0.5),
+        1.0,
+    );
+    (world, handles)
+}
+
+fn quick_impact_dynamic_world(
+    settings: QuickImpactSettings,
+    speed: f32,
+) -> (FxRapierWorld2D, ActorPhysicsHandles, ActorPhysicsHandles) {
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.integration_parameters_mut().dt = 1.0 / 60.0;
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 2.0,
+        max_iterations: 2,
+        ..StressSettings::default()
+    });
+    world.set_quick_impact_settings(settings);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    world
+        .add_destructible(FxFamilyId(2), two_node_asset(7))
+        .unwrap();
+    let a = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    let b = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+    {
+        let body = world.rigid_bodies_mut().get_mut(a.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(1.0, 0.5)), true);
+        body.set_linvel(Vector::new(speed, 0.0), true);
+    }
+    {
+        let body = world.rigid_bodies_mut().get_mut(b.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(2.5, 0.5)), true);
+        body.set_linvel(Vector::new(-speed, 0.0), true);
+    }
+    (world, a, b)
 }
 
 #[test]
@@ -774,6 +862,349 @@ fn contact_hook_material() {
         })
         .count();
     assert!(has_modified_solver_contact >= 2);
+}
+
+#[test]
+fn quick_impact_suppression_generates_quick_stress_without_post_solve_double_count() {
+    let settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
+    let (mut world, _) = quick_impact_wall_world(settings, 8.0);
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(
+        step.report
+            .quick_impacts
+            .iter()
+            .any(|input| input.impact.estimate.action == QuickImpactAction::Suppress)
+    );
+    assert!(
+        step.report
+            .stress_inputs
+            .iter()
+            .any(|input| input.source == DamageSource::ContactImpulse
+                && input.order_key.source_priority == 5)
+    );
+    assert!(
+        step.report.contact_impulses.is_empty(),
+        "suppressed contacts must not also feed post-solve contact impulse stress"
+    );
+}
+
+#[test]
+fn quick_impact_softening_is_observable_without_post_solve_double_count() {
+    let settings = quick_impact_settings(0.01, 1000.0, 1000.0, 2000.0);
+    let (mut world, handles) = quick_impact_wall_world(settings, 8.0);
+    world.set_contact_material_properties(
+        7,
+        ContactMaterialProperties {
+            friction: 0.8,
+            restitution: 0.5,
+        },
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+    let observations = world.drain_contact_hook_observations();
+
+    assert!(
+        step.report
+            .quick_impacts
+            .iter()
+            .any(|input| input.impact.estimate.action == QuickImpactAction::Soften)
+    );
+    assert!(
+        observations
+            .iter()
+            .filter(|obs| obs.destructible_collider == handles.collider)
+            .any(|obs| {
+                obs.quick_impact
+                    .is_some_and(|impact| impact.action == QuickImpactAction::Soften)
+                    && obs.after_solver_contacts > 0
+            })
+    );
+    assert!(
+        step.report.contact_impulses.is_empty(),
+        "softened quick-impact contacts must not also feed post-solve contact impulse stress"
+    );
+}
+
+#[test]
+fn quick_impact_small_debris_does_not_suppress() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.set_quick_impact_settings(quick_impact_settings(0.01, 0.02, 1000.0, 2000.0));
+    world
+        .add_destructible(FxFamilyId(1), single_node_asset(7))
+        .unwrap();
+    let handles = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    world
+        .rigid_bodies_mut()
+        .get_mut(handles.body)
+        .unwrap()
+        .set_linvel(Vector::new(8.0, 0.0), true);
+    add_fixed_box(
+        &mut world,
+        Vector::new(1.0, 0.5),
+        Vector::new(0.5, 0.5),
+        1.0,
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+    let observations = world.drain_contact_hook_observations();
+
+    assert!(step.report.quick_impacts.is_empty());
+    assert!(
+        observations
+            .iter()
+            .filter(|obs| obs.destructible_collider == handles.collider)
+            .all(|obs| obs.before_solver_contacts == obs.after_solver_contacts)
+    );
+}
+
+#[test]
+fn quick_impact_mixed_small_debris_pair_preserves_solver_contacts_and_readback() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.integration_parameters_mut().dt = 1.0 / 60.0;
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 2.0,
+        max_iterations: 2,
+        ..StressSettings::default()
+    });
+    world.set_quick_impact_settings(quick_impact_settings(0.01, 0.02, 0.01, 0.02));
+    world.set_material_impact_hardness(7, 1.0);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    world
+        .add_destructible(FxFamilyId(2), single_node_asset(7))
+        .unwrap();
+    let large = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    let small = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+    {
+        let body = world.rigid_bodies_mut().get_mut(large.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(1.0, 0.5)), true);
+        body.set_linvel(Vector::new(8.0, 0.0), true);
+    }
+    {
+        let body = world.rigid_bodies_mut().get_mut(small.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(2.0, 0.5)), true);
+        body.set_linvel(Vector::new(-8.0, 0.0), true);
+    }
+
+    let step = world.step_with_diagnostics().unwrap();
+    let observations = world.drain_contact_hook_observations();
+    let pair_observations = observations
+        .iter()
+        .filter(|obs| {
+            (obs.collider1 == large.collider && obs.collider2 == small.collider)
+                || (obs.collider1 == small.collider && obs.collider2 == large.collider)
+        })
+        .collect::<Vec<_>>();
+    let impulse_families = step
+        .report
+        .contact_impulses
+        .iter()
+        .map(|input| input.stress.order_key.family_id)
+        .collect::<BTreeSet<_>>();
+
+    assert!(
+        !pair_observations.is_empty(),
+        "mixed destructible pair must reach the contact hook"
+    );
+    assert!(step.report.quick_impacts.is_empty());
+    assert!(
+        pair_observations
+            .iter()
+            .all(|obs| obs.quick_impact.is_none()
+                && obs.before_solver_contacts == obs.after_solver_contacts),
+        "any small-debris side must disable pair-level quick-impact suppression/softening"
+    );
+    assert_eq!(step.diagnostics.contact_impulse_readback_miss_count, 0);
+    assert!(impulse_families.contains(&FxFamilyId(1)));
+    assert!(impulse_families.contains(&FxFamilyId(2)));
+}
+
+#[test]
+fn quick_impact_dynamic_opponent_uses_higher_threshold_than_static() {
+    let settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
+    let (mut static_world, _) = quick_impact_wall_world(settings, 8.0);
+    let static_step = static_world.step_with_diagnostics().unwrap();
+
+    let (mut dynamic_world, _, _) = quick_impact_dynamic_world(settings, 8.0);
+    let dynamic_step = dynamic_world.step_with_diagnostics().unwrap();
+
+    assert!(
+        static_step.report.quick_impacts.iter().any(|input| !input
+            .impact
+            .estimate
+            .dynamic_opponent
+            && input.impact.estimate.action == QuickImpactAction::Suppress)
+    );
+    assert!(
+        dynamic_step.report.quick_impacts.is_empty(),
+        "same-speed destructible-vs-destructible contact should stay below the higher dynamic threshold"
+    );
+}
+
+#[test]
+fn quick_impact_destructible_vs_destructible_is_generic() {
+    let settings = quick_impact_settings(0.01, 0.02, 0.01, 0.02);
+    let (mut world, _, _) = quick_impact_dynamic_world(settings, 8.0);
+
+    let step = world.step_with_diagnostics().unwrap();
+    let families = step
+        .report
+        .quick_impacts
+        .iter()
+        .map(|input| input.stress.order_key.family_id)
+        .collect::<BTreeSet<_>>();
+
+    assert!(families.contains(&FxFamilyId(1)));
+    assert!(families.contains(&FxFamilyId(2)));
+}
+
+#[test]
+fn fracture_field_stress_injection_can_split() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 2.0,
+        max_iterations: 2,
+        ..StressSettings::default()
+    });
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+    world.queue_fracture_field(
+        FractureField2D::stress(Vec2::new(0.5, 0.5), 0.25, Vec2::new(50.0, 0.0))
+            .with_family(family),
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(
+        step.report
+            .fracture_field_effects
+            .iter()
+            .any(|effect| effect.mode == FractureFieldMode::Stress)
+    );
+    assert!(!step.report.fracture_events.is_empty());
+    assert!(!step.report.split_events.is_empty());
+}
+
+#[test]
+fn fracture_field_direct_damage_can_split_locally() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0).with_family(family),
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert_eq!(step.report.fracture_field_effects.len(), 1);
+    assert_eq!(step.report.fracture_events.len(), 1);
+    assert_eq!(step.report.fracture_events[0].source, DamageSource::Script);
+    assert_eq!(step.report.split_events.len(), 1);
+}
+
+#[test]
+fn fracture_field_direct_damage_does_not_leak_after_later_unknown_family_error() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0).with_family(family),
+    );
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0).with_family(FxFamilyId(99)),
+    );
+
+    assert!(matches!(
+        world.step_with_diagnostics(),
+        Err(FxRapierError::UnknownFamily(FxFamilyId(99)))
+    ));
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.fracture_events.is_empty());
+    assert!(step.report.split_events.is_empty());
+    assert_eq!(world.family(family).unwrap().actor_count(), 1);
+}
+
+#[test]
+fn fracture_field_direct_damage_bypasses_stress_cap_and_diagnostics() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.set_stress_settings(StressSettings {
+        max_fractures_per_frame: 0,
+        ..StressSettings::default()
+    });
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0).with_family(family),
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert_eq!(step.report.fracture_events.len(), 1);
+    assert_eq!(step.report.split_events.len(), 1);
+    assert_eq!(step.diagnostics.global_stress_cap.input_count, 0);
+    assert_eq!(
+        step.diagnostics
+            .global_stress_cap
+            .generated_commands_before_cap,
+        0
+    );
+    assert_eq!(
+        step.diagnostics
+            .global_stress_cap
+            .generated_commands_after_cap,
+        0
+    );
+    assert_eq!(step.diagnostics.global_stress_cap.frame_cap, 0);
+}
+
+#[test]
+fn fracture_field_radius_and_family_filter_apply() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    world
+        .add_destructible(FxFamilyId(2), two_node_asset(7))
+        .unwrap();
+    let family2 = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+    world
+        .rigid_bodies_mut()
+        .get_mut(family2.body)
+        .unwrap()
+        .set_position(Pose::from_translation(Vector::new(5.0, 0.5)), true);
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(5.5, 0.5), 0.25, 2.0).with_family(FxFamilyId(2)),
+    );
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert_eq!(step.report.fracture_field_effects.len(), 1);
+    assert!(
+        step.report
+            .fracture_field_effects
+            .iter()
+            .all(|effect| effect.family == FxFamilyId(2) && effect.node == SupportNodeId(1))
+    );
+    assert!(
+        step.report
+            .fracture_events
+            .iter()
+            .all(|event| event.family == FxFamilyId(2))
+    );
+    assert_eq!(world.family(FxFamilyId(1)).unwrap().actor_count(), 1);
+    assert_eq!(world.family(FxFamilyId(2)).unwrap().actor_count(), 2);
 }
 
 #[test]
@@ -2180,6 +2611,121 @@ fn snapshot_restore_stress_settings() {
     let mut restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
     assert_eq!(restored.stress_settings(), world.stress_settings());
     restored.step().unwrap();
+}
+
+#[test]
+fn snapshot_restore_quick_impact_settings_and_hardness_round_trip() {
+    let settings = quick_impact_settings(0.01, 0.02, 0.01, 0.02);
+    let (world, _) = quick_impact_wall_world(settings, 8.0);
+    world.set_material_impact_hardness(7, 3.0);
+    let (_, snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+
+    assert_eq!(snapshot.quick_impact_settings, settings);
+    assert_eq!(snapshot.material_impact_hardness, vec![(7, 3.0)]);
+
+    let mut restored =
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)).unwrap();
+    assert_eq!(restored.quick_impact_settings(), settings);
+    assert_scalar_close(restored.material_impact_hardness(7), 3.0);
+
+    let step = restored.step_with_diagnostics().unwrap();
+
+    assert!(
+        step.report
+            .quick_impacts
+            .iter()
+            .any(|input| input.impact.estimate.hardness == 3.0)
+    );
+}
+
+#[test]
+fn fracture_field_snapshot_restore_preserves_queued_direct_damage() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+
+    let field = FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0)
+        .with_family(family)
+        .with_effective_length_loss(0.75)
+        .with_source(DamageSource::ContactImpulse);
+    world.queue_fracture_field(field);
+
+    let (_, snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    assert_eq!(snapshot.queued_fracture_fields, vec![field]);
+
+    let mut restored =
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)).unwrap();
+    let step = restored.step_with_diagnostics().unwrap();
+
+    assert_eq!(step.report.fracture_field_effects.len(), 1);
+    assert_eq!(step.report.fracture_field_effects[0].family, family);
+    assert_eq!(
+        step.report.fracture_field_effects[0].mode,
+        FractureFieldMode::DirectDamage
+    );
+    assert_eq!(step.report.fracture_events.len(), 1);
+    assert_eq!(
+        step.report.fracture_events[0].source,
+        DamageSource::ContactImpulse
+    );
+    assert_eq!(step.report.split_events.len(), 1);
+}
+
+#[test]
+fn fracture_field_snapshot_restore_rejects_invalid_queued_field() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(Vec2::new(1.5, 0.5), 0.25, 2.0).with_family(family),
+    );
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.queued_fracture_fields[0].radius = -1.0;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("queued fracture field")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_invalid_quick_impact_settings() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.quick_impact_settings.softened_friction_scale = 1.5;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("quick impact settings")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_invalid_material_impact_hardness() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.material_impact_hardness.push((7, -0.1));
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("material impact hardness")
+        ))
+    ));
 }
 
 #[test]

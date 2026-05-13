@@ -1,6 +1,7 @@
 use fracture_core::{
-    BondId, CompressionDamageMode2D, ConnectionId, ExternalBondId, FxActorId, FxFamilyId,
-    GridCoord, StressBaselineTarget2D, StressSettings, SupportNodeId, snapshot::SnapshotMode,
+    BondId, CompressionDamageMode2D, ConnectionId, DamageSource, ExternalBondId, FxActorId,
+    FxFamilyId, GridCoord, StressBaselineTarget2D, StressSettings, SupportNodeId,
+    snapshot::SnapshotMode,
 };
 use rapier2d::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -8,11 +9,12 @@ use thiserror::Error;
 
 use crate::collider_sync::{DestructibleActorRef, VoxelContact};
 use crate::connect_api::StaticAnchorBodyPolicy;
+use crate::world::{FractureField2D, FractureFieldMode};
 
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 4;
+const VERSION: u16 = 6;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -235,8 +237,11 @@ pub struct FxRapierWorldSnapshot {
     pub gravity: [f32; 2],
     pub integration: IntegrationSnapshot,
     pub stress: StressSettingsSnapshot,
+    pub quick_impact_settings: crate::hooks::QuickImpactSettings,
+    pub queued_fracture_fields: Vec<FractureField2D>,
     pub rapier_owned_state: Vec<u8>,
     pub contact_materials: Vec<(u16, crate::hooks::ContactMaterialProperties)>,
+    pub material_impact_hardness: Vec<(u16, f32)>,
     pub families: Vec<FxRapierFamilySnapshot>,
     pub actor_physics: Vec<ActorPhysicsSnapshot>,
     pub body_actors: Vec<BodyActorSnapshot>,
@@ -345,6 +350,14 @@ pub fn encode_world_snapshot(snapshot: &FxRapierWorldSnapshot) -> Vec<u8> {
     write_vec2(&mut writer, snapshot.gravity).expect("finite gravity");
     write_integration(&mut writer, snapshot.integration).expect("finite integration");
     write_stress(&mut writer, snapshot.stress).expect("finite stress");
+    write_quick_impact_settings(&mut writer, snapshot.quick_impact_settings)
+        .expect("finite quick impact settings");
+    writer
+        .len(snapshot.queued_fracture_fields.len())
+        .expect("fracture field count");
+    for field in &snapshot.queued_fracture_fields {
+        write_fracture_field(&mut writer, *field).expect("finite fracture field");
+    }
     writer
         .bytes(&snapshot.rapier_owned_state)
         .expect("rapier state bytes");
@@ -456,6 +469,14 @@ pub fn encode_world_snapshot(snapshot: &FxRapierWorldSnapshot) -> Vec<u8> {
             .expect("finite restitution");
     }
 
+    writer
+        .len(snapshot.material_impact_hardness.len())
+        .expect("material hardness count");
+    for (material, hardness) in &snapshot.material_impact_hardness {
+        writer.u16(*material);
+        writer.f32(*hardness).expect("finite material hardness");
+    }
+
     wrap(snapshot.mode, writer.bytes)
 }
 
@@ -468,6 +489,12 @@ pub fn decode_world_snapshot(
     let gravity = reader.vec2("gravity")?;
     let integration = read_integration(&mut reader)?;
     let stress = read_stress(&mut reader)?;
+    let quick_impact_settings = read_quick_impact_settings(&mut reader)?;
+    let fracture_field_count = reader.len("queued_fracture_fields")?;
+    let mut queued_fracture_fields = Vec::with_capacity(fracture_field_count);
+    for _ in 0..fracture_field_count {
+        queued_fracture_fields.push(read_fracture_field(&mut reader)?);
+    }
     let rapier_owned_state = reader.bytes("rapier_owned_state")?.to_vec();
 
     let family_count = reader.len("families")?;
@@ -601,6 +628,15 @@ pub fn decode_world_snapshot(
         ));
     }
 
+    let material_hardness_count = reader.len("material_impact_hardness")?;
+    let mut material_impact_hardness = Vec::with_capacity(material_hardness_count);
+    for _ in 0..material_hardness_count {
+        material_impact_hardness.push((
+            reader.u16("material_hardness.id")?,
+            reader.f32("material_hardness.value")?,
+        ));
+    }
+
     reader.finish()?;
     Ok((
         mode,
@@ -610,8 +646,11 @@ pub fn decode_world_snapshot(
             gravity,
             integration,
             stress,
+            quick_impact_settings,
+            queued_fracture_fields,
             rapier_owned_state,
             contact_materials,
+            material_impact_hardness,
             families,
             actor_physics,
             body_actors,
@@ -702,6 +741,142 @@ fn read_stress(reader: &mut Reader<'_>) -> Result<StressSettingsSnapshot, FxRapi
         },
     };
     Ok(settings)
+}
+
+fn write_quick_impact_settings(
+    writer: &mut Writer,
+    settings: crate::hooks::QuickImpactSettings,
+) -> Result<(), FxRapierSnapshotError> {
+    writer.u8(u8::from(settings.enabled));
+    writer.u8(u8::from(settings.soften_enabled));
+    writer.u8(u8::from(settings.suppress_enabled));
+    writer.f32(settings.static_soften_impulse_threshold)?;
+    writer.f32(settings.static_suppress_impulse_threshold)?;
+    writer.f32(settings.dynamic_soften_impulse_threshold)?;
+    writer.f32(settings.dynamic_suppress_impulse_threshold)?;
+    writer.f32(settings.penetration_impulse_scale)?;
+    writer.f32(settings.stress_force_scale)?;
+    writer.f32(settings.softened_friction_scale)?;
+    writer.f32(settings.softened_restitution_scale)?;
+    Ok(())
+}
+
+fn read_quick_impact_settings(
+    reader: &mut Reader<'_>,
+) -> Result<crate::hooks::QuickImpactSettings, FxRapierSnapshotError> {
+    Ok(crate::hooks::QuickImpactSettings {
+        enabled: read_bool(reader, "quick_impact.enabled")?,
+        soften_enabled: read_bool(reader, "quick_impact.soften_enabled")?,
+        suppress_enabled: read_bool(reader, "quick_impact.suppress_enabled")?,
+        static_soften_impulse_threshold: reader.f32("quick_impact.static_soften_threshold")?,
+        static_suppress_impulse_threshold: reader.f32("quick_impact.static_suppress_threshold")?,
+        dynamic_soften_impulse_threshold: reader.f32("quick_impact.dynamic_soften_threshold")?,
+        dynamic_suppress_impulse_threshold: reader
+            .f32("quick_impact.dynamic_suppress_threshold")?,
+        penetration_impulse_scale: reader.f32("quick_impact.penetration_impulse_scale")?,
+        stress_force_scale: reader.f32("quick_impact.stress_force_scale")?,
+        softened_friction_scale: reader.f32("quick_impact.softened_friction_scale")?,
+        softened_restitution_scale: reader.f32("quick_impact.softened_restitution_scale")?,
+    })
+}
+
+fn write_fracture_field(
+    writer: &mut Writer,
+    field: FractureField2D,
+) -> Result<(), FxRapierSnapshotError> {
+    match field.family {
+        Some(family) => {
+            writer.u8(1);
+            writer.u32(family.0);
+        }
+        None => writer.u8(0),
+    }
+    writer.f32(field.center.x)?;
+    writer.f32(field.center.y)?;
+    writer.f32(field.radius)?;
+    writer.f32(field.force.x)?;
+    writer.f32(field.force.y)?;
+    writer.f32(field.health_loss)?;
+    writer.f32(field.effective_length_loss)?;
+    write_fracture_field_mode(writer, field.mode);
+    write_damage_source(writer, field.source);
+    Ok(())
+}
+
+fn read_fracture_field(reader: &mut Reader<'_>) -> Result<FractureField2D, FxRapierSnapshotError> {
+    let family = match reader.u8("queued_fracture_field.family_present")? {
+        0 => None,
+        1 => Some(FxFamilyId(reader.u32("queued_fracture_field.family")?)),
+        _ => {
+            return Err(FxRapierSnapshotError::InvalidValue(
+                "queued fracture field family",
+            ));
+        }
+    };
+    Ok(FractureField2D {
+        family,
+        center: fracture_core::Vec2::new(
+            reader.f32("queued_fracture_field.center.x")?,
+            reader.f32("queued_fracture_field.center.y")?,
+        ),
+        radius: reader.f32("queued_fracture_field.radius")?,
+        force: fracture_core::Vec2::new(
+            reader.f32("queued_fracture_field.force.x")?,
+            reader.f32("queued_fracture_field.force.y")?,
+        ),
+        health_loss: reader.f32("queued_fracture_field.health_loss")?,
+        effective_length_loss: reader.f32("queued_fracture_field.effective_length_loss")?,
+        mode: read_fracture_field_mode(reader)?,
+        source: read_damage_source(reader)?,
+    })
+}
+
+fn write_fracture_field_mode(writer: &mut Writer, mode: FractureFieldMode) {
+    writer.u8(match mode {
+        FractureFieldMode::Stress => 0,
+        FractureFieldMode::DirectDamage => 1,
+    });
+}
+
+fn read_fracture_field_mode(
+    reader: &mut Reader<'_>,
+) -> Result<FractureFieldMode, FxRapierSnapshotError> {
+    match reader.u8("queued_fracture_field.mode")? {
+        0 => Ok(FractureFieldMode::Stress),
+        1 => Ok(FractureFieldMode::DirectDamage),
+        _ => Err(FxRapierSnapshotError::InvalidValue(
+            "queued fracture field mode",
+        )),
+    }
+}
+
+fn write_damage_source(writer: &mut Writer, source: DamageSource) {
+    writer.u8(match source {
+        DamageSource::Script => 0,
+        DamageSource::ContactImpulse => 1,
+        DamageSource::JointFeedback => 2,
+        DamageSource::Stress => 3,
+    });
+}
+
+fn read_damage_source(reader: &mut Reader<'_>) -> Result<DamageSource, FxRapierSnapshotError> {
+    match reader.u8("queued_fracture_field.source")? {
+        0 => Ok(DamageSource::Script),
+        1 => Ok(DamageSource::ContactImpulse),
+        2 => Ok(DamageSource::JointFeedback),
+        3 => Ok(DamageSource::Stress),
+        _ => Err(FxRapierSnapshotError::InvalidValue(
+            "queued fracture field source",
+        )),
+    }
+}
+
+fn read_bool(reader: &mut Reader<'_>, field: &'static str) -> Result<bool, FxRapierSnapshotError> {
+    match reader.u8(field)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(FxRapierSnapshotError::InvalidValue(field)),
+    }
 }
 
 fn write_compression_damage_mode(writer: &mut Writer, mode: CompressionDamageMode2D) {

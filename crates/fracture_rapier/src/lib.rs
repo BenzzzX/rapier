@@ -27,9 +27,14 @@ pub use collider_sync::{
 pub use connect_api::{
     DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
-pub use contact_map::{ContactPairMapping, ContactPairSide};
-pub use hooks::{ContactMaterialProperties, HookObservation};
-pub use impulse_readback::{ContactImpulseInput, TrackedContactImpulse};
+pub use contact_map::{
+    ContactPairMapping, ContactPairSide, DestructibleActorContactMetadata, QuickImpactAction,
+    QuickImpactEstimate,
+};
+pub use hooks::{ContactMaterialProperties, HookObservation, QuickImpactSettings};
+pub use impulse_readback::{
+    ContactImpulseInput, QuickImpactInput, TrackedContactImpulse, TrackedQuickImpact,
+};
 pub use joint_feedback::JointFeedbackStress;
 pub use pipeline::{
     ACTIVE_BODY_BUDGET, FxGlobalStressCapReport, FxPerformanceBudgetReport, FxStepDiagnostics,
@@ -39,7 +44,9 @@ pub use replay::{
     FxRapierReplayCommand, FxRapierReplayTickReport, ReplayTrace, ReplayTraceActorBody,
 };
 pub use snapshot::{FxRapierSnapshotError, SnapshotReplayMode};
-pub use world::{FxRapierError, FxRapierWorld2D};
+pub use world::{
+    FractureField2D, FractureFieldEffect, FractureFieldMode, FxRapierError, FxRapierWorld2D,
+};
 
 #[cfg(test)]
 mod tests;

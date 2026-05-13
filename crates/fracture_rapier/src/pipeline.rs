@@ -1,7 +1,8 @@
 use fracture_core::{FractureEvent, SplitEvent, StressInput, StressProfile};
 
 use crate::{
-    ContactImpulseInput, FxPhysicsSyncReport, ImpulseJointHandleReplacement, JointFeedbackStress,
+    ContactImpulseInput, FractureFieldEffect, FxPhysicsSyncReport, ImpulseJointHandleReplacement,
+    JointFeedbackStress, QuickImpactInput,
 };
 
 pub const OCCUPIED_VOXEL_BUDGET: usize = 10_000;
@@ -28,8 +29,10 @@ impl FxPerformanceBudgetReport {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FxStepReport {
+    pub quick_impacts: Vec<QuickImpactInput>,
     pub contact_impulses: Vec<ContactImpulseInput>,
     pub joint_feedback: Vec<JointFeedbackStress>,
+    pub fracture_field_effects: Vec<FractureFieldEffect>,
     pub stress_inputs: Vec<StressInput>,
     pub fracture_events: Vec<FractureEvent>,
     pub split_events: Vec<SplitEvent>,

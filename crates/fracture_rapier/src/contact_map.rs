@@ -19,6 +19,34 @@ pub struct ContactPairMapping {
     pub side: ContactPairSide,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestructibleActorContactMetadata {
+    pub occupied_voxels: usize,
+    pub support_nodes: usize,
+    pub small_debris: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QuickImpactAction {
+    Soften,
+    Suppress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuickImpactEstimate {
+    pub action: QuickImpactAction,
+    pub point: rapier2d::prelude::Vector,
+    pub normal: rapier2d::prelude::Vector,
+    pub impulse: rapier2d::prelude::Vector,
+    pub relative_normal_speed: f32,
+    pub effective_mass: f32,
+    pub scaled_impulse: f32,
+    pub threshold: f32,
+    pub hardness: f32,
+    pub contact_id: u32,
+    pub dynamic_opponent: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PreSolverContactKey {
     pub pair: ContactPairKey,
@@ -28,7 +56,7 @@ pub struct PreSolverContactKey {
     pub other_subshape: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreSolverContactMapping {
     pub stable_key: PreSolverContactKey,
     pub pair: ContactPairMapping,
@@ -37,6 +65,8 @@ pub struct PreSolverContactMapping {
     pub material: u16,
     pub voxel: Option<VoxelContact>,
     pub node: Option<fracture_core::SupportNodeId>,
+    pub actor_metadata: Option<DestructibleActorContactMetadata>,
+    pub quick_impact: Option<QuickImpactEstimate>,
     pub used_fallback: bool,
     pub solver_contact_count: usize,
     pub solver_contact_ids: Vec<u32>,

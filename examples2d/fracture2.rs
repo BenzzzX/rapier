@@ -3,7 +3,10 @@ use fracture_core::{
     ExternalTargetKind, ExternalTargetToken, FxActorId, FxFamilyId, GridCoord, StaticAnchorDesc,
     StressInput, StressSettings, StressSolver2D, SupportNodeId,
 };
-use fracture_rapier::{FxRapierWorld2D, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc};
+use fracture_rapier::{
+    FractureField2D, FxRapierWorld2D, QuickImpactSettings, StaticAnchorBodyPolicy,
+    StaticAnchorConnectionDesc,
+};
 use fracture_voxel::{
     AuthoredVoxelAsset, NaturalVoronoi, NaturalVoronoiClusterField, VoxelAuthoringInput,
     VoxelAuthoringOptions, VoxelClusterAxis, VoxelClusterMode, VoxelClusterPolicy,
@@ -56,6 +59,10 @@ enum DemoDriver {
         apply_after_tick: u64,
         applied: bool,
     },
+    VoxelCollisionFractureField {
+        apply_after_tick: u64,
+        applied: bool,
+    },
 }
 
 pub fn init_world(testbed: &mut Testbed) {
@@ -101,7 +108,10 @@ pub fn init_voxel_collision(testbed: &mut Testbed) {
         build_voxel_collision_world(),
         &[COLLISION_LEFT_FAMILY, COLLISION_RIGHT_FAMILY],
         COLLISION_SCENE_CENTER,
-        DemoDriver::PhysicsOnly,
+        DemoDriver::VoxelCollisionFractureField {
+            apply_after_tick: 20,
+            applied: false,
+        },
     );
 }
 
@@ -149,6 +159,15 @@ fn install_fracture_world(
                         }
                         Err(err) => eprintln!("bridge fracture load failed: {err}"),
                     }
+                }
+            }
+            DemoDriver::VoxelCollisionFractureField {
+                apply_after_tick,
+                applied,
+            } => {
+                if !*applied && fracture_world.tick() >= *apply_after_tick {
+                    queue_voxel_collision_fracture_field(&mut fracture_world);
+                    *applied = true;
                 }
             }
         }
@@ -299,6 +318,20 @@ fn build_voxel_collision_world() -> FxRapierWorld2D {
     world
 }
 
+fn queue_voxel_collision_fracture_field(world: &mut FxRapierWorld2D) {
+    let Some(handles) = world.actor_handles(COLLISION_LEFT_FAMILY, FxActorId(0)) else {
+        return;
+    };
+    let Some(body) = world.rigid_bodies().get(handles.body) else {
+        return;
+    };
+    let center = body.translation();
+    world.queue_fracture_field(
+        FractureField2D::direct_damage(fracture_core::Vec2::new(center.x, center.y), 2.4, 2.0)
+            .with_family(COLLISION_LEFT_FAMILY),
+    );
+}
+
 fn base_world(settings: StressSettings) -> FxRapierWorld2D {
     let mut world = FxRapierWorld2D::new();
     world.set_gravity(GRAVITY);
@@ -310,6 +343,19 @@ fn base_world(settings: StressSettings) -> FxRapierWorld2D {
 fn configure_high_energy_impact_solver(world: &mut FxRapierWorld2D) {
     let params = world.integration_parameters_mut();
     params.num_solver_iterations = 14;
+    world.set_quick_impact_settings(QuickImpactSettings {
+        enabled: true,
+        static_soften_impulse_threshold: 0.8,
+        static_suppress_impulse_threshold: 2.5,
+        dynamic_soften_impulse_threshold: 8.0,
+        dynamic_suppress_impulse_threshold: 24.0,
+        penetration_impulse_scale: 0.0,
+        stress_force_scale: 0.35,
+        softened_friction_scale: 0.35,
+        softened_restitution_scale: 0.0,
+        ..QuickImpactSettings::default()
+    });
+    world.set_material_impact_hardness(1, 1.0);
 }
 
 fn add_static_wall_anchors(world: &mut FxRapierWorld2D) {
@@ -851,6 +897,25 @@ mod tests {
         assert!(split_families.contains(&COLLISION_RIGHT_FAMILY));
         assert!(world.family(COLLISION_LEFT_FAMILY).unwrap().actor_count() > 1);
         assert!(world.family(COLLISION_RIGHT_FAMILY).unwrap().actor_count() > 1);
+    }
+
+    #[test]
+    fn fracture2_voxel_collision_demo_queues_direct_damage_field() {
+        let mut world = build_voxel_collision_world();
+
+        queue_voxel_collision_fracture_field(&mut world);
+        let step = world
+            .step()
+            .expect("voxel collision queued fracture field should step");
+
+        assert!(
+            step.fracture_field_effects
+                .iter()
+                .any(|effect| effect.family == COLLISION_LEFT_FAMILY)
+        );
+        assert!(!step.fracture_events.is_empty());
+        assert!(!step.split_events.is_empty());
+        assert!(world.family(COLLISION_LEFT_FAMILY).unwrap().actor_count() > 1);
     }
 
     fn assert_wall_anchors_are_on_bottom_edge(world: &FxRapierWorld2D) {

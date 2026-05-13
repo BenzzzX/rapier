@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fracture_core::{
-    CommandId, ConnectionError, ConnectionId, DeterministicOrderKey, DynamicConnectionPolicy,
-    ExternalBondId, FractureCommand, FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult,
-    SplitEvent, StressBaselineEdge2D, StressBaselineTarget2D, StressContext2D,
-    StressLoadBaseline2D, StressSettings, StressSolver2D, SupportNodeId, Vec2,
-    apply_fracture_commands,
+    CommandId, ConnectionError, ConnectionId, DamageInput, DamageSource, DeterministicOrderKey,
+    DynamicConnectionPolicy, ExternalBondId, FractureCommand, FractureTarget, FxActorId, FxFamily,
+    FxFamilyId, GridCoord, MergeActorsResult, SplitEvent, StressBaselineEdge2D,
+    StressBaselineTarget2D, StressContext2D, StressInput, StressLoadBaseline2D, StressSettings,
+    StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands, generate_damage_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
@@ -21,9 +21,11 @@ use crate::collider_sync::{
 use crate::connect_api::{
     DynamicStructuralConnectionDesc, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
-use crate::contact_map::{collider_key, rigid_body_key};
-use crate::hooks::{ContactMaterialProperties, FxContactHooks, HookObservation};
-use crate::impulse_readback::collect_contact_impulse_inputs;
+use crate::contact_map::{DestructibleActorContactMetadata, collider_key, rigid_body_key};
+use crate::hooks::{
+    ContactMaterialProperties, FxContactHooks, HookObservation, QuickImpactSettings,
+};
+use crate::impulse_readback::{collect_contact_impulse_inputs, collect_quick_impact_inputs};
 use crate::joint_feedback::collect_joint_feedback_stress;
 use crate::pipeline::{
     ACTIVE_BODY_BUDGET, FxPerformanceBudgetReport, FxStepDiagnostics, FxStepReport,
@@ -71,6 +73,76 @@ pub enum FxRapierError {
     DuplicateReplayKey { tick: u64, stable_order: u64 },
     #[error(transparent)]
     Snapshot(#[from] FxRapierSnapshotError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FractureFieldMode {
+    Stress,
+    DirectDamage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FractureField2D {
+    pub family: Option<FxFamilyId>,
+    pub center: Vec2,
+    pub radius: f32,
+    pub force: Vec2,
+    pub health_loss: f32,
+    pub effective_length_loss: f32,
+    pub mode: FractureFieldMode,
+    pub source: DamageSource,
+}
+
+impl FractureField2D {
+    pub fn stress(center: Vec2, radius: f32, force: Vec2) -> Self {
+        Self {
+            family: None,
+            center,
+            radius,
+            force,
+            health_loss: 0.0,
+            effective_length_loss: 0.0,
+            mode: FractureFieldMode::Stress,
+            source: DamageSource::Stress,
+        }
+    }
+
+    pub fn direct_damage(center: Vec2, radius: f32, health_loss: f32) -> Self {
+        Self {
+            family: None,
+            center,
+            radius,
+            force: Vec2::ZERO,
+            health_loss,
+            effective_length_loss: health_loss,
+            mode: FractureFieldMode::DirectDamage,
+            source: DamageSource::Script,
+        }
+    }
+
+    pub fn with_family(mut self, family: FxFamilyId) -> Self {
+        self.family = Some(family);
+        self
+    }
+
+    pub fn with_effective_length_loss(mut self, loss: f32) -> Self {
+        self.effective_length_loss = loss;
+        self
+    }
+
+    pub fn with_source(mut self, source: DamageSource) -> Self {
+        self.source = source;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FractureFieldEffect {
+    pub family: FxFamilyId,
+    pub actor: FxActorId,
+    pub node: SupportNodeId,
+    pub mode: FractureFieldMode,
+    pub weight: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +194,36 @@ fn voxel_contact_key(contact: &VoxelContact) -> (u32, u32, u32, u16, u32) {
     )
 }
 
+fn field_weight(distance: f32, radius: f32) -> f32 {
+    if radius <= f32::EPSILON {
+        1.0
+    } else {
+        (1.0 - distance / radius).clamp(0.05, 1.0)
+    }
+}
+
+fn actor_contact_metadata(
+    actor: &fracture_core::FxActor,
+    asset: &AuthoredVoxelAsset,
+    lod: ColliderLodSettings,
+) -> DestructibleActorContactMetadata {
+    let occupied_voxels = actor
+        .owned_nodes
+        .iter()
+        .filter_map(|node| asset.core().node(*node))
+        .map(|node| node.voxels.len())
+        .sum::<usize>();
+    let support_nodes = actor.owned_nodes.len();
+    DestructibleActorContactMetadata {
+        occupied_voxels,
+        support_nodes,
+        small_debris: lod.enabled
+            && lod.small_debris_max_nodes == 1
+            && support_nodes == 1
+            && occupied_voxels <= lod.small_debris_max_voxels,
+    }
+}
+
 pub struct FxRapierWorld2D {
     pub(crate) gravity: Vector,
     pub(crate) integration_parameters: IntegrationParameters,
@@ -143,6 +245,8 @@ pub struct FxRapierWorld2D {
     static_anchor_policies: BTreeMap<(FxFamilyId, ExternalBondId), StaticAnchorBodyPolicy>,
     applied_static_anchor_policies: BTreeMap<(FxFamilyId, FxActorId), StaticAnchorBodyPolicy>,
     static_anchor_body_baselines: BTreeMap<(FxFamilyId, FxActorId), RigidBodyType>,
+    fracture_fields: Vec<FractureField2D>,
+    pending_field_fracture_commands: Vec<FractureCommand>,
     pub(crate) snapshot_mode: SnapshotMode,
     pub(crate) tick: u64,
 }
@@ -203,6 +307,8 @@ impl FxRapierWorld2D {
             static_anchor_policies: BTreeMap::new(),
             applied_static_anchor_policies: BTreeMap::new(),
             static_anchor_body_baselines: BTreeMap::new(),
+            fracture_fields: Vec::new(),
+            pending_field_fracture_commands: Vec::new(),
             snapshot_mode: SnapshotMode::Normal,
             tick: 0,
         }
@@ -391,6 +497,33 @@ impl FxRapierWorld2D {
         properties: ContactMaterialProperties,
     ) {
         self.hooks.set_material_properties(material, properties);
+    }
+
+    pub fn set_quick_impact_settings(&self, settings: QuickImpactSettings) {
+        self.hooks.set_quick_impact_settings(settings);
+    }
+
+    pub fn quick_impact_settings(&self) -> QuickImpactSettings {
+        self.hooks.quick_impact_settings()
+    }
+
+    pub fn set_material_impact_hardness(&self, material: u16, hardness: f32) {
+        self.hooks.set_material_impact_hardness(material, hardness);
+    }
+
+    pub fn material_impact_hardness(&self, material: u16) -> f32 {
+        self.hooks.material_impact_hardness(material)
+    }
+
+    pub fn queue_fracture_field(&mut self, field: FractureField2D) {
+        if field.radius.is_finite() && field.radius >= 0.0 {
+            self.fracture_fields.push(field);
+        }
+    }
+
+    pub fn clear_fracture_fields(&mut self) {
+        self.fracture_fields.clear();
+        self.pending_field_fracture_commands.clear();
     }
 
     pub fn add_destructible(
@@ -610,6 +743,14 @@ impl FxRapierWorld2D {
             .expect("contact material registry poisoned")
             .clone();
         let pre_solver_contact_cache = self.hooks.pre_solver_contact_cache_snapshot();
+        let quick_impact_settings = registry.quick_impact_settings;
+        let quick_impacts = collect_quick_impact_inputs(
+            self.tick,
+            self.integration_parameters.dt,
+            &families,
+            &pre_solver_contact_cache,
+            quick_impact_settings.stress_force_scale,
+        );
         let contact_readback = collect_contact_impulse_inputs(
             self.tick,
             self.integration_parameters.dt,
@@ -632,12 +773,14 @@ impl FxRapierWorld2D {
             stress_inputs: contact_impulses
                 .iter()
                 .map(|input| input.stress.clone())
+                .chain(quick_impacts.iter().map(|input| input.stress.clone()))
                 .chain(
                     joint_feedback
                         .iter()
                         .map(|feedback| feedback.stress.clone()),
                 )
                 .collect(),
+            quick_impacts,
             contact_impulses,
             joint_feedback,
             ..FxStepReport::default()
@@ -645,6 +788,7 @@ impl FxRapierWorld2D {
         let mut diagnostics = FxStepDiagnostics::default();
         diagnostics.contact_impulse_readback_miss_count = contact_impulse_readback_miss_count;
 
+        self.consume_fracture_fields(&mut report)?;
         self.apply_step_stress_inputs(&mut report, &mut diagnostics)?;
 
         diagnostics.budget = Some(self.performance_budget_report());
@@ -718,9 +862,19 @@ impl FxRapierWorld2D {
                 .or_default()
                 .push(command);
         }
-        for (family_id, commands) in &selected_by_family {
-            if let Some(profile) = family_profiles.get_mut(family_id) {
-                profile.generated_commands_after_cap = commands.len();
+        let capped_stress_counts = selected_by_family
+            .iter()
+            .map(|(family_id, commands)| (*family_id, commands.len()))
+            .collect::<BTreeMap<_, _>>();
+        for command in std::mem::take(&mut self.pending_field_fracture_commands) {
+            selected_by_family
+                .entry(command.order_key.family_id)
+                .or_default()
+                .push(command);
+        }
+        for (family_id, count) in capped_stress_counts {
+            if let Some(profile) = family_profiles.get_mut(&family_id) {
+                profile.generated_commands_after_cap = count;
             }
         }
 
@@ -770,6 +924,92 @@ impl FxRapierWorld2D {
             report.split_events.extend(split_events);
         }
 
+        Ok(())
+    }
+
+    fn consume_fracture_fields(&mut self, report: &mut FxStepReport) -> Result<(), FxRapierError> {
+        let fields = std::mem::take(&mut self.fracture_fields);
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let mut stress_command_id = 0u32;
+        let mut damage_command_id = 0u32;
+        let mut pending_field_fracture_commands = Vec::new();
+        for field in fields {
+            let family_ids = match field.family {
+                Some(family_id) => vec![family_id],
+                None => self.family_ids(),
+            };
+            for family_id in family_ids {
+                let Some(entry) = self.families.get(&family_id) else {
+                    return Err(FxRapierError::UnknownFamily(family_id));
+                };
+                let context = self.stress_context_for_family(family_id, entry);
+                let mut damage_inputs = Vec::new();
+                for node_context in &context.nodes {
+                    let Some(actor) = entry.family.node_owner(node_context.node) else {
+                        continue;
+                    };
+                    let delta = node_context.position - field.center;
+                    let distance = delta.length();
+                    if distance > field.radius {
+                        continue;
+                    }
+                    let weight = field_weight(distance, field.radius);
+                    report.fracture_field_effects.push(FractureFieldEffect {
+                        family: family_id,
+                        actor,
+                        node: node_context.node,
+                        mode: field.mode,
+                        weight,
+                    });
+                    match field.mode {
+                        FractureFieldMode::Stress => {
+                            report.stress_inputs.push(StressInput {
+                                order_key: DeterministicOrderKey::new(
+                                    self.tick,
+                                    30,
+                                    family_id,
+                                    actor,
+                                    CommandId(stress_command_id),
+                                ),
+                                actor,
+                                node: node_context.node,
+                                force: field.force * weight,
+                                source: field.source,
+                            });
+                            stress_command_id += 1;
+                        }
+                        FractureFieldMode::DirectDamage => {
+                            damage_inputs.push(DamageInput {
+                                order_key: DeterministicOrderKey::new(
+                                    self.tick,
+                                    2,
+                                    family_id,
+                                    actor,
+                                    CommandId(damage_command_id),
+                                ),
+                                actor,
+                                target: FractureTarget::Node(node_context.node),
+                                health_loss: field.health_loss * weight,
+                                effective_length_loss: field.effective_length_loss * weight,
+                                source: field.source,
+                                position: field.center,
+                                radius: field.radius,
+                            });
+                            damage_command_id += 1;
+                        }
+                    }
+                }
+                if !damage_inputs.is_empty() {
+                    pending_field_fracture_commands
+                        .extend(generate_damage_commands(&entry.family, &damage_inputs));
+                }
+            }
+        }
+        self.pending_field_fracture_commands
+            .extend(pending_field_fracture_commands);
         Ok(())
     }
 
@@ -829,6 +1069,7 @@ impl FxRapierWorld2D {
             ..FxStepReport::default()
         };
         let mut diagnostics = FxStepDiagnostics::default();
+        self.consume_fracture_fields(&mut report)?;
         self.apply_step_stress_inputs(&mut report, &mut diagnostics)?;
         diagnostics.budget = Some(self.performance_budget_report());
         self.tick += 1;
@@ -1206,9 +1447,16 @@ impl FxRapierWorld2D {
             gravity: [self.gravity.x, self.gravity.y],
             integration: integration_to_snapshot(&self.integration_parameters),
             stress: stress_to_snapshot(self.stress_solver.settings),
+            quick_impact_settings: registry.quick_impact_settings,
+            queued_fracture_fields: self.fracture_fields.clone(),
             rapier_owned_state,
             contact_materials: registry
                 .material_properties
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            material_impact_hardness: registry
+                .material_hardness
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect(),
@@ -1282,12 +1530,14 @@ impl FxRapierWorld2D {
     fn from_snapshot(snapshot: FxRapierWorldSnapshot) -> Result<Self, FxRapierError> {
         validate_snapshot_metadata(&snapshot)?;
         let prestress_baselines = snapshot.prestress_baselines;
+        let queued_fracture_fields = snapshot.queued_fracture_fields;
         let mut world = Self::new();
         world.snapshot_mode = snapshot.mode;
         world.tick = snapshot.tick;
         world.gravity = Vector::new(snapshot.gravity[0], snapshot.gravity[1]);
         apply_integration_snapshot(&mut world.integration_parameters, snapshot.integration);
         world.stress_solver = StressSolver2D::new(stress_from_snapshot(snapshot.stress));
+        world.set_quick_impact_settings(snapshot.quick_impact_settings);
         world.lod_settings = if snapshot.mode == SnapshotMode::Deterministic {
             ColliderLodSettings::disabled()
         } else {
@@ -1304,6 +1554,9 @@ impl FxRapierWorld2D {
         world.ccd_solver = rapier.ccd_solver;
         for (material, properties) in snapshot.contact_materials {
             world.set_contact_material_properties(material, properties);
+        }
+        for (material, hardness) in snapshot.material_impact_hardness {
+            world.set_material_impact_hardness(material, hardness);
         }
 
         let mut families = snapshot.families;
@@ -1422,6 +1675,22 @@ impl FxRapierWorld2D {
             .into_iter()
             .map(|entry| (entry.body_handle, entry.actor))
             .collect();
+        let lod_settings = world.lod_settings;
+        let actor_metadata = world
+            .families
+            .iter()
+            .flat_map(|(family_id, entry)| {
+                entry.family.actors().map(move |(actor_id, actor)| {
+                    (
+                        DestructibleActorRef {
+                            family: *family_id,
+                            actor: *actor_id,
+                        },
+                        actor_contact_metadata(actor, &entry.asset, lod_settings),
+                    )
+                })
+            })
+            .collect();
         {
             let registry = world.hooks.registry();
             let mut registry = registry
@@ -1442,6 +1711,7 @@ impl FxRapierWorld2D {
                     )
                 })
                 .collect();
+            registry.actor_metadata = actor_metadata;
         }
 
         world.static_anchor_policies = snapshot
@@ -1466,6 +1736,7 @@ impl FxRapierWorld2D {
             world.validate_checkpoint_state(&registry, VoxelMetadataValidation::Captured)?;
         }
         world.restore_prestress_baselines(prestress_baselines)?;
+        world.fracture_fields = queued_fracture_fields;
         Ok(world)
     }
 
@@ -2040,6 +2311,7 @@ impl FxRapierWorld2D {
             family: family_id,
             actor: actor_id,
         };
+        let actor_metadata = actor_contact_metadata(actor, &entry.asset, self.lod_settings);
         {
             let registry = self.hooks.registry();
             let mut registry = registry
@@ -2051,6 +2323,7 @@ impl FxRapierWorld2D {
             registry
                 .collider_voxels
                 .insert(collider_key(collider), collider_build.voxels);
+            registry.actor_metadata.insert(actor_ref, actor_metadata);
         }
         self.body_actors.insert(rigid_body_key(body), actor_ref);
         self.families
@@ -2093,6 +2366,10 @@ impl FxRapierWorld2D {
             registry
                 .collider_voxels
                 .remove(&collider_key(old_handles.collider));
+            registry.actor_metadata.remove(&DestructibleActorRef {
+                family: family_id,
+                actor: actor_id,
+            });
         }
         self.colliders.remove(
             old_handles.collider,
@@ -2153,6 +2430,7 @@ impl FxRapierWorld2D {
             family: family_id,
             actor: actor_id,
         };
+        let actor_metadata = actor_contact_metadata(actor, &entry.asset, self.lod_settings);
         {
             let registry = self.hooks.registry();
             let mut registry = registry
@@ -2164,6 +2442,7 @@ impl FxRapierWorld2D {
             registry
                 .collider_voxels
                 .insert(collider_key(collider), collider_build.voxels);
+            registry.actor_metadata.insert(actor_ref, actor_metadata);
         }
         self.families
             .get_mut(&family_id)
@@ -2199,6 +2478,10 @@ impl FxRapierWorld2D {
             registry
                 .collider_voxels
                 .remove(&collider_key(handles.collider));
+            registry.actor_metadata.remove(&DestructibleActorRef {
+                family: family_id,
+                actor: actor_id,
+            });
         }
         self.body_actors.remove(&rigid_body_key(handles.body));
         self.bodies.remove(
@@ -2529,12 +2812,16 @@ fn validate_snapshot_metadata(snapshot: &FxRapierWorldSnapshot) -> Result<(), Fx
     }
     validate_integration_snapshot(snapshot.integration)?;
     validate_stress_snapshot(snapshot.stress)?;
+    validate_quick_impact_settings_snapshot(snapshot.quick_impact_settings)?;
 
     let mut families = BTreeSet::new();
     for family in &snapshot.families {
         if !families.insert(family.family) {
             return Err(FxRapierSnapshotError::StateMismatch("duplicate family").into());
         }
+    }
+    for field in &snapshot.queued_fracture_fields {
+        validate_queued_fracture_field_snapshot(field, &families)?;
     }
 
     let mut actor_physics = BTreeSet::new();
@@ -2634,6 +2921,17 @@ fn validate_snapshot_metadata(snapshot: &FxRapierWorldSnapshot) -> Result<(), Fx
             return Err(FxRapierSnapshotError::InvalidValue("contact material").into());
         }
     }
+    let mut material_hardness = BTreeSet::new();
+    for (material, hardness) in &snapshot.material_impact_hardness {
+        if !material_hardness.insert(*material) {
+            return Err(
+                FxRapierSnapshotError::StateMismatch("duplicate material impact hardness").into(),
+            );
+        }
+        if !hardness.is_finite() || *hardness < 0.0 {
+            return Err(FxRapierSnapshotError::InvalidValue("material impact hardness").into());
+        }
+    }
     Ok(())
 }
 
@@ -2667,6 +2965,67 @@ fn validate_stress_snapshot(snapshot: StressSettingsSnapshot) -> Result<(), FxRa
     }
     if !snapshot.compression_limit_scale.is_finite() || snapshot.compression_limit_scale < 0.0 {
         return Err(FxRapierSnapshotError::InvalidValue("stress.compression_limit_scale").into());
+    }
+    Ok(())
+}
+
+fn validate_quick_impact_settings_snapshot(
+    settings: crate::hooks::QuickImpactSettings,
+) -> Result<(), FxRapierError> {
+    let values = [
+        settings.static_soften_impulse_threshold,
+        settings.static_suppress_impulse_threshold,
+        settings.dynamic_soften_impulse_threshold,
+        settings.dynamic_suppress_impulse_threshold,
+        settings.penetration_impulse_scale,
+        settings.stress_force_scale,
+        settings.softened_friction_scale,
+        settings.softened_restitution_scale,
+    ];
+    if values
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(FxRapierSnapshotError::InvalidValue("quick impact settings").into());
+    }
+    if settings.static_suppress_impulse_threshold < settings.static_soften_impulse_threshold
+        || settings.dynamic_suppress_impulse_threshold < settings.dynamic_soften_impulse_threshold
+        || settings.softened_friction_scale > 1.0
+        || settings.softened_restitution_scale > 1.0
+    {
+        return Err(FxRapierSnapshotError::InvalidValue("quick impact settings").into());
+    }
+    Ok(())
+}
+
+fn validate_queued_fracture_field_snapshot(
+    field: &FractureField2D,
+    families: &BTreeSet<FxFamilyId>,
+) -> Result<(), FxRapierError> {
+    let values = [
+        field.center.x,
+        field.center.y,
+        field.radius,
+        field.force.x,
+        field.force.y,
+        field.health_loss,
+        field.effective_length_loss,
+    ];
+    if values.into_iter().any(|value| !value.is_finite()) || field.radius < 0.0 {
+        return Err(FxRapierSnapshotError::InvalidValue("queued fracture field").into());
+    }
+    if matches!(field.mode, FractureFieldMode::DirectDamage)
+        && (field.health_loss < 0.0 || field.effective_length_loss < 0.0)
+    {
+        return Err(FxRapierSnapshotError::InvalidValue("queued fracture field").into());
+    }
+    if let Some(family) = field.family {
+        if !families.contains(&family) {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "queued fracture field unknown family",
+            )
+            .into());
+        }
     }
     Ok(())
 }

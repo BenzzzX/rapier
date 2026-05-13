@@ -5,8 +5,9 @@ use rapier2d::prelude::*;
 
 use crate::collider_sync::{DestructibleActorRef, VoxelContact};
 use crate::contact_map::{
-    ContactPairMapping, ContactPairSide, PreSolverContactKey, PreSolverContactMapping,
-    collider_key, contact_pair_key,
+    ContactPairMapping, ContactPairSide, DestructibleActorContactMetadata, PreSolverContactKey,
+    PreSolverContactMapping, QuickImpactAction, QuickImpactEstimate, collider_key,
+    contact_pair_key,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,14 +41,52 @@ pub struct HookObservation {
     pub restitution: f32,
     pub material: u16,
     pub voxel: Option<VoxelContact>,
+    pub actor_metadata: Option<DestructibleActorContactMetadata>,
+    pub quick_impact: Option<QuickImpactEstimate>,
     pub used_fallback: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuickImpactSettings {
+    pub enabled: bool,
+    pub soften_enabled: bool,
+    pub suppress_enabled: bool,
+    pub static_soften_impulse_threshold: f32,
+    pub static_suppress_impulse_threshold: f32,
+    pub dynamic_soften_impulse_threshold: f32,
+    pub dynamic_suppress_impulse_threshold: f32,
+    pub penetration_impulse_scale: f32,
+    pub stress_force_scale: f32,
+    pub softened_friction_scale: f32,
+    pub softened_restitution_scale: f32,
+}
+
+impl Default for QuickImpactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            soften_enabled: true,
+            suppress_enabled: true,
+            static_soften_impulse_threshold: 2.0,
+            static_suppress_impulse_threshold: 6.0,
+            dynamic_soften_impulse_threshold: 8.0,
+            dynamic_suppress_impulse_threshold: 24.0,
+            penetration_impulse_scale: 1.0,
+            stress_force_scale: 1.0,
+            softened_friction_scale: 0.25,
+            softened_restitution_scale: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ContactMaterialRegistry {
     pub collider_actors: BTreeMap<(u32, u32), DestructibleActorRef>,
     pub collider_voxels: BTreeMap<(u32, u32), Vec<VoxelContact>>,
+    pub actor_metadata: BTreeMap<DestructibleActorRef, DestructibleActorContactMetadata>,
     pub material_properties: BTreeMap<u16, ContactMaterialProperties>,
+    pub material_hardness: BTreeMap<u16, f32>,
+    pub quick_impact_settings: QuickImpactSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +121,39 @@ impl FxContactHooks {
             .expect("contact material registry poisoned")
             .material_properties
             .insert(material, properties);
+    }
+
+    pub fn set_quick_impact_settings(&self, settings: QuickImpactSettings) {
+        self.registry
+            .write()
+            .expect("contact material registry poisoned")
+            .quick_impact_settings = sanitize_quick_impact_settings(settings);
+    }
+
+    pub fn quick_impact_settings(&self) -> QuickImpactSettings {
+        self.registry
+            .read()
+            .expect("contact material registry poisoned")
+            .quick_impact_settings
+    }
+
+    pub fn set_material_impact_hardness(&self, material: u16, hardness: f32) {
+        self.registry
+            .write()
+            .expect("contact material registry poisoned")
+            .material_hardness
+            .insert(material, hardness.max(0.0));
+    }
+
+    pub fn material_impact_hardness(&self, material: u16) -> f32 {
+        self.registry
+            .read()
+            .expect("contact material registry poisoned")
+            .material_hardness
+            .get(&material)
+            .copied()
+            .unwrap_or(1.0)
+            .max(0.0)
     }
 
     pub fn drain_observations(&self) -> Vec<HookObservation> {
@@ -128,9 +200,35 @@ impl PhysicsHooks for FxContactHooks {
             .copied()
             .unwrap_or_default();
         let before = context.solver_contacts.len();
+        let pair_contains_small_debris = mappings
+            .iter()
+            .copied()
+            .any(|mapping| mapping_is_small_debris(mapping, &registry));
+        let quick_impacts = if pair_contains_small_debris {
+            vec![None; mappings.len()]
+        } else {
+            mappings
+                .iter()
+                .copied()
+                .map(|mapping| quick_impact_for_mapping(mapping, context, &registry))
+                .collect::<Vec<_>>()
+        };
+        let strongest_action = quick_impacts
+            .iter()
+            .filter_map(|impact| impact.map(|impact| impact.action))
+            .max();
         for contact in context.solver_contacts.iter_mut() {
             contact.friction = properties.friction;
             contact.restitution = properties.restitution;
+        }
+        if strongest_action == Some(QuickImpactAction::Soften) {
+            let settings = registry.quick_impact_settings;
+            for contact in context.solver_contacts.iter_mut() {
+                contact.friction *= settings.softened_friction_scale;
+                contact.restitution *= settings.softened_restitution_scale;
+            }
+        } else if strongest_action == Some(QuickImpactAction::Suppress) {
+            context.solver_contacts.clear();
         }
         let after = context.solver_contacts.len();
         let solver_contact_ids = context
@@ -144,7 +242,7 @@ impl PhysicsHooks for FxContactHooks {
             .lock()
             .expect("pre-solver contact cache poisoned");
         let mut cached_mappings = Vec::new();
-        for mapping in mappings {
+        for (mapping, quick_impact) in mappings.into_iter().zip(quick_impacts) {
             let voxel = contact_context_voxel(mapping, context, &registry);
             let (destructible_subshape, other_subshape) =
                 contact_context_subshapes(mapping.side, context);
@@ -166,6 +264,8 @@ impl PhysicsHooks for FxContactHooks {
                 material,
                 voxel,
                 node: voxel.map(|voxel| voxel.node),
+                actor_metadata: registry.actor_metadata.get(&mapping.destructible).copied(),
+                quick_impact,
                 used_fallback: voxel.is_none(),
                 solver_contact_count: after,
                 solver_contact_ids: solver_contact_ids.clone(),
@@ -196,10 +296,158 @@ impl PhysicsHooks for FxContactHooks {
                 restitution: properties.restitution,
                 material: cached.material,
                 voxel: cached.voxel,
+                actor_metadata: cached.actor_metadata,
+                quick_impact: cached.quick_impact,
                 used_fallback: cached.used_fallback,
             });
         }
     }
+}
+
+fn mapping_is_small_debris(
+    mapping: ContactPairMapping,
+    registry: &ContactMaterialRegistry,
+) -> bool {
+    registry
+        .actor_metadata
+        .get(&mapping.destructible)
+        .is_some_and(|metadata| metadata.small_debris)
+}
+
+fn sanitize_quick_impact_settings(mut settings: QuickImpactSettings) -> QuickImpactSettings {
+    settings.static_soften_impulse_threshold = settings.static_soften_impulse_threshold.max(0.0);
+    settings.static_suppress_impulse_threshold = settings
+        .static_suppress_impulse_threshold
+        .max(settings.static_soften_impulse_threshold);
+    settings.dynamic_soften_impulse_threshold = settings.dynamic_soften_impulse_threshold.max(0.0);
+    settings.dynamic_suppress_impulse_threshold = settings
+        .dynamic_suppress_impulse_threshold
+        .max(settings.dynamic_soften_impulse_threshold);
+    settings.penetration_impulse_scale = settings.penetration_impulse_scale.max(0.0);
+    settings.stress_force_scale = settings.stress_force_scale.max(0.0);
+    settings.softened_friction_scale = settings.softened_friction_scale.clamp(0.0, 1.0);
+    settings.softened_restitution_scale = settings.softened_restitution_scale.clamp(0.0, 1.0);
+    settings
+}
+
+fn quick_impact_for_mapping(
+    mapping: ContactPairMapping,
+    context: &ContactModificationContext,
+    registry: &ContactMaterialRegistry,
+) -> Option<QuickImpactEstimate> {
+    let settings = registry.quick_impact_settings;
+    if !settings.enabled {
+        return None;
+    }
+    let metadata = registry
+        .actor_metadata
+        .get(&mapping.destructible)
+        .copied()?;
+    if metadata.small_debris {
+        return None;
+    }
+    let voxel = contact_context_voxel(mapping, context, registry);
+    let material = voxel
+        .map(|voxel| voxel.contact_material)
+        .unwrap_or_default();
+    let hardness = registry
+        .material_hardness
+        .get(&material)
+        .copied()
+        .unwrap_or(1.0)
+        .max(0.0);
+    if hardness == 0.0 {
+        return None;
+    }
+    let (body1, body2) = (
+        context
+            .rigid_body1
+            .and_then(|handle| context.bodies.get(handle)),
+        context
+            .rigid_body2
+            .and_then(|handle| context.bodies.get(handle)),
+    );
+    let (destructible_body, other_body) = match mapping.side {
+        ContactPairSide::Collider1 => (body1, body2),
+        ContactPairSide::Collider2 => (body2, body1),
+    };
+    let destructible_body = destructible_body?;
+    let normal = *context.normal;
+    let normal_sign = match mapping.side {
+        ContactPairSide::Collider1 => 1.0,
+        ContactPairSide::Collider2 => -1.0,
+    };
+    let dynamic_opponent = other_body.is_some_and(RigidBody::is_dynamic);
+    let (soften_threshold, suppress_threshold) = if dynamic_opponent {
+        (
+            settings.dynamic_soften_impulse_threshold,
+            settings.dynamic_suppress_impulse_threshold,
+        )
+    } else {
+        (
+            settings.static_soften_impulse_threshold,
+            settings.static_suppress_impulse_threshold,
+        )
+    };
+
+    let destructible_mass = destructible_body.mass().max(0.0);
+    let other_mass = other_body
+        .filter(|body| body.is_dynamic())
+        .map(|body| body.mass().max(0.0));
+    let effective_mass = match other_mass {
+        Some(other_mass) if destructible_mass > 0.0 && other_mass > 0.0 => {
+            1.0 / (1.0 / destructible_mass + 1.0 / other_mass)
+        }
+        _ => destructible_mass,
+    };
+    if !effective_mass.is_finite() || effective_mass <= 0.0 {
+        return None;
+    }
+
+    let mut best = None;
+    for contact in context.solver_contacts.iter() {
+        let vel1 = body1
+            .map(|body| body.velocity_at_point(contact.point))
+            .unwrap_or_default();
+        let vel2 = body2
+            .map(|body| body.velocity_at_point(contact.point))
+            .unwrap_or_default();
+        let relative_normal_speed = (-(vel2 - vel1).dot(normal)).max(0.0);
+        let penetration_speed = (-contact.dist).max(0.0) * settings.penetration_impulse_scale;
+        let raw_impulse = (relative_normal_speed + penetration_speed) * effective_mass;
+        let scaled_impulse = raw_impulse * hardness;
+        let action = if settings.suppress_enabled && scaled_impulse >= suppress_threshold {
+            QuickImpactAction::Suppress
+        } else if settings.soften_enabled && scaled_impulse >= soften_threshold {
+            QuickImpactAction::Soften
+        } else {
+            continue;
+        };
+        let estimate = QuickImpactEstimate {
+            action,
+            point: contact.point,
+            normal,
+            impulse: normal * (raw_impulse * normal_sign),
+            relative_normal_speed,
+            effective_mass,
+            scaled_impulse,
+            threshold: if action == QuickImpactAction::Suppress {
+                suppress_threshold
+            } else {
+                soften_threshold
+            },
+            hardness,
+            contact_id: contact.contact_id[0],
+            dynamic_opponent,
+        };
+        if best.is_none_or(|best: QuickImpactEstimate| {
+            estimate.action > best.action
+                || (estimate.action == best.action && estimate.scaled_impulse > best.scaled_impulse)
+        }) {
+            best = Some(estimate);
+        }
+    }
+    best
 }
 
 fn contact_context_mappings(
