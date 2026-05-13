@@ -1024,7 +1024,7 @@ fn stress_gravity_static_anchor_without_contact_or_joint_input() {
     world
         .add_destructible(family, single_node_asset(7))
         .unwrap();
-    let anchor = world
+    world
         .connect_static_anchor(
             family,
             StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
@@ -1037,15 +1037,211 @@ fn stress_gravity_static_anchor_without_contact_or_joint_input() {
     assert!(step.report.contact_impulses.is_empty());
     assert!(step.report.joint_feedback.is_empty());
     assert!(step.report.stress_inputs.is_empty());
+    assert!(step.report.fracture_events.is_empty());
+    assert!(step.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.contact_impulses.is_empty());
+    assert!(step.report.joint_feedback.is_empty());
+    assert!(step.report.stress_inputs.is_empty());
+    assert!(step.report.fracture_events.is_empty());
+    assert!(step.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+}
+
+#[test]
+fn prestress_baseline_extra_test_input_still_fractures() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let anchor = world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let initial = world.step_with_diagnostics().unwrap();
+
+    assert!(initial.report.fracture_events.is_empty());
+    assert!(initial.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+
+    let step = world
+        .step_with_stress_inputs_for_test(vec![StressInput {
+            order_key: DeterministicOrderKey::new(
+                world.tick(),
+                1,
+                family,
+                FxActorId(0),
+                CommandId(1),
+            ),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(0.0, -1.0),
+            source: DamageSource::ContactImpulse,
+        }])
+        .unwrap();
+
     assert_eq!(step.report.fracture_events.len(), 1);
     assert_eq!(
         step.report.fracture_events[0].target,
-        fracture_core::FractureTarget::ExternalBond(anchor)
+        FractureTarget::ExternalBond(anchor)
     );
     assert_eq!(
         step.report.fracture_events[0].source,
-        fracture_core::DamageSource::Stress
+        DamageSource::ContactImpulse
     );
+    assert_eq!(world.prestress_baseline_count_for_test(), 0);
+}
+
+#[test]
+fn prestress_baseline_gravity_delta_fractures() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let anchor = world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let initial = world.step_with_diagnostics().unwrap();
+
+    assert!(initial.report.fracture_events.is_empty());
+    assert!(initial.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+
+    world.set_gravity(Vector::new(0.0, -2.0));
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.stress_inputs.is_empty());
+    assert_eq!(step.report.fracture_events.len(), 1);
+    assert_eq!(
+        step.report.fracture_events[0].target,
+        FractureTarget::ExternalBond(anchor)
+    );
+    assert_eq!(step.report.fracture_events[0].source, DamageSource::Stress);
+    assert_eq!(world.prestress_baseline_count_for_test(), 0);
+}
+
+#[test]
+fn prestress_baseline_invalidates_after_static_anchor_change() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let initial = world.step_with_diagnostics().unwrap();
+
+    assert!(initial.report.fracture_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+    let first_signature = world
+        .prestress_baseline_signature_for_test(family)
+        .expect("baseline captured");
+
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(78, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    assert_eq!(world.prestress_baseline_count_for_test(), 0);
+    assert_eq!(world.prestress_baseline_signature_for_test(family), None);
+
+    let recaptured = world.step_with_diagnostics().unwrap();
+
+    assert!(recaptured.report.fracture_events.is_empty());
+    assert!(recaptured.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+    assert_ne!(
+        world
+            .prestress_baseline_signature_for_test(family)
+            .expect("baseline recaptured"),
+        first_signature
+    );
+}
+
+#[test]
+fn prestress_baseline_invalidates_after_stress_settings_change() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let initial = world.step_with_diagnostics().unwrap();
+
+    assert!(initial.report.fracture_events.is_empty());
+    assert!(initial.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        enable_gravity: false,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+
+    assert_eq!(world.prestress_baseline_count_for_test(), 0);
+    assert_eq!(world.prestress_baseline_signature_for_test(family), None);
+
+    let recaptured = world.step_with_diagnostics().unwrap();
+
+    assert!(recaptured.report.fracture_events.is_empty());
+    assert!(recaptured.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+    assert_eq!(world.stress_settings().enable_gravity, false);
 }
 
 #[test]

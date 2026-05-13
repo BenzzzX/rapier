@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use fracture_core::{
     CommandId, ConnectionError, ConnectionId, DeterministicOrderKey, DynamicConnectionPolicy,
     ExternalBondId, FractureCommand, FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult,
-    SplitEvent, StressContext2D, StressSettings, StressSolver2D, SupportNodeId, Vec2,
-    apply_fracture_commands,
+    SplitEvent, StressContext2D, StressLoadBaseline2D, StressSettings, StressSolver2D,
+    SupportNodeId, Vec2, apply_fracture_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
@@ -136,6 +136,7 @@ pub struct FxRapierWorld2D {
     stress_solver: StressSolver2D,
     lod_settings: ColliderLodSettings,
     pub(crate) families: BTreeMap<FxFamilyId, DestructibleFamily>,
+    prestress_baselines: BTreeMap<FxFamilyId, StressLoadBaseline2D>,
     body_actors: BTreeMap<(u32, u32), DestructibleActorRef>,
     static_anchor_policies: BTreeMap<(FxFamilyId, ExternalBondId), StaticAnchorBodyPolicy>,
     applied_static_anchor_policies: BTreeMap<(FxFamilyId, FxActorId), StaticAnchorBodyPolicy>,
@@ -195,6 +196,7 @@ impl FxRapierWorld2D {
             stress_solver: StressSolver2D::new(StressSettings::default()),
             lod_settings: ColliderLodSettings::default(),
             families: BTreeMap::new(),
+            prestress_baselines: BTreeMap::new(),
             body_actors: BTreeMap::new(),
             static_anchor_policies: BTreeMap::new(),
             applied_static_anchor_policies: BTreeMap::new(),
@@ -206,6 +208,7 @@ impl FxRapierWorld2D {
 
     pub fn set_stress_settings(&mut self, settings: StressSettings) {
         self.stress_solver = StressSolver2D::new(settings);
+        self.prestress_baselines.clear();
     }
 
     pub fn stress_settings(&self) -> StressSettings {
@@ -437,6 +440,7 @@ impl FxRapierWorld2D {
             .ok_or(FxRapierError::UnknownFamily(family_id))?
             .family
             .connect_static_anchor(desc.core)?;
+        self.invalidate_prestress_baseline(family_id);
         if desc.body_policy != StaticAnchorBodyPolicy::Preserve {
             self.static_anchor_policies
                 .insert((family_id, id), desc.body_policy);
@@ -461,6 +465,7 @@ impl FxRapierWorld2D {
             .ok_or(FxRapierError::UnknownFamily(family_id))?
             .family
             .connect_dynamic_structural_bond_graph_only(desc.core)?;
+        self.invalidate_prestress_baseline(family_id);
         debug_assert_eq!(self.impulse_joints.len(), before_joints);
         Ok(id)
     }
@@ -511,6 +516,7 @@ impl FxRapierWorld2D {
             .ok_or(FxRapierError::UnknownFamily(family_id))?
             .family
             .merge_actors(actor_a, actor_b)?;
+        self.invalidate_prestress_baseline(family_id);
         let merged_local_origin = self
             .families
             .get(&family_id)
@@ -658,7 +664,18 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get(family_id) else {
                 return Err(FxRapierError::UnknownFamily(*family_id));
             };
-            let stress_context = self.stress_context_for_family(*family_id, entry);
+            let mut stress_context = self.stress_context_for_family(*family_id, entry);
+            let baseline = match self.prestress_baselines.get(family_id) {
+                Some(baseline) => baseline.clone(),
+                None => {
+                    let baseline =
+                        uncapped_solver.capture_load_baseline(&entry.family, &stress_context);
+                    self.prestress_baselines
+                        .insert(*family_id, baseline.clone());
+                    baseline
+                }
+            };
+            stress_context.load_baseline = Some(baseline);
             let stress_report = uncapped_solver.generate_with_context_and_profile(
                 &entry.family,
                 &stress_context,
@@ -702,17 +719,23 @@ impl FxRapierWorld2D {
 
         for family_id in family_ids {
             let parent_snapshots = self.snapshot_family_bodies(family_id);
-            let split_events = {
+            let (split_events, baseline_dirty) = {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
+                let mut baseline_dirty = false;
                 if let Some(commands) = selected_by_family.get(&family_id) {
-                    report
-                        .fracture_events
-                        .extend(apply_fracture_commands(&mut entry.family, commands));
+                    let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+                    baseline_dirty |= !fracture_events.is_empty();
+                    report.fracture_events.extend(fracture_events);
                 }
-                split_dirty_actors(&mut entry.family)
+                let split_events = split_dirty_actors(&mut entry.family);
+                baseline_dirty |= !split_events.is_empty();
+                (split_events, baseline_dirty)
             };
+            if baseline_dirty {
+                self.invalidate_prestress_baseline(family_id);
+            }
             if !split_events.is_empty() {
                 let sync_report =
                     self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
@@ -813,6 +836,9 @@ impl FxRapierWorld2D {
             (fracture_events, split_events)
         };
         let (fracture_events, split_events) = split_events;
+        if !fracture_events.is_empty() || !split_events.is_empty() {
+            self.invalidate_prestress_baseline(family_id);
+        }
         let mut report = FxStepReport {
             fracture_events,
             split_events: split_events.clone(),
@@ -878,15 +904,20 @@ impl FxRapierWorld2D {
                 continue;
             };
             let parent_snapshots = self.snapshot_family_bodies(family_id);
-            let split_events = {
+            let (split_events, baseline_dirty) = {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
-                report
-                    .fracture_events
-                    .extend(apply_fracture_commands(&mut entry.family, commands));
-                split_dirty_actors(&mut entry.family)
+                let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+                let mut baseline_dirty = !fracture_events.is_empty();
+                report.fracture_events.extend(fracture_events);
+                let split_events = split_dirty_actors(&mut entry.family);
+                baseline_dirty |= !split_events.is_empty();
+                (split_events, baseline_dirty)
             };
+            if baseline_dirty {
+                self.invalidate_prestress_baseline(family_id);
+            }
             if !split_events.is_empty() {
                 let sync_report =
                     self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
@@ -909,13 +940,18 @@ impl FxRapierWorld2D {
     ) -> Result<Vec<SplitEvent>, FxRapierError> {
         self.sync_family_actors(family_id)?;
         let parent_snapshots = self.snapshot_family_bodies(family_id);
-        let split_events = {
+        let (split_events, baseline_dirty) = {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            apply_fracture_commands(&mut entry.family, commands);
-            split_dirty_actors(&mut entry.family)
+            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+            let split_events = split_dirty_actors(&mut entry.family);
+            let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
+            (split_events, baseline_dirty)
         };
+        if baseline_dirty {
+            self.invalidate_prestress_baseline(family_id);
+        }
         if !split_events.is_empty() {
             let _sync_report =
                 self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
@@ -933,13 +969,18 @@ impl FxRapierWorld2D {
     ) -> Result<(Vec<SplitEvent>, FxPhysicsSyncReport), FxRapierError> {
         self.sync_family_actors(family_id)?;
         let parent_snapshots = self.snapshot_family_bodies(family_id);
-        let split_events = {
+        let (split_events, baseline_dirty) = {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            apply_fracture_commands(&mut entry.family, commands);
-            split_dirty_actors(&mut entry.family)
+            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+            let split_events = split_dirty_actors(&mut entry.family);
+            let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
+            (split_events, baseline_dirty)
         };
+        if baseline_dirty {
+            self.invalidate_prestress_baseline(family_id);
+        }
         let sync_report = if !split_events.is_empty() {
             self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?
         } else {
@@ -959,13 +1000,18 @@ impl FxRapierWorld2D {
         self.sync_family_actors(family_id)?;
         let mut parent_snapshots = self.snapshot_family_bodies(family_id);
         parent_snapshots.remove(&missing_parent);
-        let split_events = {
+        let (split_events, baseline_dirty) = {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            apply_fracture_commands(&mut entry.family, commands);
-            split_dirty_actors(&mut entry.family)
+            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+            let split_events = split_dirty_actors(&mut entry.family);
+            let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
+            (split_events, baseline_dirty)
         };
+        if baseline_dirty {
+            self.invalidate_prestress_baseline(family_id);
+        }
         if !split_events.is_empty() {
             let _sync_report =
                 self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
@@ -999,13 +1045,18 @@ impl FxRapierWorld2D {
                 continue;
             };
             let parent_snapshots = self.snapshot_family_bodies(family_id);
-            let split_events = {
+            let (split_events, baseline_dirty) = {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
-                apply_fracture_commands(&mut entry.family, commands);
-                split_dirty_actors(&mut entry.family)
+                let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+                let split_events = split_dirty_actors(&mut entry.family);
+                let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
+                (split_events, baseline_dirty)
             };
+            if baseline_dirty {
+                self.invalidate_prestress_baseline(family_id);
+            }
             if !split_events.is_empty() {
                 let _sync_report =
                     self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
@@ -1019,6 +1070,25 @@ impl FxRapierWorld2D {
 
     fn family_ids(&self) -> Vec<FxFamilyId> {
         self.families.keys().copied().collect()
+    }
+
+    fn invalidate_prestress_baseline(&mut self, family_id: FxFamilyId) {
+        self.prestress_baselines.remove(&family_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prestress_baseline_count_for_test(&self) -> usize {
+        self.prestress_baselines.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prestress_baseline_signature_for_test(
+        &self,
+        family_id: FxFamilyId,
+    ) -> Option<u64> {
+        self.prestress_baselines
+            .get(&family_id)
+            .map(|baseline| baseline.topology_signature)
     }
 
     fn capture_snapshot(&self) -> Result<FxRapierWorldSnapshot, FxRapierError> {
