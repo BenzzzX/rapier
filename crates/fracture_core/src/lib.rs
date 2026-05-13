@@ -2137,6 +2137,7 @@ pub struct StressContext2D {
     pub nodes: Vec<StressNodeContext2D>,
     pub gravity: Vec2,
     pub fallback_order_keys: Vec<(FxActorId, DeterministicOrderKey)>,
+    pub load_baseline: Option<StressLoadBaseline2D>,
 }
 
 impl StressContext2D {
@@ -2177,8 +2178,30 @@ impl StressContext2D {
             nodes,
             gravity: Vec2::ZERO,
             fallback_order_keys: Vec::new(),
+            load_baseline: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StressBaselineTarget2D {
+    Bond(BondId),
+    ExternalBond(ExternalBondId),
+    Connection(ConnectionId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StressBaselineEdge2D {
+    pub target: StressBaselineTarget2D,
+    pub node_a_force: Vec2,
+    pub node_b_force: Vec2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StressLoadBaseline2D {
+    pub topology_signature: u64,
+    pub gravity: Vec2,
+    pub loads: Vec<StressBaselineEdge2D>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2414,6 +2437,27 @@ impl StressSolver2D {
         Self { settings }
     }
 
+    pub fn capture_load_baseline(
+        &self,
+        family: &FxFamily,
+        context: &StressContext2D,
+    ) -> StressLoadBaseline2D {
+        let node_context_by_id = stress_context_nodes_by_id(family, context);
+        let initial_force_by_node =
+            self.stress_gravity_forces(family, context, &node_context_by_id);
+        let mut profile = StressProfile::default();
+        let edges = stress_graph_edges(family, &mut profile);
+        let topology_signature = stress_load_topology_signature(&edges, &node_context_by_id);
+        let edge_loads =
+            self.solve_edge_loads(family, &edges, &node_context_by_id, &initial_force_by_node);
+        let loads = stress_baseline_edges(&edges, &edge_loads);
+        StressLoadBaseline2D {
+            topology_signature,
+            gravity: context.gravity,
+            loads,
+        }
+    }
+
     pub fn generate(&self, family: &FxFamily, inputs: &[StressInput]) -> Vec<FractureCommand> {
         self.generate_with_profile(family, inputs).commands
     }
@@ -2459,37 +2503,23 @@ impl StressSolver2D {
             source_by_actor.entry(input.actor).or_insert(input.source);
         }
 
-        let mut node_context = context.nodes.clone();
-        node_context.sort_by_key(|node| node.node);
-        let mut node_context_by_id = BTreeMap::new();
-        for node in node_context {
-            if family.node_owner(node.node).is_none() || !valid_vec2(node.position) {
-                continue;
-            }
-            node_context_by_id.insert(node.node, node);
-        }
-        let gravity_enabled = self.settings.enable_gravity
-            && valid_vec2(context.gravity)
-            && (context.gravity.x != 0.0 || context.gravity.y != 0.0);
-        if gravity_enabled {
+        let node_context_by_id = stress_context_nodes_by_id(family, context);
+        let gravity_forces = self.stress_gravity_forces(family, context, &node_context_by_id);
+        if !gravity_forces.is_empty() {
             let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, &node_context_by_id);
             let fallback_order_keys = context
                 .fallback_order_keys
                 .iter()
                 .copied()
                 .collect::<BTreeMap<_, _>>();
-            for (node, node_context) in &node_context_by_id {
-                if !fixed_reachable_nodes.contains(node) {
+            for (node, force) in gravity_forces {
+                if !fixed_reachable_nodes.contains(&node) {
                     continue;
                 }
-                if !node_context.mass.is_finite() || node_context.mass <= 0.0 {
-                    continue;
-                }
-                let Some(actor) = family.node_owner(*node) else {
+                let Some(actor) = family.node_owner(node) else {
                     continue;
                 };
-                *initial_force_by_node.entry(*node).or_insert(Vec2::ZERO) +=
-                    context.gravity * node_context.mass;
+                *initial_force_by_node.entry(node).or_insert(Vec2::ZERO) += force;
                 if let Some(order_key) = fallback_order_keys.get(&actor).copied() {
                     first_key_by_actor
                         .entry(actor)
@@ -2537,23 +2567,11 @@ impl StressSolver2D {
             profile.actor_count_visited += 1;
         }
 
-        let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, &node_context_by_id);
-        let mut edge_loads = stress_solve_anchored_residuals(
-            &edges,
-            &node_context_by_id,
-            &fixed_reachable_nodes,
-            &initial_force_by_node,
-            self.settings.max_iterations,
-            self.settings.convergence_epsilon,
-        );
-        stress_solve_free_residual_paths(
-            &edges,
-            &fixed_reachable_nodes,
-            &initial_force_by_node,
-            self.settings.max_iterations,
-            self.settings.convergence_epsilon,
-            &mut edge_loads,
-        );
+        let mut edge_loads =
+            self.solve_edge_loads(family, &edges, &node_context_by_id, &initial_force_by_node);
+        if let Some(baseline) = &context.load_baseline {
+            stress_apply_load_baseline(&mut edge_loads, &edges, &node_context_by_id, baseline);
+        }
 
         let mut commands_by_actor = BTreeMap::<FxActorId, Vec<FractureCommand>>::new();
         for edge in &edges {
@@ -2644,6 +2662,202 @@ impl StressSolver2D {
         sort_fracture_commands(&mut commands);
         StressSolveReport { commands, profile }
     }
+
+    fn stress_gravity_forces(
+        &self,
+        family: &FxFamily,
+        context: &StressContext2D,
+        node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+    ) -> BTreeMap<SupportNodeId, Vec2> {
+        let gravity_enabled = self.settings.enable_gravity
+            && valid_vec2(context.gravity)
+            && (context.gravity.x != 0.0 || context.gravity.y != 0.0);
+        if !gravity_enabled {
+            return BTreeMap::new();
+        }
+        let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, node_context_by_id);
+        let mut gravity_forces = BTreeMap::new();
+        for (node, node_context) in node_context_by_id {
+            if !fixed_reachable_nodes.contains(node) {
+                continue;
+            }
+            if !node_context.mass.is_finite() || node_context.mass <= 0.0 {
+                continue;
+            }
+            gravity_forces.insert(*node, context.gravity * node_context.mass);
+        }
+        gravity_forces
+    }
+
+    fn solve_edge_loads(
+        &self,
+        family: &FxFamily,
+        edges: &[StressGraphEdge],
+        node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+        initial_force_by_node: &BTreeMap<SupportNodeId, Vec2>,
+    ) -> BTreeMap<StressEdgeKey, StressEdgeLoad> {
+        let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, node_context_by_id);
+        let mut edge_loads = stress_solve_anchored_residuals(
+            edges,
+            node_context_by_id,
+            &fixed_reachable_nodes,
+            initial_force_by_node,
+            self.settings.max_iterations,
+            self.settings.convergence_epsilon,
+        );
+        stress_solve_free_residual_paths(
+            edges,
+            &fixed_reachable_nodes,
+            initial_force_by_node,
+            self.settings.max_iterations,
+            self.settings.convergence_epsilon,
+            &mut edge_loads,
+        );
+        edge_loads
+    }
+}
+
+fn stress_context_nodes_by_id(
+    family: &FxFamily,
+    context: &StressContext2D,
+) -> BTreeMap<SupportNodeId, StressNodeContext2D> {
+    let mut node_context = context.nodes.clone();
+    node_context.sort_by_key(|node| node.node);
+    let mut node_context_by_id = BTreeMap::new();
+    for node in node_context {
+        if family.node_owner(node.node).is_none() || !valid_vec2(node.position) {
+            continue;
+        }
+        node_context_by_id.insert(node.node, node);
+    }
+    node_context_by_id
+}
+
+fn stress_baseline_target(edge_target: StressEdgeTarget) -> StressBaselineTarget2D {
+    match edge_target {
+        StressEdgeTarget::Bond(id) => StressBaselineTarget2D::Bond(id),
+        StressEdgeTarget::ExternalBond(id) => StressBaselineTarget2D::ExternalBond(id),
+        StressEdgeTarget::Connection(id) => StressBaselineTarget2D::Connection(id),
+    }
+}
+
+fn stress_baseline_edges(
+    edges: &[StressGraphEdge],
+    edge_loads: &BTreeMap<StressEdgeKey, StressEdgeLoad>,
+) -> Vec<StressBaselineEdge2D> {
+    edges
+        .iter()
+        .map(|edge| {
+            let load = edge_loads.get(&edge.key).copied().unwrap_or_default();
+            StressBaselineEdge2D {
+                target: stress_baseline_target(edge.target),
+                node_a_force: load.node_a_force,
+                node_b_force: load.node_b_force,
+            }
+        })
+        .collect()
+}
+
+fn stress_load_topology_signature(
+    edges: &[StressGraphEdge],
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> u64 {
+    let mut hasher = Fnva64::default();
+    hasher.write_u32(edges.len() as u32);
+    for edge in edges {
+        hasher.write_u32(match edge.key.kind {
+            StressEdgeKind::Internal => 0,
+            StressEdgeKind::External => 1,
+            StressEdgeKind::DynamicStructural => 2,
+        });
+        hasher.write_u32(edge.key.id);
+        hasher.write_u32(edge.node_a.0);
+        hasher.write_u32(edge.node_b.map_or(u32::MAX, |node| node.0));
+        match stress_baseline_target(edge.target) {
+            StressBaselineTarget2D::Bond(id) => {
+                hasher.write_u32(0);
+                hasher.write_u32(id.0);
+            }
+            StressBaselineTarget2D::ExternalBond(id) => {
+                hasher.write_u32(1);
+                hasher.write_u32(id.0);
+            }
+            StressBaselineTarget2D::Connection(id) => {
+                hasher.write_u32(2);
+                hasher.write_u32(id.0);
+            }
+        }
+    }
+    hasher.write_u32(node_context_by_id.len() as u32);
+    for node in node_context_by_id.values() {
+        hasher.write_u32(node.node.0);
+        hasher.write_f32(node.mass);
+        hasher.write_u32(u32::from(node.fixed));
+    }
+    hasher.finish()
+}
+
+fn stress_apply_load_baseline(
+    edge_loads: &mut BTreeMap<StressEdgeKey, StressEdgeLoad>,
+    edges: &[StressGraphEdge],
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+    baseline: &StressLoadBaseline2D,
+) {
+    if baseline.topology_signature != stress_load_topology_signature(edges, node_context_by_id) {
+        return;
+    }
+    let Some(loads_by_target) = stress_baseline_loads_by_target(edges, baseline) else {
+        return;
+    };
+    for edge in edges {
+        let Some(baseline_load) = loads_by_target
+            .get(&stress_baseline_target(edge.target))
+            .copied()
+        else {
+            return;
+        };
+        let load = edge_loads.entry(edge.key).or_default();
+        load.node_a_force = load.node_a_force - baseline_load.node_a_force;
+        load.node_b_force = load.node_b_force - baseline_load.node_b_force;
+    }
+}
+
+fn stress_baseline_loads_by_target(
+    edges: &[StressGraphEdge],
+    baseline: &StressLoadBaseline2D,
+) -> Option<BTreeMap<StressBaselineTarget2D, StressEdgeLoad>> {
+    if edges.len() != baseline.loads.len() {
+        return None;
+    }
+    let current_targets = edges
+        .iter()
+        .map(|edge| stress_baseline_target(edge.target))
+        .collect::<BTreeSet<_>>();
+    let mut loads_by_target = BTreeMap::new();
+    for load in &baseline.loads {
+        if !valid_vec2(load.node_a_force) || !valid_vec2(load.node_b_force) {
+            return None;
+        }
+        if !current_targets.contains(&load.target) {
+            return None;
+        }
+        if loads_by_target
+            .insert(
+                load.target,
+                StressEdgeLoad {
+                    node_a_force: load.node_a_force,
+                    node_b_force: load.node_b_force,
+                },
+            )
+            .is_some()
+        {
+            return None;
+        }
+    }
+    if loads_by_target.len() != current_targets.len() {
+        return None;
+    }
+    Some(loads_by_target)
 }
 
 fn force_is_active(force: Vec2, epsilon: f32) -> bool {
@@ -5656,6 +5870,294 @@ mod tests {
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+    }
+
+    #[test]
+    fn stress_baseline_static_gravity_does_not_fracture() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        context.load_baseline = Some(solver.capture_load_baseline(&family, &context));
+
+        assert!(
+            solver
+                .generate_with_context(&family, &context, &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stress_baseline_extra_input_still_fractures() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        context.load_baseline = Some(solver.capture_load_baseline(&family, &context));
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(0.0, -1.0),
+            source: DamageSource::ContactImpulse,
+        };
+
+        let commands = solver.generate_with_context(&family, &context, &[input]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        assert_eq!(commands[0].source, DamageSource::ContactImpulse);
+    }
+
+    #[test]
+    fn stress_baseline_gravity_delta_fractures() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut capture_context = StressContext2D::from_family(&family);
+        capture_context.gravity = Vec2::new(0.0, -1.0);
+        capture_context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        let baseline = solver.capture_load_baseline(&family, &capture_context);
+        let mut context = capture_context;
+        context.gravity = Vec2::new(0.0, -2.0);
+        context.load_baseline = Some(baseline);
+
+        let commands = solver.generate_with_context(&family, &context, &[]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        assert_eq!(commands[0].source, DamageSource::Stress);
+    }
+
+    #[test]
+    fn stress_baseline_signature_mismatch_is_ignored() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let extra_anchor = family
+            .connect_static_anchor(static_anchor_desc(8, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut capture_context = StressContext2D::from_family(&family);
+        capture_context.gravity = Vec2::new(0.0, -1.0);
+        capture_context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        family.external_bonds.remove(&extra_anchor);
+        let baseline = solver.capture_load_baseline(&family, &capture_context);
+        family
+            .connect_static_anchor(static_anchor_desc(extra_anchor.0, 0))
+            .unwrap();
+        let mut context = capture_context;
+        context.load_baseline = Some(baseline);
+
+        let commands = solver.generate_with_context(&family, &context, &[]);
+
+        let targets = commands
+            .iter()
+            .map(|command| command.target)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            [anchor, extra_anchor]
+                .into_iter()
+                .map(FractureTarget::ExternalBond)
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn stress_baseline_same_topology_position_and_axes_changes_still_deduct() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 8,
+            ..Default::default()
+        });
+        let mut capture_context = StressContext2D::from_family(&family);
+        capture_context.gravity = Vec2::new(0.0, -1.0);
+        capture_context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        let baseline = solver.capture_load_baseline(&family, &capture_context);
+
+        let external_bond = family.external_bonds.get_mut(&anchor).unwrap();
+        external_bond.normal = Vec2::new(0.0, -1.0);
+        external_bond.tangent = Vec2::new(1.0, 0.0);
+
+        let mut context = capture_context;
+        for node in &mut context.nodes {
+            node.position = match node.node {
+                SupportNodeId(0) => Vec2::new(10.0, 10.0),
+                SupportNodeId(1) => Vec2::new(10.0, 11.0),
+                _ => node.position,
+            };
+        }
+        context.load_baseline = Some(baseline);
+
+        assert!(
+            solver
+                .generate_with_context(&family, &context, &[])
+                .is_empty()
+        );
+    }
+
+    fn two_static_anchor_baseline_case() -> (
+        FxFamily,
+        StressSolver2D,
+        StressContext2D,
+        StressLoadBaseline2D,
+    ) {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        let baseline = solver.capture_load_baseline(&family, &context);
+        (family, solver, context, baseline)
+    }
+
+    fn assert_malformed_stress_baseline_is_ignored(
+        family: &FxFamily,
+        solver: &StressSolver2D,
+        mut context: StressContext2D,
+        baseline: StressLoadBaseline2D,
+    ) {
+        let expected_commands = solver.generate_with_context(family, &context, &[]);
+        assert!(expected_commands.len() > 1);
+
+        context.load_baseline = Some(baseline);
+
+        let commands = solver.generate_with_context(family, &context, &[]);
+
+        assert_eq!(commands, expected_commands);
+    }
+
+    #[test]
+    fn stress_baseline_duplicate_target_is_rejected_without_partial_deduct() {
+        let (family, solver, context, mut baseline) = two_static_anchor_baseline_case();
+        baseline.loads[1].target = baseline.loads[0].target;
+
+        assert_malformed_stress_baseline_is_ignored(&family, &solver, context, baseline);
+    }
+
+    #[test]
+    fn stress_baseline_missing_target_is_rejected_without_partial_deduct() {
+        let (family, solver, context, mut baseline) = two_static_anchor_baseline_case();
+        baseline.loads[1].target = StressBaselineTarget2D::ExternalBond(ExternalBondId(99));
+
+        assert_malformed_stress_baseline_is_ignored(&family, &solver, context, baseline);
+    }
+
+    #[test]
+    fn stress_baseline_non_finite_load_is_rejected_without_partial_deduct() {
+        let (family, solver, context, mut baseline) = two_static_anchor_baseline_case();
+        baseline.loads[0].node_a_force.x = f32::INFINITY;
+
+        assert_malformed_stress_baseline_is_ignored(&family, &solver, context, baseline);
+    }
+
+    #[test]
+    fn stress_baseline_deterministic_with_input_order() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        });
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        context.load_baseline = Some(solver.capture_load_baseline(&family, &context));
+        let inputs = vec![
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(0.0, -0.25),
+                source: DamageSource::ContactImpulse,
+            },
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(0.0, -0.75),
+                source: DamageSource::JointFeedback,
+            },
+        ];
+        let mut reversed_inputs = inputs.clone();
+        reversed_inputs.reverse();
+        let mut reversed_context = context.clone();
+        reversed_context.nodes.reverse();
+
+        let commands = solver.generate_with_context(&family, &context, &inputs);
+        let reversed_commands =
+            solver.generate_with_context(&family, &reversed_context, &reversed_inputs);
+
+        assert_eq!(commands, reversed_commands);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        assert_eq!(commands[0].source, DamageSource::JointFeedback);
     }
 
     #[test]
