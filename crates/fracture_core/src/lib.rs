@@ -286,6 +286,7 @@ pub struct Bond2D {
     pub length: f32,
     pub base_health: f32,
     pub tension_limit: f32,
+    pub compression_limit: f32,
     pub shear_limit: f32,
     pub material_pair: (u16, u16),
     pub interface_edges: Vec<InterfaceEdge>,
@@ -325,6 +326,7 @@ pub struct FxAssetDesc {
     pub orientation_map: Option<Vec<u16>>,
     pub default_bond_health: f32,
     pub default_tension_limit: f32,
+    pub default_compression_limit: f32,
     pub default_shear_limit: f32,
 }
 
@@ -345,6 +347,7 @@ impl FxAssetDesc {
             orientation_map: None,
             default_bond_health: 1.0,
             default_tension_limit: 10.0,
+            default_compression_limit: 10.0,
             default_shear_limit: 10.0,
         }
     }
@@ -485,6 +488,7 @@ impl FxAsset {
         asset.internal_bonds = asset.generate_internal_bonds(
             desc.default_bond_health,
             desc.default_tension_limit,
+            desc.default_compression_limit,
             desc.default_shear_limit,
         )?;
         asset.validate()?;
@@ -587,6 +591,7 @@ impl FxAsset {
             if !valid_vec2(bond.centroid)
                 || !valid_runtime_scalar(bond.base_health)
                 || !valid_runtime_scalar(bond.tension_limit)
+                || !valid_runtime_scalar(bond.compression_limit)
                 || !valid_runtime_scalar(bond.shear_limit)
             {
                 return Err(ValidationError::InvalidBondScalar(bond.id));
@@ -606,6 +611,7 @@ impl FxAsset {
         &self,
         base_health: f32,
         tension_limit: f32,
+        compression_limit: f32,
         shear_limit: f32,
     ) -> Result<Vec<Bond2D>, ValidationError> {
         let mut grouped: BTreeMap<
@@ -684,6 +690,7 @@ impl FxAsset {
                     length: edges.len() as f32 * self.voxel_size,
                     base_health,
                     tension_limit,
+                    compression_limit,
                     shear_limit,
                     material_pair,
                     interface_edges: edges,
@@ -768,6 +775,7 @@ pub struct ExternalBond2D {
     pub tangent: Vec2,
     pub base_health: f32,
     pub tension_limit: f32,
+    pub compression_limit: f32,
     pub shear_limit: f32,
     pub runtime: BondRuntimeState,
 }
@@ -783,6 +791,7 @@ pub struct DynamicStructuralBond2D {
     pub tangent: Vec2,
     pub base_health: f32,
     pub tension_limit: f32,
+    pub compression_limit: f32,
     pub shear_limit: f32,
     pub runtime: BondRuntimeState,
 }
@@ -797,6 +806,7 @@ pub struct StaticAnchorDesc {
     pub health: f32,
     pub effective_length: f32,
     pub tension_limit: f32,
+    pub compression_limit: f32,
     pub shear_limit: f32,
 }
 
@@ -810,6 +820,7 @@ pub struct DynamicStructuralBondDesc {
     pub health: f32,
     pub effective_length: f32,
     pub tension_limit: f32,
+    pub compression_limit: f32,
     pub shear_limit: f32,
 }
 
@@ -1040,6 +1051,7 @@ impl FxFamily {
             desc.health,
             desc.effective_length,
             desc.tension_limit,
+            desc.compression_limit,
             desc.shear_limit,
         )
         .map_err(|_| ConnectionError::InvalidExternalBondRuntime(desc.id))?;
@@ -1061,6 +1073,7 @@ impl FxFamily {
                 tangent,
                 base_health: desc.health,
                 tension_limit: desc.tension_limit,
+                compression_limit: desc.compression_limit,
                 shear_limit: desc.shear_limit,
                 runtime: BondRuntimeState {
                     health: desc.health,
@@ -1088,6 +1101,7 @@ impl FxFamily {
             desc.health,
             desc.effective_length,
             desc.tension_limit,
+            desc.compression_limit,
             desc.shear_limit,
         )
         .map_err(|_| ConnectionError::InvalidConnectionRuntime(desc.id))?;
@@ -1115,6 +1129,7 @@ impl FxFamily {
                 tangent,
                 base_health: desc.health,
                 tension_limit: desc.tension_limit,
+                compression_limit: desc.compression_limit,
                 shear_limit: desc.shear_limit,
                 runtime: BondRuntimeState {
                     health: desc.health,
@@ -1235,6 +1250,7 @@ impl FxFamily {
             hasher.write_u32(bond.node_b.0);
             hasher.write_f32(bond.length);
             hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.compression_limit);
             hasher.write_f32(bond.shear_limit);
             for edge in &bond.interface_edges {
                 hasher.write_u32(edge.start.x);
@@ -1300,6 +1316,7 @@ impl FxFamily {
             hasher.write_f32(bond.tangent.y);
             hasher.write_f32(bond.base_health);
             hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.compression_limit);
             hasher.write_f32(bond.shear_limit);
             hasher.write_f32(bond.runtime.health);
             hasher.write_f32(bond.runtime.effective_length);
@@ -1321,6 +1338,7 @@ impl FxFamily {
             hasher.write_f32(bond.tangent.y);
             hasher.write_f32(bond.base_health);
             hasher.write_f32(bond.tension_limit);
+            hasher.write_f32(bond.compression_limit);
             hasher.write_f32(bond.shear_limit);
             hasher.write_f32(bond.runtime.health);
             hasher.write_f32(bond.runtime.effective_length);
@@ -2163,10 +2181,26 @@ impl StressContext2D {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StressFailureMode2D {
+    Tension,
+    Compression,
+    Shear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionDamageMode2D {
+    Ignore,
+    DamageOnly,
+    Break,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StressSettings {
     pub tension_limit_scale: f32,
+    pub compression_limit_scale: f32,
     pub shear_limit_scale: f32,
+    pub compression_damage_mode: CompressionDamageMode2D,
     pub damage_per_overload: f32,
     pub max_fractures_per_frame: u16,
     pub max_iterations: u16,
@@ -2178,7 +2212,9 @@ impl Default for StressSettings {
     fn default() -> Self {
         Self {
             tension_limit_scale: 1.0,
+            compression_limit_scale: 1.0,
             shear_limit_scale: 1.0,
+            compression_damage_mode: CompressionDamageMode2D::Ignore,
             damage_per_overload: 1.0,
             max_fractures_per_frame: u16::MAX,
             max_iterations: 8,
@@ -2251,6 +2287,64 @@ impl SignedStressLoad2D {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StressMaterialLimits2D {
+    tension: f32,
+    compression: f32,
+    shear: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StressFailureDecision2D {
+    mode: StressFailureMode2D,
+    overload_ratio: f32,
+}
+
+fn stress_overload_mode_2d(
+    load: SignedStressLoad2D,
+    limits: StressMaterialLimits2D,
+    compression_damage_mode: CompressionDamageMode2D,
+) -> Option<StressFailureDecision2D> {
+    let candidates = [
+        (StressFailureMode2D::Tension, load.tension, limits.tension),
+        (
+            StressFailureMode2D::Compression,
+            load.compression,
+            limits.compression,
+        ),
+        (StressFailureMode2D::Shear, load.shear, limits.shear),
+    ];
+    let mut best = None;
+    for (mode, load, limit) in candidates {
+        if mode == StressFailureMode2D::Compression
+            && compression_damage_mode == CompressionDamageMode2D::Ignore
+        {
+            continue;
+        }
+        let Some(overload_ratio) = stress_overload_ratio(load, limit) else {
+            continue;
+        };
+        if best.is_none_or(|best: StressFailureDecision2D| overload_ratio > best.overload_ratio) {
+            best = Some(StressFailureDecision2D {
+                mode,
+                overload_ratio,
+            });
+        }
+    }
+    best
+}
+
+fn stress_overload_ratio(load: f32, limit: f32) -> Option<f32> {
+    if load <= limit {
+        return None;
+    }
+    Some(if limit > 0.0 {
+        load / limit
+    } else {
+        f32::INFINITY
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum StressEdgeKind {
     Internal,
@@ -2280,6 +2374,7 @@ struct StressGraphEdge {
     tangent: Vec2,
     base_health: f32,
     tension_limit: f32,
+    compression_limit: f32,
     shear_limit: f32,
     effective_length: f32,
     health: f32,
@@ -2478,11 +2573,31 @@ impl StressSolver2D {
             };
             let tension_limit =
                 edge.tension_limit * self.settings.tension_limit_scale * health_ratio.max(0.001);
+            let compression_limit = edge.compression_limit
+                * self.settings.compression_limit_scale
+                * health_ratio.max(0.001);
             let shear_limit =
                 edge.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
-            if signed_load.tension <= tension_limit && signed_load.shear <= shear_limit {
+            let Some(failure) = stress_overload_mode_2d(
+                signed_load,
+                StressMaterialLimits2D {
+                    tension: tension_limit,
+                    compression: compression_limit,
+                    shear: shear_limit,
+                },
+                self.settings.compression_damage_mode,
+            ) else {
                 continue;
-            }
+            };
+            let effective_length_loss = match failure.mode {
+                StressFailureMode2D::Tension => edge.effective_length,
+                StressFailureMode2D::Shear => 0.0,
+                StressFailureMode2D::Compression => match self.settings.compression_damage_mode {
+                    CompressionDamageMode2D::Ignore => continue,
+                    CompressionDamageMode2D::DamageOnly => 0.0,
+                    CompressionDamageMode2D::Break => edge.effective_length,
+                },
+            };
             commands_by_actor
                 .entry(actor)
                 .or_default()
@@ -2495,11 +2610,7 @@ impl StressSolver2D {
                         StressEdgeTarget::Connection(id) => FractureTarget::Connection(id),
                     },
                     health_loss: self.settings.damage_per_overload,
-                    effective_length_loss: if signed_load.tension > tension_limit {
-                        edge.effective_length
-                    } else {
-                        0.0
-                    },
+                    effective_length_loss,
                     source: *source_by_actor.get(&actor).unwrap_or(&DamageSource::Stress),
                 });
         }
@@ -2816,6 +2927,7 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             tangent: bond.tangent,
             base_health: bond.base_health,
             tension_limit: bond.tension_limit,
+            compression_limit: bond.compression_limit,
             shear_limit: bond.shear_limit,
             effective_length: bond.length,
             health: state.health,
@@ -2839,6 +2951,7 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             tangent: bond.tangent,
             base_health: bond.base_health,
             tension_limit: bond.tension_limit,
+            compression_limit: bond.compression_limit,
             shear_limit: bond.shear_limit,
             effective_length: bond.runtime.effective_length,
             health: bond.runtime.health,
@@ -2861,6 +2974,7 @@ fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<Str
             tangent: bond.tangent,
             base_health: bond.base_health,
             tension_limit: bond.tension_limit,
+            compression_limit: bond.compression_limit,
             shear_limit: bond.shear_limit,
             effective_length: bond.runtime.effective_length,
             health: bond.runtime.health,
@@ -3539,11 +3653,13 @@ fn validate_connection_scalars(
     health: f32,
     effective_length: f32,
     tension_limit: f32,
+    compression_limit: f32,
     shear_limit: f32,
 ) -> Result<(), ()> {
     if valid_runtime_scalar(health)
         && valid_runtime_scalar(effective_length)
         && valid_runtime_scalar(tension_limit)
+        && valid_runtime_scalar(compression_limit)
         && valid_runtime_scalar(shear_limit)
     {
         Ok(())
@@ -3603,6 +3719,22 @@ mod tests {
         tension_limit: f32,
         shear_limit: f32,
     ) -> FxAsset {
+        asset_from_rows_with_material_limits(
+            rows,
+            node_ids,
+            tension_limit,
+            tension_limit,
+            shear_limit,
+        )
+    }
+
+    fn asset_from_rows_with_material_limits(
+        rows: &[&str],
+        node_ids: &[Option<u32>],
+        tension_limit: f32,
+        compression_limit: f32,
+        shear_limit: f32,
+    ) -> FxAsset {
         let occupancy = DenseOccupancy::from_rows(rows).unwrap();
         let mut desc = FxAssetDesc::new(
             FxAssetId(7),
@@ -3612,6 +3744,7 @@ mod tests {
         );
         desc.default_bond_health = 10.0;
         desc.default_tension_limit = tension_limit;
+        desc.default_compression_limit = compression_limit;
         desc.default_shear_limit = shear_limit;
         FxAsset::from_desc(desc).unwrap()
     }
@@ -3637,6 +3770,7 @@ mod tests {
             health: 1.0,
             effective_length: 1.0,
             tension_limit: 0.01,
+            compression_limit: 0.01,
             shear_limit: 0.01,
         }
     }
@@ -3651,6 +3785,7 @@ mod tests {
             health: 1.0,
             effective_length: 1.0,
             tension_limit: 0.01,
+            compression_limit: 0.01,
             shear_limit: 0.01,
         }
     }
@@ -3741,6 +3876,19 @@ mod tests {
         assert_eq!(bond.node_b, SupportNodeId(1));
         assert_eq!(bond.interface_edges.len(), 2);
         assert_eq!(bond.length, 2.0);
+        assert_eq!(bond.compression_limit, bond.tension_limit);
+    }
+
+    #[test]
+    fn internal_bond_validation_rejects_invalid_compression_limit() {
+        let occupancy = DenseOccupancy::from_rows(&["##"]).unwrap();
+        let mut desc = FxAssetDesc::new(FxAssetId(1), 1.0, occupancy, map(2, &[Some(0), Some(1)]));
+        desc.default_compression_limit = -1.0;
+
+        assert_eq!(
+            FxAsset::from_desc(desc).unwrap_err(),
+            ValidationError::InvalidBondScalar(BondId(0))
+        );
     }
 
     #[test]
@@ -4060,6 +4208,132 @@ mod tests {
         };
         let commands = solver.generate(&family, &[input]);
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn stress_compression_damage_only_generates_health_loss() {
+        let mut family = family_for(asset_from_rows_with_material_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            100.0,
+            5.0,
+            100.0,
+        ));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            compression_damage_mode: CompressionDamageMode2D::DamageOnly,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-10.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+        assert_eq!(commands[0].health_loss, 0.25);
+        assert_eq!(commands[0].effective_length_loss, 0.0);
+
+        let events = apply_fracture_commands(&mut family, &commands);
+        assert_eq!(events.len(), 1);
+        assert_eq!(family.bond_state(BondId(0)).unwrap().health, 9.75);
+        assert_eq!(family.bond_state(BondId(0)).unwrap().effective_length, 1.0);
+    }
+
+    #[test]
+    fn stress_compression_break_generates_effective_length_loss() {
+        let family = family_for(asset_from_rows_with_material_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            100.0,
+            5.0,
+            100.0,
+        ));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            compression_damage_mode: CompressionDamageMode2D::Break,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-10.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+        assert_eq!(commands[0].health_loss, 0.25);
+        assert_eq!(commands[0].effective_length_loss, 1.0);
+    }
+
+    #[test]
+    fn stress_mixed_helper_uses_highest_overload_ratio() {
+        let failure = stress_overload_mode_2d(
+            SignedStressLoad2D {
+                tension: 12.0,
+                compression: 21.0,
+                shear: 30.0,
+            },
+            StressMaterialLimits2D {
+                tension: 10.0,
+                compression: 5.0,
+                shear: 10.0,
+            },
+            CompressionDamageMode2D::Break,
+        )
+        .unwrap();
+        assert_eq!(failure.mode, StressFailureMode2D::Compression);
+        assert_eq!(failure.overload_ratio, 4.2);
+
+        let failure = stress_overload_mode_2d(
+            SignedStressLoad2D {
+                tension: 12.0,
+                compression: 21.0,
+                shear: 30.0,
+            },
+            StressMaterialLimits2D {
+                tension: 10.0,
+                compression: 5.0,
+                shear: 10.0,
+            },
+            CompressionDamageMode2D::Ignore,
+        )
+        .unwrap();
+        assert_eq!(failure.mode, StressFailureMode2D::Shear);
+        assert_eq!(failure.overload_ratio, 3.0);
+
+        let family = family_for(asset_from_rows_with_material_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            10.0,
+            5.0,
+            10.0,
+        ));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            compression_damage_mode: CompressionDamageMode2D::Ignore,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-21.0, 12.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+        assert_eq!(commands[0].health_loss, 0.25);
+        assert_eq!(commands[0].effective_length_loss, 0.0);
     }
 
     #[test]
@@ -5273,6 +5547,37 @@ mod tests {
     }
 
     #[test]
+    fn static_anchor_compression_damage_only_consumes_external_limit() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            compression_damage_mode: CompressionDamageMode2D::DamageOnly,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-1.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        assert_eq!(commands[0].effective_length_loss, 0.0);
+        apply_fracture_commands(&mut family, &commands);
+        assert_eq!(family.external_bond_state(anchor).unwrap().health, 0.75);
+        assert_eq!(
+            family.external_bond_state(anchor).unwrap().effective_length,
+            1.0
+        );
+    }
+
+    #[test]
     fn static_external_bonds_keep_world_bound_fragments_grouped() {
         for (idx, kind) in [
             ExternalTargetKind::World,
@@ -5560,6 +5865,12 @@ mod tests {
             family.connect_static_anchor(invalid_anchor).unwrap_err(),
             ConnectionError::InvalidExternalBondRuntime(ExternalBondId(1))
         );
+        let mut invalid_anchor = static_anchor_desc(1, 0);
+        invalid_anchor.compression_limit = -1.0;
+        assert_eq!(
+            family.connect_static_anchor(invalid_anchor).unwrap_err(),
+            ConnectionError::InvalidExternalBondRuntime(ExternalBondId(1))
+        );
         family
             .connect_static_anchor(static_anchor_desc(1, 0))
             .unwrap();
@@ -5578,6 +5889,14 @@ mod tests {
         );
         let mut invalid_dynamic = dynamic_graph_only_desc(2, 0, 1);
         invalid_dynamic.effective_length = -1.0;
+        assert_eq!(
+            family
+                .connect_dynamic_structural_bond_graph_only(invalid_dynamic)
+                .unwrap_err(),
+            ConnectionError::InvalidConnectionRuntime(ConnectionId(2))
+        );
+        let mut invalid_dynamic = dynamic_graph_only_desc(2, 0, 1);
+        invalid_dynamic.compression_limit = -1.0;
         assert_eq!(
             family
                 .connect_dynamic_structural_bond_graph_only(invalid_dynamic)
@@ -5774,6 +6093,54 @@ mod tests {
             ],
         );
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn graph_only_connection_compression_break_consumes_dynamic_limit() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(8, 0, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            compression_damage_mode: CompressionDamageMode2D::Break,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(-1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Connection(connection));
+        assert_eq!(commands[0].effective_length_loss, 1.0);
     }
 
     #[test]

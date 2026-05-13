@@ -2428,6 +2428,9 @@ fn validate_stress_snapshot(snapshot: StressSettingsSnapshot) -> Result<(), FxRa
     {
         return Err(FxRapierSnapshotError::InvalidValue("stress").into());
     }
+    if !snapshot.compression_limit_scale.is_finite() || snapshot.compression_limit_scale < 0.0 {
+        return Err(FxRapierSnapshotError::InvalidValue("stress.compression_limit_scale").into());
+    }
     Ok(())
 }
 

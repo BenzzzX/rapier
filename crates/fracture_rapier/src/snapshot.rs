@@ -1,5 +1,6 @@
 use fracture_core::{
-    FxActorId, FxFamilyId, GridCoord, StressSettings, SupportNodeId, snapshot::SnapshotMode,
+    CompressionDamageMode2D, FxActorId, FxFamilyId, GridCoord, StressSettings, SupportNodeId,
+    snapshot::SnapshotMode,
 };
 use rapier2d::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use crate::connect_api::StaticAnchorBodyPolicy;
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -226,6 +227,8 @@ pub struct IntegrationSnapshot {
 pub struct StressSettingsSnapshot {
     pub tension_limit_scale: f32,
     pub shear_limit_scale: f32,
+    pub compression_limit_scale: f32,
+    pub compression_damage_mode: CompressionDamageMode2D,
     pub damage_per_overload: f32,
     pub max_fractures_per_frame: u16,
     pub max_iterations: u16,
@@ -238,6 +241,8 @@ impl From<StressSettings> for StressSettingsSnapshot {
         Self {
             tension_limit_scale: value.tension_limit_scale,
             shear_limit_scale: value.shear_limit_scale,
+            compression_limit_scale: value.compression_limit_scale,
+            compression_damage_mode: value.compression_damage_mode,
             damage_per_overload: value.damage_per_overload,
             max_fractures_per_frame: value.max_fractures_per_frame,
             max_iterations: value.max_iterations,
@@ -252,6 +257,8 @@ impl From<StressSettingsSnapshot> for StressSettings {
         Self {
             tension_limit_scale: value.tension_limit_scale,
             shear_limit_scale: value.shear_limit_scale,
+            compression_limit_scale: value.compression_limit_scale,
+            compression_damage_mode: value.compression_damage_mode,
             damage_per_overload: value.damage_per_overload,
             max_fractures_per_frame: value.max_fractures_per_frame,
             max_iterations: value.max_iterations,
@@ -586,6 +593,8 @@ fn write_stress(
 ) -> Result<(), FxRapierSnapshotError> {
     writer.f32(settings.tension_limit_scale)?;
     writer.f32(settings.shear_limit_scale)?;
+    writer.f32(settings.compression_limit_scale)?;
+    write_compression_damage_mode(writer, settings.compression_damage_mode);
     writer.f32(settings.damage_per_overload)?;
     writer.u16(settings.max_fractures_per_frame);
     writer.u16(settings.max_iterations);
@@ -598,6 +607,8 @@ fn read_stress(reader: &mut Reader<'_>) -> Result<StressSettingsSnapshot, FxRapi
     let settings = StressSettingsSnapshot {
         tension_limit_scale: reader.f32("stress.tension_limit_scale")?,
         shear_limit_scale: reader.f32("stress.shear_limit_scale")?,
+        compression_limit_scale: reader.f32("stress.compression_limit_scale")?,
+        compression_damage_mode: read_compression_damage_mode(reader)?,
         damage_per_overload: reader.f32("stress.damage_per_overload")?,
         max_fractures_per_frame: reader.u16("stress.max_fractures_per_frame")?,
         max_iterations: reader.u16("stress.max_iterations")?,
@@ -609,6 +620,27 @@ fn read_stress(reader: &mut Reader<'_>) -> Result<StressSettingsSnapshot, FxRapi
         },
     };
     Ok(settings)
+}
+
+fn write_compression_damage_mode(writer: &mut Writer, mode: CompressionDamageMode2D) {
+    writer.u8(match mode {
+        CompressionDamageMode2D::Ignore => 0,
+        CompressionDamageMode2D::DamageOnly => 1,
+        CompressionDamageMode2D::Break => 2,
+    });
+}
+
+fn read_compression_damage_mode(
+    reader: &mut Reader<'_>,
+) -> Result<CompressionDamageMode2D, FxRapierSnapshotError> {
+    match reader.u8("stress.compression_damage_mode")? {
+        0 => Ok(CompressionDamageMode2D::Ignore),
+        1 => Ok(CompressionDamageMode2D::DamageOnly),
+        2 => Ok(CompressionDamageMode2D::Break),
+        _ => Err(FxRapierSnapshotError::InvalidValue(
+            "stress.compression_damage_mode",
+        )),
+    }
 }
 
 fn write_handle(writer: &mut Writer, handle: (u32, u32)) {

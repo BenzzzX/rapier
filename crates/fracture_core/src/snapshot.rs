@@ -6,7 +6,7 @@ use super::*;
 
 const MAGIC_ASSET: [u8; 8] = *b"RFXSCA\0\0";
 const MAGIC_FAMILY: [u8; 8] = *b"RFXSCF\0\0";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const DIMENSION_2D: u8 = 2;
 const SCALAR_F32: u8 = 4;
 const HEADER_LEN: usize = 34;
@@ -156,6 +156,7 @@ pub(crate) fn write_asset_payload(
         writer.f32(bond.length, "bond.length")?;
         writer.f32(bond.base_health, "bond.base_health")?;
         writer.f32(bond.tension_limit, "bond.tension_limit")?;
+        writer.f32(bond.compression_limit, "bond.compression_limit")?;
         writer.f32(bond.shear_limit, "bond.shear_limit")?;
         writer.u16(bond.material_pair.0);
         writer.u16(bond.material_pair.1);
@@ -260,6 +261,7 @@ pub(crate) fn read_asset_payload(reader: &mut Reader<'_>) -> Result<FxAsset, FxC
         let length = reader.f32("bond.length")?;
         let base_health = reader.f32("bond.base_health")?;
         let tension_limit = reader.f32("bond.tension_limit")?;
+        let compression_limit = reader.f32("bond.compression_limit")?;
         let shear_limit = reader.f32("bond.shear_limit")?;
         let material_pair = (
             reader.u16("bond.material_pair.0")?,
@@ -283,6 +285,7 @@ pub(crate) fn read_asset_payload(reader: &mut Reader<'_>) -> Result<FxAsset, FxC
             length,
             base_health,
             tension_limit,
+            compression_limit,
             shear_limit,
             material_pair,
             interface_edges,
@@ -353,6 +356,7 @@ pub(crate) fn write_family_payload(
         write_vec2(writer, bond.tangent, "external_bond.tangent")?;
         writer.f32(bond.base_health, "external_bond.base_health")?;
         writer.f32(bond.tension_limit, "external_bond.tension_limit")?;
+        writer.f32(bond.compression_limit, "external_bond.compression_limit")?;
         writer.f32(bond.shear_limit, "external_bond.shear_limit")?;
         write_bond_state(writer, &bond.runtime)?;
     }
@@ -371,6 +375,7 @@ pub(crate) fn write_family_payload(
         write_vec2(writer, bond.tangent, "dynamic_bond.tangent")?;
         writer.f32(bond.base_health, "dynamic_bond.base_health")?;
         writer.f32(bond.tension_limit, "dynamic_bond.tension_limit")?;
+        writer.f32(bond.compression_limit, "dynamic_bond.compression_limit")?;
         writer.f32(bond.shear_limit, "dynamic_bond.shear_limit")?;
         write_bond_state(writer, &bond.runtime)?;
     }
@@ -454,6 +459,7 @@ pub(crate) fn read_family_payload(
             tangent: read_vec2(reader, "external_bond.tangent")?,
             base_health: reader.f32("external_bond.base_health")?,
             tension_limit: reader.f32("external_bond.tension_limit")?,
+            compression_limit: reader.f32("external_bond.compression_limit")?,
             shear_limit: reader.f32("external_bond.shear_limit")?,
             runtime: read_bond_state(reader)?,
         };
@@ -485,6 +491,7 @@ pub(crate) fn read_family_payload(
             tangent: read_vec2(reader, "dynamic_bond.tangent")?,
             base_health: reader.f32("dynamic_bond.base_health")?,
             tension_limit: reader.f32("dynamic_bond.tension_limit")?,
+            compression_limit: reader.f32("dynamic_bond.compression_limit")?,
             shear_limit: reader.f32("dynamic_bond.shear_limit")?,
             runtime: read_bond_state(reader)?,
         };
@@ -770,6 +777,7 @@ fn validate_asset_finite(asset: &FxAsset) -> Result<(), FxCoreSnapshotError> {
             || !valid_runtime_scalar(bond.length)
             || !valid_runtime_scalar(bond.base_health)
             || !valid_runtime_scalar(bond.tension_limit)
+            || !valid_runtime_scalar(bond.compression_limit)
             || !valid_runtime_scalar(bond.shear_limit)
         {
             return Err(FxCoreSnapshotError::InvalidValue("bond"));
@@ -794,6 +802,7 @@ fn validate_external_bond(bond: &ExternalBond2D) -> Result<(), FxCoreSnapshotErr
         || !valid_vec2(bond.tangent)
         || !valid_runtime_scalar(bond.base_health)
         || !valid_runtime_scalar(bond.tension_limit)
+        || !valid_runtime_scalar(bond.compression_limit)
         || !valid_runtime_scalar(bond.shear_limit)
     {
         return Err(FxCoreSnapshotError::InvalidValue("external_bond"));
@@ -813,6 +822,7 @@ fn validate_dynamic_bond(bond: &DynamicStructuralBond2D) -> Result<(), FxCoreSna
         || !valid_vec2(bond.tangent)
         || !valid_runtime_scalar(bond.base_health)
         || !valid_runtime_scalar(bond.tension_limit)
+        || !valid_runtime_scalar(bond.compression_limit)
         || !valid_runtime_scalar(bond.shear_limit)
     {
         return Err(FxCoreSnapshotError::InvalidValue("dynamic_bond"));
@@ -1135,14 +1145,27 @@ mod tests {
     use super::*;
 
     fn asset_from_rows(rows: &[&str], map: &[Option<u32>]) -> FxAsset {
+        asset_from_rows_with_limits(rows, map, 10.0, 10.0, 10.0)
+    }
+
+    fn asset_from_rows_with_limits(
+        rows: &[&str],
+        map: &[Option<u32>],
+        tension_limit: f32,
+        compression_limit: f32,
+        shear_limit: f32,
+    ) -> FxAsset {
         let occupancy = DenseOccupancy::from_rows(rows).unwrap();
-        FxAsset::from_desc(FxAssetDesc::new(
+        let mut desc = FxAssetDesc::new(
             FxAssetId(7),
             1.0,
             occupancy,
             map.iter().map(|id| id.map(SupportNodeId)).collect(),
-        ))
-        .unwrap()
+        );
+        desc.default_tension_limit = tension_limit;
+        desc.default_compression_limit = compression_limit;
+        desc.default_shear_limit = shear_limit;
+        FxAsset::from_desc(desc).unwrap()
     }
 
     fn non_leaf_support_asset() -> FxAsset {
@@ -1217,7 +1240,8 @@ mod tests {
 
     #[test]
     fn core_snapshot_roundtrip_preserves_digest_and_allocator_state() {
-        let asset = asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]);
+        let asset =
+            asset_from_rows_with_limits(&["###"], &[Some(0), Some(1), Some(2)], 11.0, 17.0, 23.0);
         let mut family = FxFamily::instantiate(FxFamilyId(3), asset);
         apply_fracture_commands(
             &mut family,
@@ -1238,11 +1262,110 @@ mod tests {
         );
         let split_events = split_dirty_actors(&mut family);
         assert_eq!(split_events.len(), 1);
+        let external_id = family
+            .connect_static_anchor(StaticAnchorDesc {
+                id: ExternalBondId(5),
+                node: SupportNodeId(2),
+                target: ExternalTarget2D {
+                    kind: ExternalTargetKind::World,
+                    token: ExternalTargetToken(0),
+                },
+                anchor: Vec2::new(2.5, 0.5),
+                normal: Vec2::new(1.0, 0.0),
+                health: 1.0,
+                effective_length: 1.0,
+                tension_limit: 31.0,
+                compression_limit: 37.0,
+                shear_limit: 41.0,
+            })
+            .unwrap();
+        let dynamic_id = family
+            .connect_dynamic_structural_bond_graph_only(DynamicStructuralBondDesc {
+                id: ConnectionId(9),
+                node_a: SupportNodeId(0),
+                node_b: SupportNodeId(2),
+                centroid: Vec2::new(1.5, 0.5),
+                normal: Vec2::new(1.0, 0.0),
+                health: 1.0,
+                effective_length: 1.0,
+                tension_limit: 43.0,
+                compression_limit: 47.0,
+                shear_limit: 53.0,
+            })
+            .unwrap();
         let digest = family.deterministic_state_digest();
+        let mut digest_probe = family.clone();
+        digest_probe.asset.internal_bonds[0].compression_limit = 19.0;
+        assert_ne!(digest_probe.deterministic_state_digest(), digest);
+        let mut digest_probe = family.clone();
+        digest_probe
+            .external_bonds
+            .get_mut(&external_id)
+            .unwrap()
+            .compression_limit = 39.0;
+        assert_ne!(digest_probe.deterministic_state_digest(), digest);
+        let mut digest_probe = family.clone();
+        digest_probe
+            .dynamic_structural_bonds
+            .get_mut(&dynamic_id)
+            .unwrap()
+            .compression_limit = 49.0;
+        assert_ne!(digest_probe.deterministic_state_digest(), digest);
         let bytes = family
             .to_snapshot_bytes(SnapshotMode::Deterministic)
             .unwrap();
         let mut restored = FxFamily::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restored.asset.internal_bonds[0].tension_limit, 11.0);
+        assert_eq!(restored.asset.internal_bonds[0].compression_limit, 17.0);
+        assert_eq!(restored.asset.internal_bonds[0].shear_limit, 23.0);
+        assert_eq!(
+            restored
+                .external_bonds
+                .get(&external_id)
+                .unwrap()
+                .tension_limit,
+            31.0
+        );
+        assert_eq!(
+            restored
+                .external_bonds
+                .get(&external_id)
+                .unwrap()
+                .compression_limit,
+            37.0
+        );
+        assert_eq!(
+            restored
+                .external_bonds
+                .get(&external_id)
+                .unwrap()
+                .shear_limit,
+            41.0
+        );
+        assert_eq!(
+            restored
+                .dynamic_structural_bonds
+                .get(&dynamic_id)
+                .unwrap()
+                .tension_limit,
+            43.0
+        );
+        assert_eq!(
+            restored
+                .dynamic_structural_bonds
+                .get(&dynamic_id)
+                .unwrap()
+                .compression_limit,
+            47.0
+        );
+        assert_eq!(
+            restored
+                .dynamic_structural_bonds
+                .get(&dynamic_id)
+                .unwrap()
+                .shear_limit,
+            53.0
+        );
         assert_eq!(restored.deterministic_state_digest(), digest);
 
         let events = apply_fracture_commands(
@@ -1548,6 +1671,7 @@ mod tests {
                 health: 1.0,
                 effective_length: 1.0,
                 tension_limit: 1.0,
+                compression_limit: 1.0,
                 shear_limit: 1.0,
             })
             .unwrap();
@@ -1586,6 +1710,7 @@ mod tests {
                 health: 1.0,
                 effective_length: 1.0,
                 tension_limit: 1.0,
+                compression_limit: 1.0,
                 shear_limit: 1.0,
             })
             .unwrap();

@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
 use fracture_core::{
-    BondId, CommandId, ConnectionError, ConnectionId, DamageSource, DeterministicOrderKey,
-    DynamicConnectionPolicy, DynamicStructuralBondDesc, ExternalBondId, ExternalTarget2D,
-    ExternalTargetKind, ExternalTargetToken, FractureCommand, FractureTarget, FxActorId,
-    FxFamilyId, StaticAnchorDesc, StressInput, StressSettings, SupportNodeId, Vec2,
+    BondId, CommandId, CompressionDamageMode2D, ConnectionError, ConnectionId, DamageSource,
+    DeterministicOrderKey, DynamicConnectionPolicy, DynamicStructuralBondDesc, ExternalBondId,
+    ExternalTarget2D, ExternalTargetKind, ExternalTargetToken, FractureCommand, FractureTarget,
+    FxActorId, FxFamilyId, StaticAnchorDesc, StressInput, StressSettings, SupportNodeId, Vec2,
     snapshot::SnapshotMode,
 };
 use fracture_voxel::{VoxelAuthoringInput, author_voxel_asset};
@@ -23,6 +23,15 @@ use crate::{
 fn set_deterministic_replay_mode(world: &mut FxRapierWorld2D) {
     world.set_snapshot_mode(SnapshotMode::Deterministic);
     world.set_lod_settings(ColliderLodSettings::disabled());
+}
+
+fn rewrite_snapshot_checksum(bytes: &mut [u8]) {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in &bytes[34..] {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    bytes[26..34].copy_from_slice(&hash.to_le_bytes());
 }
 
 fn two_node_asset(contact_material: u16) -> fracture_voxel::AuthoredVoxelAsset {
@@ -132,6 +141,7 @@ fn static_anchor_desc(id: u32, node: u32) -> StaticAnchorDesc {
         health: 1.0,
         effective_length: 1.0,
         tension_limit: 0.01,
+        compression_limit: 0.01,
         shear_limit: 0.01,
     }
 }
@@ -146,6 +156,7 @@ fn dynamic_graph_only_desc(id: u32, node_a: u32, node_b: u32) -> DynamicStructur
         health: 1.0,
         effective_length: 1.0,
         tension_limit: 0.01,
+        compression_limit: 0.01,
         shear_limit: 0.01,
     }
 }
@@ -1761,6 +1772,8 @@ fn snapshot_restore_stress_settings() {
     world.set_stress_settings(StressSettings {
         tension_limit_scale: 0.5,
         shear_limit_scale: 0.25,
+        compression_limit_scale: 0.75,
+        compression_damage_mode: CompressionDamageMode2D::Break,
         damage_per_overload: 3.0,
         max_fractures_per_frame: 2,
         max_iterations: 6,
@@ -1774,6 +1787,46 @@ fn snapshot_restore_stress_settings() {
     let mut restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
     assert_eq!(restored.stress_settings(), world.stress_settings());
     restored.step().unwrap();
+}
+
+#[test]
+fn snapshot_restore_rejects_invalid_compression_limit_scale() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    let (_, mut snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    snapshot.stress.compression_limit_scale = -0.5;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("stress.compression_limit_scale")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_invalid_compression_damage_mode() {
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    let mut bytes = world.snapshot().unwrap();
+    const HEADER_LEN: usize = 34;
+    const STRESS_PAYLOAD_OFFSET: usize = 8 + 8 + (9 * 4) + (5 * 4);
+    const COMPRESSION_MODE_STRESS_OFFSET: usize = 4 + 4 + 4;
+    bytes[HEADER_LEN + STRESS_PAYLOAD_OFFSET + COMPRESSION_MODE_STRESS_OFFSET] = 99;
+    rewrite_snapshot_checksum(&mut bytes);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&bytes),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("stress.compression_damage_mode")
+        ))
+    ));
 }
 
 #[test]
