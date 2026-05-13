@@ -326,6 +326,50 @@ fn static_anchor_policy_moves_to_split_child() {
 }
 
 #[test]
+fn static_anchor_grouping_prevents_spurious_split() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(21, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(22, 3))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let actor = world.actor_handles(family, FxActorId(0)).unwrap();
+    assert!(world.rigid_bodies().get(actor.body).unwrap().is_fixed());
+
+    let split = world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(1))],
+        )
+        .unwrap();
+
+    assert!(
+        split.is_empty(),
+        "fragments attached to the same live static target must remain one split island"
+    );
+    assert_eq!(world.family(family).unwrap().actor_count(), 1);
+    let actor = world.actor_handles(family, FxActorId(0)).unwrap();
+    assert!(
+        world.rigid_bodies().get(actor.body).unwrap().is_fixed(),
+        "no-split anchored actor must retain the requested static-anchor body policy"
+    );
+}
+
+#[test]
 fn broken_static_anchor_clears_body_policy() {
     let family = FxFamilyId(1);
     let mut world = FxRapierWorld2D::new();

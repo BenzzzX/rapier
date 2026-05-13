@@ -1859,6 +1859,7 @@ pub fn apply_fracture_commands(
                 if bond.runtime.is_broken() {
                     continue;
                 }
+                let node = bond.node;
                 let old_health = bond.runtime.health;
                 let old_effective_length = bond.runtime.effective_length;
                 bond.runtime.health = (bond.runtime.health - health_loss).max(0.0);
@@ -1867,6 +1868,11 @@ pub fn apply_fracture_commands(
                 bond.runtime.accumulated_damage += health_loss;
                 let new_health = bond.runtime.health;
                 let new_effective_length = bond.runtime.effective_length;
+                if bond.runtime.is_broken() {
+                    if let Some(actor) = family.node_owner.get(&node) {
+                        family.dirty_actors.insert(*actor);
+                    }
+                }
                 events.push(FractureEvent {
                     event_id: family.next_event_id(),
                     order_key: command.order_key,
@@ -2715,7 +2721,7 @@ fn actor_components(actor: &FxActor, family: &FxFamily) -> Vec<Vec<SupportNodeId
     let mut remaining: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
     let mut components = Vec::new();
     while let Some(start) = remaining.first().copied() {
-        let component = component_without_bond(actor, family, start, None);
+        let component = split_component_graph_walk(actor, family, start);
         for node in &component {
             remaining.remove(node);
         }
@@ -2723,6 +2729,68 @@ fn actor_components(actor: &FxActor, family: &FxFamily) -> Vec<Vec<SupportNodeId
     }
     components.sort_by_key(|nodes| nodes.first().copied().unwrap_or_default());
     components
+}
+
+fn split_component_graph_walk(
+    actor: &FxActor,
+    family: &FxFamily,
+    start: SupportNodeId,
+) -> Vec<SupportNodeId> {
+    let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([start]);
+    seen.insert(start);
+    while let Some(node) = queue.pop_front() {
+        for bond in &family.asset.internal_bonds {
+            if family
+                .bond_state(bond.id)
+                .is_none_or(BondRuntimeState::is_broken)
+            {
+                continue;
+            }
+            let Some(other) = bond.other(node) else {
+                continue;
+            };
+            if owned.contains(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+        for bond in family.dynamic_structural_bonds.values() {
+            if bond.policy != DynamicConnectionPolicy::GraphOnly || bond.runtime.is_broken() {
+                continue;
+            }
+            let other = if bond.node_a == node {
+                Some(bond.node_b)
+            } else if bond.node_b == node {
+                Some(bond.node_a)
+            } else {
+                None
+            };
+            let Some(other) = other else {
+                continue;
+            };
+            if owned.contains(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+        for target in family
+            .external_bonds
+            .values()
+            .filter(|bond| bond.node == node && !bond.runtime.is_broken())
+            .map(|bond| bond.target)
+        {
+            for bond in family.external_bonds.values() {
+                if bond.target != target || bond.runtime.is_broken() {
+                    continue;
+                }
+                let other = bond.node;
+                if owned.contains(&other) && seen.insert(other) {
+                    queue.push_back(other);
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
 }
 
 fn fragment_stats(nodes: &[SupportNodeId], asset: &FxAsset) -> (usize, f32, SupportNodeId) {
@@ -2899,6 +2967,38 @@ mod tests {
             effective_length: 1.0,
             tension_limit: 0.01,
             shear_limit: 0.01,
+        }
+    }
+
+    fn break_bond_command(
+        tick: u64,
+        family: FxFamilyId,
+        actor: FxActorId,
+        bond: BondId,
+    ) -> FractureCommand {
+        FractureCommand {
+            order_key: DeterministicOrderKey::new(tick, 1, family, actor, CommandId(tick as u32)),
+            actor,
+            target: FractureTarget::Bond(bond),
+            health_loss: 20.0,
+            effective_length_loss: 20.0,
+            source: DamageSource::Script,
+        }
+    }
+
+    fn break_external_bond_command(
+        tick: u64,
+        family: FxFamilyId,
+        actor: FxActorId,
+        bond: ExternalBondId,
+    ) -> FractureCommand {
+        FractureCommand {
+            order_key: DeterministicOrderKey::new(tick, 1, family, actor, CommandId(tick as u32)),
+            actor,
+            target: FractureTarget::ExternalBond(bond),
+            health_loss: 2.0,
+            effective_length_loss: 2.0,
+            source: DamageSource::Script,
         }
     }
 
@@ -4059,6 +4159,169 @@ mod tests {
         let commands = solver.generate(&family, &[input]);
         assert!(commands.is_empty());
         assert!(!family.external_bond_state(anchor).unwrap().is_broken());
+    }
+
+    #[test]
+    fn static_external_bonds_keep_world_bound_fragments_grouped() {
+        for (idx, kind) in [
+            ExternalTargetKind::World,
+            ExternalTargetKind::Static,
+            ExternalTargetKind::Kinematic,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+            let target = ExternalTarget2D {
+                kind,
+                token: ExternalTargetToken(0),
+            };
+            let mut anchor_a = static_anchor_desc(7 + idx as u32 * 2, 0);
+            anchor_a.target = target;
+            let mut anchor_b = static_anchor_desc(8 + idx as u32 * 2, 1);
+            anchor_b.target = target;
+            family.connect_static_anchor(anchor_a).unwrap();
+            family.connect_static_anchor(anchor_b).unwrap();
+            let family_id = family.id;
+            apply_fracture_commands(
+                &mut family,
+                &[break_bond_command(1, family_id, FxActorId(0), BondId(0))],
+            );
+
+            assert_eq!(
+                component_without_bond(
+                    family.actor(FxActorId(0)).unwrap(),
+                    &family,
+                    SupportNodeId(0),
+                    None,
+                ),
+                vec![SupportNodeId(0)],
+                "stress/internal component traversal must not cross external endpoints"
+            );
+            assert!(
+                split_dirty_actors(&mut family).is_empty(),
+                "live bonds to the same exact fixed target must keep split grouping connected"
+            );
+            assert_eq!(family.actor_count(), 1);
+            assert_eq!(
+                family.actor(FxActorId(0)).unwrap().owned_nodes,
+                vec![SupportNodeId(0), SupportNodeId(1)]
+            );
+        }
+    }
+
+    #[test]
+    fn broken_external_bond_does_not_group_actor() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let family_id = family.id;
+        apply_fracture_commands(
+            &mut family,
+            &[break_external_bond_command(
+                1,
+                family_id,
+                FxActorId(0),
+                ExternalBondId(8),
+            )],
+        );
+        assert!(
+            family
+                .external_bond_state(ExternalBondId(8))
+                .unwrap()
+                .is_broken()
+        );
+        apply_fracture_commands(
+            &mut family,
+            &[break_bond_command(2, family_id, FxActorId(0), BondId(0))],
+        );
+
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fragments,
+            vec![vec![SupportNodeId(0)], vec![SupportNodeId(1)]]
+        );
+        assert_eq!(events[0].created_children, vec![FxActorId(1)]);
+        assert_eq!(family.actor_count(), 2);
+    }
+
+    #[test]
+    fn breaking_external_bond_after_grouped_noop_marks_actor_dirty() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let family_id = family.id;
+        apply_fracture_commands(
+            &mut family,
+            &[break_bond_command(1, family_id, FxActorId(0), BondId(0))],
+        );
+
+        assert!(
+            split_dirty_actors(&mut family).is_empty(),
+            "same-target external anchors should make the first split pass a no-op"
+        );
+        assert!(!family.is_dirty(FxActorId(0)));
+        assert_eq!(family.actor_count(), 1);
+
+        apply_fracture_commands(
+            &mut family,
+            &[break_external_bond_command(
+                2,
+                family_id,
+                FxActorId(0),
+                ExternalBondId(8),
+            )],
+        );
+        assert!(
+            family.is_dirty(FxActorId(0)),
+            "breaking the external topology edge must requeue the owning actor for split"
+        );
+
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fragments,
+            vec![vec![SupportNodeId(0)], vec![SupportNodeId(1)]]
+        );
+        assert_eq!(events[0].created_children, vec![FxActorId(1)]);
+        assert_eq!(family.actor_count(), 2);
+    }
+
+    #[test]
+    fn different_external_targets_do_not_group() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let mut other_target = static_anchor_desc(8, 1);
+        other_target.target = ExternalTarget2D {
+            kind: ExternalTargetKind::World,
+            token: ExternalTargetToken(1),
+        };
+        family.connect_static_anchor(other_target).unwrap();
+        let family_id = family.id;
+        apply_fracture_commands(
+            &mut family,
+            &[break_bond_command(1, family_id, FxActorId(0), BondId(0))],
+        );
+
+        let events = split_dirty_actors(&mut family);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fragments,
+            vec![vec![SupportNodeId(0)], vec![SupportNodeId(1)]],
+            "external target grouping must use full ExternalTarget2D equality, including token"
+        );
+        assert_eq!(family.actor_count(), 2);
     }
 
     #[test]
