@@ -11,7 +11,7 @@ use crate::connect_api::StaticAnchorBodyPolicy;
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -228,6 +228,9 @@ pub struct StressSettingsSnapshot {
     pub shear_limit_scale: f32,
     pub damage_per_overload: f32,
     pub max_fractures_per_frame: u16,
+    pub max_iterations: u16,
+    pub convergence_epsilon: f32,
+    pub enable_gravity: bool,
 }
 
 impl From<StressSettings> for StressSettingsSnapshot {
@@ -237,6 +240,9 @@ impl From<StressSettings> for StressSettingsSnapshot {
             shear_limit_scale: value.shear_limit_scale,
             damage_per_overload: value.damage_per_overload,
             max_fractures_per_frame: value.max_fractures_per_frame,
+            max_iterations: value.max_iterations,
+            convergence_epsilon: value.convergence_epsilon,
+            enable_gravity: value.enable_gravity,
         }
     }
 }
@@ -248,6 +254,9 @@ impl From<StressSettingsSnapshot> for StressSettings {
             shear_limit_scale: value.shear_limit_scale,
             damage_per_overload: value.damage_per_overload,
             max_fractures_per_frame: value.max_fractures_per_frame,
+            max_iterations: value.max_iterations,
+            convergence_epsilon: value.convergence_epsilon,
+            enable_gravity: value.enable_gravity,
         }
     }
 }
@@ -579,16 +588,27 @@ fn write_stress(
     writer.f32(settings.shear_limit_scale)?;
     writer.f32(settings.damage_per_overload)?;
     writer.u16(settings.max_fractures_per_frame);
+    writer.u16(settings.max_iterations);
+    writer.f32(settings.convergence_epsilon)?;
+    writer.u8(u8::from(settings.enable_gravity));
     Ok(())
 }
 
 fn read_stress(reader: &mut Reader<'_>) -> Result<StressSettingsSnapshot, FxRapierSnapshotError> {
-    Ok(StressSettingsSnapshot {
+    let settings = StressSettingsSnapshot {
         tension_limit_scale: reader.f32("stress.tension_limit_scale")?,
         shear_limit_scale: reader.f32("stress.shear_limit_scale")?,
         damage_per_overload: reader.f32("stress.damage_per_overload")?,
         max_fractures_per_frame: reader.u16("stress.max_fractures_per_frame")?,
-    })
+        max_iterations: reader.u16("stress.max_iterations")?,
+        convergence_epsilon: reader.f32("stress.convergence_epsilon")?,
+        enable_gravity: match reader.u8("stress.enable_gravity")? {
+            0 => false,
+            1 => true,
+            _ => return Err(FxRapierSnapshotError::InvalidValue("stress.enable_gravity")),
+        },
+    };
+    Ok(settings)
 }
 
 fn write_handle(writer: &mut Writer, handle: (u32, u32)) {

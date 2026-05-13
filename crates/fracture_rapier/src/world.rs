@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fracture_core::{
-    ConnectionError, ConnectionId, DynamicConnectionPolicy, ExternalBondId, FractureCommand,
-    FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult, SplitEvent, StressSettings,
-    StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands,
+    CommandId, ConnectionError, ConnectionId, DeterministicOrderKey, DynamicConnectionPolicy,
+    ExternalBondId, FractureCommand, FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult,
+    SplitEvent, StressContext2D, StressSettings, StressSolver2D, SupportNodeId, Vec2,
+    apply_fracture_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
@@ -657,8 +658,12 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get(family_id) else {
                 return Err(FxRapierError::UnknownFamily(*family_id));
             };
-            let stress_report =
-                uncapped_solver.generate_with_profile(&entry.family, &stress_inputs);
+            let stress_context = self.stress_context_for_family(*family_id, entry);
+            let stress_report = uncapped_solver.generate_with_context_and_profile(
+                &entry.family,
+                &stress_context,
+                &stress_inputs,
+            );
             let mut profile = stress_report.profile;
             profile.frame_cap = global_cap;
             profile.generated_commands_after_cap = 0;
@@ -725,6 +730,52 @@ impl FxRapierWorld2D {
         }
 
         Ok(())
+    }
+
+    fn stress_context_for_family(
+        &self,
+        family_id: FxFamilyId,
+        entry: &DestructibleFamily,
+    ) -> StressContext2D {
+        let mut context = StressContext2D::from_family(&entry.family);
+        context.gravity = Vec2::new(self.gravity.x, self.gravity.y);
+        context.fallback_order_keys = entry
+            .family
+            .actors()
+            .map(|(actor, _)| {
+                (
+                    *actor,
+                    DeterministicOrderKey::new(self.tick, 30, family_id, *actor, CommandId(0)),
+                )
+            })
+            .collect();
+
+        for node_context in &mut context.nodes {
+            let Some(actor) = entry.family.node_owner(node_context.node) else {
+                continue;
+            };
+            let Some(actor_core) = entry.family.actor(actor) else {
+                continue;
+            };
+            let Some(physics) = entry.physics.get(&actor) else {
+                continue;
+            };
+            let Some(body) = self.bodies.get(physics.handles.body) else {
+                continue;
+            };
+            if actor_core.mass > 0.0 && body.mass().is_finite() {
+                node_context.mass *= body.mass() / actor_core.mass;
+            }
+            let local_delta = Vector::new(
+                node_context.position.x - physics.body_local_origin_in_asset.x,
+                node_context.position.y - physics.body_local_origin_in_asset.y,
+            );
+            let world_position =
+                body.position().translation + body.position().rotation * local_delta;
+            node_context.position = Vec2::new(world_position.x, world_position.y);
+        }
+        context.nodes.sort_by_key(|node| node.node);
+        context
     }
 
     #[cfg(test)]
@@ -2373,6 +2424,7 @@ fn validate_stress_snapshot(snapshot: StressSettingsSnapshot) -> Result<(), FxRa
     if !snapshot.tension_limit_scale.is_finite()
         || !snapshot.shear_limit_scale.is_finite()
         || !snapshot.damage_per_overload.is_finite()
+        || !snapshot.convergence_epsilon.is_finite()
     {
         return Err(FxRapierSnapshotError::InvalidValue("stress").into());
     }

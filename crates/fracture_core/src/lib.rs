@@ -2107,11 +2107,71 @@ pub struct StressInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StressNodeContext2D {
+    pub node: SupportNodeId,
+    pub mass: f32,
+    pub position: Vec2,
+    pub fixed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StressContext2D {
+    pub nodes: Vec<StressNodeContext2D>,
+    pub gravity: Vec2,
+    pub fallback_order_keys: Vec<(FxActorId, DeterministicOrderKey)>,
+}
+
+impl StressContext2D {
+    pub fn from_family(family: &FxFamily) -> Self {
+        let fixed_nodes = family
+            .external_bonds
+            .values()
+            .filter(|bond| !bond.runtime.is_broken())
+            .map(|bond| bond.node)
+            .collect::<BTreeSet<_>>();
+        let nodes = family
+            .asset
+            .support_nodes()
+            .iter()
+            .map(|node| {
+                let (mass, weighted_position) =
+                    node.voxels
+                        .iter()
+                        .fold((0.0, Vec2::ZERO), |(mass, position), voxel| {
+                            (
+                                mass + 1.0,
+                                position + voxel.center(family.asset.voxel_size()),
+                            )
+                        });
+                StressNodeContext2D {
+                    node: node.id,
+                    mass,
+                    position: if mass > 0.0 {
+                        weighted_position * (1.0 / mass)
+                    } else {
+                        Vec2::ZERO
+                    },
+                    fixed: fixed_nodes.contains(&node.id),
+                }
+            })
+            .collect();
+        Self {
+            nodes,
+            gravity: Vec2::ZERO,
+            fallback_order_keys: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StressSettings {
     pub tension_limit_scale: f32,
     pub shear_limit_scale: f32,
     pub damage_per_overload: f32,
     pub max_fractures_per_frame: u16,
+    pub max_iterations: u16,
+    pub convergence_epsilon: f32,
+    pub enable_gravity: bool,
 }
 
 impl Default for StressSettings {
@@ -2121,6 +2181,9 @@ impl Default for StressSettings {
             shear_limit_scale: 1.0,
             damage_per_overload: 1.0,
             max_fractures_per_frame: u16::MAX,
+            max_iterations: 8,
+            convergence_epsilon: 0.000_1,
+            enable_gravity: true,
         }
     }
 }
@@ -2188,6 +2251,55 @@ impl SignedStressLoad2D {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StressEdgeKind {
+    Internal,
+    External,
+    DynamicStructural,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StressEdgeKey {
+    kind: StressEdgeKind,
+    id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StressEdgeTarget {
+    Bond(BondId),
+    ExternalBond(ExternalBondId),
+    Connection(ConnectionId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StressGraphEdge {
+    key: StressEdgeKey,
+    node_a: SupportNodeId,
+    node_b: Option<SupportNodeId>,
+    normal: Vec2,
+    tangent: Vec2,
+    base_health: f32,
+    tension_limit: f32,
+    shear_limit: f32,
+    effective_length: f32,
+    health: f32,
+    target: StressEdgeTarget,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StressEdgeLoad {
+    node_a_force: Vec2,
+    node_b_force: Vec2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StressFrontierLoad {
+    node: SupportNodeId,
+    force: Vec2,
+    came_from: Option<StressEdgeKey>,
+    visited_nodes: BTreeSet<SupportNodeId>,
+}
+
 impl StressSolver2D {
     pub fn new(settings: StressSettings) -> Self {
         Self { settings }
@@ -2202,19 +2314,83 @@ impl StressSolver2D {
         family: &FxFamily,
         inputs: &[StressInput],
     ) -> StressSolveReport {
-        let mut force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
+        let context = StressContext2D::from_family(family);
+        self.generate_with_context_and_profile(family, &context, inputs)
+    }
+
+    pub fn generate_with_context(
+        &self,
+        family: &FxFamily,
+        context: &StressContext2D,
+        inputs: &[StressInput],
+    ) -> Vec<FractureCommand> {
+        self.generate_with_context_and_profile(family, context, inputs)
+            .commands
+    }
+
+    pub fn generate_with_context_and_profile(
+        &self,
+        family: &FxFamily,
+        context: &StressContext2D,
+        inputs: &[StressInput],
+    ) -> StressSolveReport {
+        let mut initial_force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
         let mut first_key_by_actor: BTreeMap<FxActorId, DeterministicOrderKey> = BTreeMap::new();
         let mut source_by_actor: BTreeMap<FxActorId, DamageSource> = BTreeMap::new();
         let mut sorted_inputs = inputs.to_vec();
         sorted_inputs.sort_by_key(|input| input.order_key);
         for input in sorted_inputs {
-            *force_by_node.entry(input.node).or_insert(Vec2::ZERO) += input.force;
+            *initial_force_by_node
+                .entry(input.node)
+                .or_insert(Vec2::ZERO) += input.force;
             first_key_by_actor
                 .entry(input.actor)
                 .and_modify(|key| *key = (*key).min(input.order_key))
                 .or_insert(input.order_key);
             source_by_actor.entry(input.actor).or_insert(input.source);
         }
+
+        let mut node_context = context.nodes.clone();
+        node_context.sort_by_key(|node| node.node);
+        let mut node_context_by_id = BTreeMap::new();
+        for node in node_context {
+            if family.node_owner(node.node).is_none() || !valid_vec2(node.position) {
+                continue;
+            }
+            node_context_by_id.insert(node.node, node);
+        }
+        let gravity_enabled = self.settings.enable_gravity
+            && valid_vec2(context.gravity)
+            && (context.gravity.x != 0.0 || context.gravity.y != 0.0);
+        if gravity_enabled {
+            let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, &node_context_by_id);
+            let fallback_order_keys = context
+                .fallback_order_keys
+                .iter()
+                .copied()
+                .collect::<BTreeMap<_, _>>();
+            for (node, node_context) in &node_context_by_id {
+                if !fixed_reachable_nodes.contains(node) {
+                    continue;
+                }
+                if !node_context.mass.is_finite() || node_context.mass <= 0.0 {
+                    continue;
+                }
+                let Some(actor) = family.node_owner(*node) else {
+                    continue;
+                };
+                *initial_force_by_node.entry(*node).or_insert(Vec2::ZERO) +=
+                    context.gravity * node_context.mass;
+                if let Some(order_key) = fallback_order_keys.get(&actor).copied() {
+                    first_key_by_actor
+                        .entry(actor)
+                        .and_modify(|key| *key = (*key).min(order_key))
+                        .or_insert(order_key);
+                }
+                source_by_actor.entry(actor).or_insert(DamageSource::Stress);
+            }
+        }
+
         let mut dynamic_connection_actor: BTreeMap<
             ConnectionId,
             (FxActorId, DeterministicOrderKey),
@@ -2246,185 +2422,94 @@ impl StressSolver2D {
             frame_cap: self.settings.max_fractures_per_frame,
             ..StressProfile::default()
         };
-        let mut commands = Vec::new();
-        for (actor_id, actor) in &family.actors {
+
+        let edges = stress_graph_edges(family, &mut profile);
+        for _ in &family.actors {
             profile.actor_count_visited += 1;
-            let Some(order_key) = first_key_by_actor.get(actor_id).copied() else {
+        }
+
+        let fixed_reachable_nodes = stress_fixed_reachable_nodes(family, &node_context_by_id);
+        let mut edge_loads = stress_solve_anchored_residuals(
+            &edges,
+            &node_context_by_id,
+            &fixed_reachable_nodes,
+            &initial_force_by_node,
+            self.settings.max_iterations,
+            self.settings.convergence_epsilon,
+        );
+        stress_solve_free_residual_paths(
+            &edges,
+            &fixed_reachable_nodes,
+            &initial_force_by_node,
+            self.settings.max_iterations,
+            self.settings.convergence_epsilon,
+            &mut edge_loads,
+        );
+
+        let mut commands_by_actor = BTreeMap::<FxActorId, Vec<FractureCommand>>::new();
+        for edge in &edges {
+            let Some(load) = edge_loads.get(&edge.key).copied() else {
                 continue;
             };
-            let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
-            let mut actor_commands = Vec::new();
-            for bond in &family.asset.internal_bonds {
-                if !owned.contains(&bond.node_a) || !owned.contains(&bond.node_b) {
-                    continue;
+            let Some((actor, order_key)) = stress_command_actor_and_order(
+                family,
+                edge,
+                &first_key_by_actor,
+                &dynamic_connection_actor,
+            ) else {
+                continue;
+            };
+            let (normal, tangent) = stress_edge_axes(edge, &node_context_by_id);
+            let signed_load = match edge.target {
+                StressEdgeTarget::ExternalBond(_) => {
+                    SignedStressLoad2D::external_node_side(load.node_a_force, normal, tangent)
                 }
-                profile.internal_bond_candidates += 1;
-                if family
-                    .bond_state(bond.id)
-                    .is_none_or(BondRuntimeState::is_broken)
-                {
-                    continue;
+                StressEdgeTarget::Bond(_) | StressEdgeTarget::Connection(_) => {
+                    SignedStressLoad2D::combine_sides(
+                        SignedStressLoad2D::node_a_side(load.node_a_force, normal, tangent),
+                        SignedStressLoad2D::node_b_side(load.node_b_force, normal, tangent),
+                    )
                 }
-                profile.internal_bonds_tested += 1;
-                let side_a = component_without_bond(actor, family, bond.node_a, Some(bond.id));
-                let side_b = component_without_bond(actor, family, bond.node_b, Some(bond.id));
-                let force_a = side_a.iter().fold(Vec2::ZERO, |acc, node| {
-                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
-                });
-                let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
-                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
-                });
-                let load_a = SignedStressLoad2D::node_a_side(force_a, bond.normal, bond.tangent);
-                let load_b = SignedStressLoad2D::node_b_side(force_b, bond.normal, bond.tangent);
-                let load = SignedStressLoad2D::combine_sides(load_a, load_b);
-                let tension = load.tension;
-                let shear = load.shear;
-                let state = family.bond_state(bond.id).expect("bond state exists");
-                let health_ratio = if bond.base_health > 0.0 {
-                    (state.health / bond.base_health).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let tension_limit = bond.tension_limit
-                    * self.settings.tension_limit_scale
-                    * health_ratio.max(0.001);
-                let shear_limit =
-                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
-                if tension > tension_limit || shear > shear_limit {
-                    actor_commands.push(FractureCommand {
-                        order_key,
-                        actor: *actor_id,
-                        target: FractureTarget::Bond(bond.id),
-                        health_loss: self.settings.damage_per_overload,
-                        effective_length_loss: if tension > tension_limit {
-                            bond.length
-                        } else {
-                            0.0
-                        },
-                        source: *source_by_actor
-                            .get(actor_id)
-                            .unwrap_or(&DamageSource::Stress),
-                    });
-                }
+            };
+            let health_ratio = if edge.base_health > 0.0 {
+                (edge.health / edge.base_health).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let tension_limit =
+                edge.tension_limit * self.settings.tension_limit_scale * health_ratio.max(0.001);
+            let shear_limit =
+                edge.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
+            if signed_load.tension <= tension_limit && signed_load.shear <= shear_limit {
+                continue;
             }
-            for bond in family.dynamic_structural_bonds.values() {
-                if bond.policy != DynamicConnectionPolicy::GraphOnly {
-                    continue;
-                }
-                let Some((connection_actor, connection_order_key)) =
-                    dynamic_connection_actor.get(&bond.id).copied()
-                else {
-                    continue;
-                };
-                if connection_actor != *actor_id {
-                    continue;
-                }
-                let Some(owner_a) = family.node_owner.get(&bond.node_a).copied() else {
-                    continue;
-                };
-                let Some(owner_b) = family.node_owner.get(&bond.node_b).copied() else {
-                    continue;
-                };
-                let Some(actor_a) = family.actor(owner_a) else {
-                    continue;
-                };
-                let Some(actor_b) = family.actor(owner_b) else {
-                    continue;
-                };
-                profile.dynamic_structural_bonds_tested += 1;
-                let side_a = component_without_dynamic_connection(
-                    actor_a,
-                    family,
-                    bond.node_a,
-                    Some(bond.id),
-                );
-                let side_b = component_without_dynamic_connection(
-                    actor_b,
-                    family,
-                    bond.node_b,
-                    Some(bond.id),
-                );
-                let force_a = side_a.iter().fold(Vec2::ZERO, |acc, node| {
-                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
+            commands_by_actor
+                .entry(actor)
+                .or_default()
+                .push(FractureCommand {
+                    order_key,
+                    actor,
+                    target: match edge.target {
+                        StressEdgeTarget::Bond(id) => FractureTarget::Bond(id),
+                        StressEdgeTarget::ExternalBond(id) => FractureTarget::ExternalBond(id),
+                        StressEdgeTarget::Connection(id) => FractureTarget::Connection(id),
+                    },
+                    health_loss: self.settings.damage_per_overload,
+                    effective_length_loss: if signed_load.tension > tension_limit {
+                        edge.effective_length
+                    } else {
+                        0.0
+                    },
+                    source: *source_by_actor.get(&actor).unwrap_or(&DamageSource::Stress),
                 });
-                let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
-                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
-                });
-                let load_a = SignedStressLoad2D::node_a_side(force_a, bond.normal, bond.tangent);
-                let load_b = SignedStressLoad2D::node_b_side(force_b, bond.normal, bond.tangent);
-                let load = SignedStressLoad2D::combine_sides(load_a, load_b);
-                let tension = load.tension;
-                let shear = load.shear;
-                let health_ratio = if bond.base_health > 0.0 {
-                    (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let tension_limit = bond.tension_limit
-                    * self.settings.tension_limit_scale
-                    * health_ratio.max(0.001);
-                let shear_limit =
-                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
-                if tension > tension_limit || shear > shear_limit {
-                    actor_commands.push(FractureCommand {
-                        order_key: connection_order_key,
-                        actor: connection_actor,
-                        target: FractureTarget::Connection(bond.id),
-                        health_loss: self.settings.damage_per_overload,
-                        effective_length_loss: if tension > tension_limit {
-                            bond.runtime.effective_length
-                        } else {
-                            0.0
-                        },
-                        source: *source_by_actor
-                            .get(&connection_actor)
-                            .unwrap_or(&DamageSource::Stress),
-                    });
-                }
-            }
-            for bond in family.external_bonds.values() {
-                if !owned.contains(&bond.node) {
-                    continue;
-                }
-                profile.external_bond_candidates += 1;
-                if bond.runtime.is_broken() {
-                    continue;
-                }
-                profile.external_bonds_tested += 1;
-                let side = component_without_bond(actor, family, bond.node, None);
-                let force = side.iter().fold(Vec2::ZERO, |acc, node| {
-                    acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
-                });
-                let load = SignedStressLoad2D::external_node_side(force, bond.normal, bond.tangent);
-                let tension = load.tension;
-                let shear = load.shear;
-                let health_ratio = if bond.base_health > 0.0 {
-                    (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let tension_limit = bond.tension_limit
-                    * self.settings.tension_limit_scale
-                    * health_ratio.max(0.001);
-                let shear_limit =
-                    bond.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
-                if tension > tension_limit || shear > shear_limit {
-                    actor_commands.push(FractureCommand {
-                        order_key,
-                        actor: *actor_id,
-                        target: FractureTarget::ExternalBond(bond.id),
-                        health_loss: self.settings.damage_per_overload,
-                        effective_length_loss: if tension > tension_limit {
-                            bond.runtime.effective_length
-                        } else {
-                            0.0
-                        },
-                        source: *source_by_actor
-                            .get(actor_id)
-                            .unwrap_or(&DamageSource::Stress),
-                    });
-                }
-            }
+        }
+
+        let mut commands = Vec::new();
+        for actor_id in family.actors.keys() {
+            let Some(mut actor_commands) = commands_by_actor.remove(actor_id) else {
+                continue;
+            };
+            sort_fracture_commands(&mut actor_commands);
             profile.generated_commands_before_cap += actor_commands.len();
             actor_commands.truncate(self.settings.max_fractures_per_frame as usize);
             profile.generated_commands_after_cap += actor_commands.len();
@@ -2432,6 +2517,406 @@ impl StressSolver2D {
         }
         sort_fracture_commands(&mut commands);
         StressSolveReport { commands, profile }
+    }
+}
+
+fn force_is_active(force: Vec2, epsilon: f32) -> bool {
+    force.length() > epsilon.max(0.0)
+}
+
+fn sort_frontier(frontier: &mut [StressFrontierLoad]) {
+    frontier.sort_by_key(|load| {
+        (
+            load.node,
+            load.came_from
+                .map(|key| (key.kind, key.id))
+                .unwrap_or((StressEdgeKind::Internal, u32::MAX)),
+        )
+    });
+}
+
+fn stress_solve_anchored_residuals(
+    edges: &[StressGraphEdge],
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+    fixed_reachable_nodes: &BTreeSet<SupportNodeId>,
+    initial_force_by_node: &BTreeMap<SupportNodeId, Vec2>,
+    max_iterations: u16,
+    convergence_epsilon: f32,
+) -> BTreeMap<StressEdgeKey, StressEdgeLoad> {
+    let mut potentials = fixed_reachable_nodes
+        .iter()
+        .copied()
+        .map(|node| (node, Vec2::ZERO))
+        .collect::<BTreeMap<_, _>>();
+    let incident = stress_incident_edges(edges);
+    let epsilon = convergence_epsilon.max(0.0);
+    for _ in 0..max_iterations {
+        let mut max_residual = 0.0f32;
+        for node in fixed_reachable_nodes {
+            let Some(incident_edges) = incident.get(node) else {
+                continue;
+            };
+            let mut degree = 0.0f32;
+            let mut neighbor_sum = Vec2::ZERO;
+            for edge in incident_edges {
+                if edge.node_b.is_none() {
+                    degree += 1.0;
+                    continue;
+                }
+                let Some(other) = stress_edge_other_node(edge, *node) else {
+                    continue;
+                };
+                if !fixed_reachable_nodes.contains(&other)
+                    || !node_context_by_id.contains_key(&other)
+                {
+                    continue;
+                }
+                degree += 1.0;
+                neighbor_sum += potentials.get(&other).copied().unwrap_or(Vec2::ZERO);
+            }
+            if degree <= 0.0 {
+                continue;
+            }
+            let old = potentials.get(node).copied().unwrap_or(Vec2::ZERO);
+            let load = initial_force_by_node
+                .get(node)
+                .copied()
+                .unwrap_or(Vec2::ZERO);
+            let next = (load + neighbor_sum) * (1.0 / degree);
+            max_residual = max_residual.max((next - old).length());
+            potentials.insert(*node, next);
+        }
+        if max_residual <= epsilon {
+            break;
+        }
+    }
+
+    let mut edge_loads = BTreeMap::new();
+    for edge in edges {
+        match edge.node_b {
+            Some(node_b)
+                if fixed_reachable_nodes.contains(&edge.node_a)
+                    && fixed_reachable_nodes.contains(&node_b) =>
+            {
+                let potential_a = potentials.get(&edge.node_a).copied().unwrap_or(Vec2::ZERO);
+                let potential_b = potentials.get(&node_b).copied().unwrap_or(Vec2::ZERO);
+                edge_loads.insert(
+                    edge.key,
+                    StressEdgeLoad {
+                        node_a_force: potential_a - potential_b,
+                        node_b_force: potential_b - potential_a,
+                    },
+                );
+            }
+            None if fixed_reachable_nodes.contains(&edge.node_a) => {
+                edge_loads.insert(
+                    edge.key,
+                    StressEdgeLoad {
+                        node_a_force: potentials.get(&edge.node_a).copied().unwrap_or(Vec2::ZERO),
+                        node_b_force: Vec2::ZERO,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    edge_loads
+}
+
+fn stress_solve_free_residual_paths(
+    edges: &[StressGraphEdge],
+    fixed_reachable_nodes: &BTreeSet<SupportNodeId>,
+    initial_force_by_node: &BTreeMap<SupportNodeId, Vec2>,
+    max_iterations: u16,
+    convergence_epsilon: f32,
+    edge_loads: &mut BTreeMap<StressEdgeKey, StressEdgeLoad>,
+) {
+    let incident = stress_incident_edges(edges);
+    let mut frontier = initial_force_by_node
+        .iter()
+        .filter_map(|(node, force)| {
+            if fixed_reachable_nodes.contains(node) || !force_is_active(*force, convergence_epsilon)
+            {
+                return None;
+            }
+            Some(StressFrontierLoad {
+                node: *node,
+                force: *force,
+                came_from: None,
+                visited_nodes: BTreeSet::from([*node]),
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_frontier(&mut frontier);
+    let mut processed = BTreeSet::<(SupportNodeId, Option<StressEdgeKey>)>::new();
+
+    for _ in 0..max_iterations {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut max_residual = 0.0f32;
+        let mut next = Vec::new();
+        for load in frontier {
+            if !processed.insert((load.node, load.came_from)) {
+                continue;
+            }
+            let outgoing = incident
+                .get(&load.node)
+                .map(|edges| {
+                    edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.node_b.is_some()
+                                && Some(edge.key) != load.came_from
+                                && stress_edge_other_node(edge, load.node)
+                                    .is_some_and(|other| !load.visited_nodes.contains(&other))
+                        })
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if outgoing.is_empty() {
+                continue;
+            }
+            let share = load.force * (1.0 / outgoing.len() as f32);
+            for edge in outgoing {
+                let Some(other) = stress_edge_other_node(edge, load.node) else {
+                    continue;
+                };
+                stress_accumulate_edge_load(edge_loads, edge.key, load.node == edge.node_a, share);
+                max_residual = max_residual.max(share.length());
+                let mut visited_nodes = load.visited_nodes.clone();
+                visited_nodes.insert(other);
+                next.push(StressFrontierLoad {
+                    node: other,
+                    force: share,
+                    came_from: Some(edge.key),
+                    visited_nodes,
+                });
+            }
+        }
+        if max_residual <= convergence_epsilon.max(0.0) {
+            break;
+        }
+        frontier = next
+            .into_iter()
+            .filter(|load| force_is_active(load.force, convergence_epsilon))
+            .collect();
+        sort_frontier(&mut frontier);
+    }
+}
+
+fn stress_incident_edges(
+    edges: &[StressGraphEdge],
+) -> BTreeMap<SupportNodeId, Vec<&StressGraphEdge>> {
+    let mut incident = BTreeMap::<SupportNodeId, Vec<&StressGraphEdge>>::new();
+    for edge in edges {
+        incident.entry(edge.node_a).or_default().push(edge);
+        if let Some(node_b) = edge.node_b {
+            incident.entry(node_b).or_default().push(edge);
+        }
+    }
+    for edges in incident.values_mut() {
+        edges.sort_by_key(|edge| edge.key);
+    }
+    incident
+}
+
+fn stress_edge_other_node(edge: &StressGraphEdge, node: SupportNodeId) -> Option<SupportNodeId> {
+    if edge.node_a == node {
+        edge.node_b
+    } else if edge.node_b == Some(node) {
+        Some(edge.node_a)
+    } else {
+        None
+    }
+}
+
+fn stress_fixed_reachable_nodes(
+    family: &FxFamily,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> BTreeSet<SupportNodeId> {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for (node, context) in node_context_by_id {
+        if context.fixed && seen.insert(*node) {
+            queue.push_back(*node);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        for bond in &family.asset.internal_bonds {
+            if family
+                .bond_state(bond.id)
+                .is_none_or(BondRuntimeState::is_broken)
+            {
+                continue;
+            }
+            let Some(other) = bond.other(node) else {
+                continue;
+            };
+            if node_context_by_id.contains_key(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+        for bond in family.dynamic_structural_bonds.values() {
+            if bond.policy != DynamicConnectionPolicy::GraphOnly || bond.runtime.is_broken() {
+                continue;
+            }
+            let other = if bond.node_a == node {
+                Some(bond.node_b)
+            } else if bond.node_b == node {
+                Some(bond.node_a)
+            } else {
+                None
+            };
+            let Some(other) = other else {
+                continue;
+            };
+            if node_context_by_id.contains_key(&other) && seen.insert(other) {
+                queue.push_back(other);
+            }
+        }
+    }
+    seen
+}
+
+fn stress_accumulate_edge_load(
+    edge_loads: &mut BTreeMap<StressEdgeKey, StressEdgeLoad>,
+    key: StressEdgeKey,
+    node_a_side: bool,
+    force: Vec2,
+) {
+    let load = edge_loads.entry(key).or_default();
+    if node_a_side {
+        load.node_a_force += force;
+    } else {
+        load.node_b_force += force;
+    }
+}
+
+fn stress_graph_edges(family: &FxFamily, profile: &mut StressProfile) -> Vec<StressGraphEdge> {
+    let mut edges = Vec::new();
+    for bond in &family.asset.internal_bonds {
+        profile.internal_bond_candidates += 1;
+        let Some(state) = family.bond_state(bond.id) else {
+            continue;
+        };
+        if state.is_broken() {
+            continue;
+        }
+        profile.internal_bonds_tested += 1;
+        edges.push(StressGraphEdge {
+            key: StressEdgeKey {
+                kind: StressEdgeKind::Internal,
+                id: bond.id.0,
+            },
+            node_a: bond.node_a,
+            node_b: Some(bond.node_b),
+            normal: bond.normal,
+            tangent: bond.tangent,
+            base_health: bond.base_health,
+            tension_limit: bond.tension_limit,
+            shear_limit: bond.shear_limit,
+            effective_length: bond.length,
+            health: state.health,
+            target: StressEdgeTarget::Bond(bond.id),
+        });
+    }
+    for bond in family.external_bonds.values() {
+        profile.external_bond_candidates += 1;
+        if bond.runtime.is_broken() {
+            continue;
+        }
+        profile.external_bonds_tested += 1;
+        edges.push(StressGraphEdge {
+            key: StressEdgeKey {
+                kind: StressEdgeKind::External,
+                id: bond.id.0,
+            },
+            node_a: bond.node,
+            node_b: None,
+            normal: bond.normal,
+            tangent: bond.tangent,
+            base_health: bond.base_health,
+            tension_limit: bond.tension_limit,
+            shear_limit: bond.shear_limit,
+            effective_length: bond.runtime.effective_length,
+            health: bond.runtime.health,
+            target: StressEdgeTarget::ExternalBond(bond.id),
+        });
+    }
+    for bond in family.dynamic_structural_bonds.values() {
+        if bond.policy != DynamicConnectionPolicy::GraphOnly || bond.runtime.is_broken() {
+            continue;
+        }
+        profile.dynamic_structural_bonds_tested += 1;
+        edges.push(StressGraphEdge {
+            key: StressEdgeKey {
+                kind: StressEdgeKind::DynamicStructural,
+                id: bond.id.0,
+            },
+            node_a: bond.node_a,
+            node_b: Some(bond.node_b),
+            normal: bond.normal,
+            tangent: bond.tangent,
+            base_health: bond.base_health,
+            tension_limit: bond.tension_limit,
+            shear_limit: bond.shear_limit,
+            effective_length: bond.runtime.effective_length,
+            health: bond.runtime.health,
+            target: StressEdgeTarget::Connection(bond.id),
+        });
+    }
+    edges.sort_by_key(|edge| edge.key);
+    edges
+}
+
+fn stress_edge_axes(
+    edge: &StressGraphEdge,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> (Vec2, Vec2) {
+    if edge.node_b.is_none() {
+        return (edge.normal, edge.tangent);
+    }
+    let position_a = node_context_by_id
+        .get(&edge.node_a)
+        .map(|node| node.position);
+    let position_b = edge
+        .node_b
+        .and_then(|node| node_context_by_id.get(&node).map(|node| node.position));
+    let Some((position_a, position_b)) = position_a.zip(position_b) else {
+        return (edge.normal, edge.tangent);
+    };
+    let normal = (position_b - position_a).normalized_or_zero();
+    if normal == Vec2::ZERO {
+        (edge.normal, edge.tangent)
+    } else {
+        (normal, normal.perp())
+    }
+}
+
+fn stress_command_actor_and_order(
+    family: &FxFamily,
+    edge: &StressGraphEdge,
+    first_key_by_actor: &BTreeMap<FxActorId, DeterministicOrderKey>,
+    dynamic_connection_actor: &BTreeMap<ConnectionId, (FxActorId, DeterministicOrderKey)>,
+) -> Option<(FxActorId, DeterministicOrderKey)> {
+    match edge.target {
+        StressEdgeTarget::Bond(_) => {
+            let actor = family.node_owner(edge.node_a)?;
+            first_key_by_actor
+                .get(&actor)
+                .copied()
+                .map(|order_key| (actor, order_key))
+        }
+        StressEdgeTarget::ExternalBond(_) => {
+            let actor = family.node_owner(edge.node_a)?;
+            first_key_by_actor
+                .get(&actor)
+                .copied()
+                .map(|order_key| (actor, order_key))
+        }
+        StressEdgeTarget::Connection(id) => dynamic_connection_actor.get(&id).copied(),
     }
 }
 
@@ -2830,30 +3315,22 @@ fn build_actor(id: FxActorId, nodes: &[SupportNodeId], asset: &FxAsset) -> FxAct
     }
 }
 
+#[cfg(test)]
 fn component_without_bond(
     actor: &FxActor,
     family: &FxFamily,
     start: SupportNodeId,
     skipped_bond: Option<BondId>,
 ) -> Vec<SupportNodeId> {
-    component_graph_walk(actor, family, start, skipped_bond, None)
+    component_graph_walk(actor, family, start, skipped_bond)
 }
 
-fn component_without_dynamic_connection(
-    actor: &FxActor,
-    family: &FxFamily,
-    start: SupportNodeId,
-    skipped_connection: Option<ConnectionId>,
-) -> Vec<SupportNodeId> {
-    component_graph_walk(actor, family, start, None, skipped_connection)
-}
-
+#[cfg(test)]
 fn component_graph_walk(
     actor: &FxActor,
     family: &FxFamily,
     start: SupportNodeId,
     skipped_bond: Option<BondId>,
-    skipped_connection: Option<ConnectionId>,
 ) -> Vec<SupportNodeId> {
     let owned: BTreeSet<_> = actor.owned_nodes.iter().copied().collect();
     let mut seen = BTreeSet::new();
@@ -2878,10 +3355,7 @@ fn component_graph_walk(
             }
         }
         for bond in family.dynamic_structural_bonds.values() {
-            if Some(bond.id) == skipped_connection
-                || bond.policy != DynamicConnectionPolicy::GraphOnly
-                || bond.runtime.is_broken()
-            {
+            if bond.policy != DynamicConnectionPolicy::GraphOnly || bond.runtime.is_broken() {
                 continue;
             }
             let other = if bond.node_a == node {
@@ -4158,6 +4632,334 @@ mod tests {
         assert_eq!(
             solver.generate(&family, &[input]).len(),
             report.commands.len()
+        );
+    }
+
+    #[test]
+    fn stress_max_iterations_affects_long_path_propagation() {
+        let family = family_for(asset_from_rows(
+            &["####"],
+            &[Some(0), Some(1), Some(2), Some(3)],
+        ));
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let one_iteration = StressSolver2D::new(StressSettings {
+            max_iterations: 1,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input.clone()]);
+        let three_iterations = StressSolver2D::new(StressSettings {
+            max_iterations: 3,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert_eq!(one_iteration.len(), 1);
+        assert_eq!(one_iteration[0].target, FractureTarget::Bond(BondId(0)));
+        assert!(three_iterations.len() >= 3);
+        assert!(
+            three_iterations
+                .iter()
+                .any(|command| command.target == FractureTarget::Bond(BondId(2)))
+        );
+    }
+
+    #[test]
+    fn stress_cycle_no_iteration_amplification() {
+        let family = family_for(asset_from_rows_with_limits(
+            &["##", "##"],
+            &[Some(0), Some(1), Some(2), Some(3)],
+            7.5,
+            7.5,
+        ));
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let shallow = StressSolver2D::new(StressSettings {
+            max_iterations: 4,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input.clone()]);
+        let deep = StressSolver2D::new(StressSettings {
+            max_iterations: 32,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert_eq!(deep, shallow);
+    }
+
+    #[test]
+    fn stress_branch_force_not_duplicated() {
+        let family = family_for(asset_from_rows_with_limits(
+            &["###"],
+            &[Some(0), Some(1), Some(2)],
+            15.0,
+            15.0,
+        ));
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = StressSolver2D::new(StressSettings {
+            max_iterations: 8,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert!(
+            commands.is_empty(),
+            "the 20N load must be split across the two branch bonds, not copied into both"
+        );
+    }
+
+    #[test]
+    fn stress_max_iterations_converges_not_overloads() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            100.0,
+            100.0,
+        ));
+        let mut anchor = static_anchor_desc(7, 0);
+        anchor.tension_limit = 2.0;
+        anchor.shear_limit = 2.0;
+        family.connect_static_anchor(anchor).unwrap();
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(1.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let early = StressSolver2D::new(StressSettings {
+            max_iterations: 2,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input.clone()]);
+        let converged = StressSolver2D::new(StressSettings {
+            max_iterations: 32,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert!(early.is_empty());
+        assert!(
+            converged.is_empty(),
+            "extra iterations must converge rather than repeatedly add the same path load"
+        );
+    }
+
+    #[test]
+    fn stress_gravity_remote_mass_loads_static_anchor() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            100.0,
+            100.0,
+        ));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+
+        let commands = StressSolver2D::new(StressSettings {
+            max_iterations: 32,
+            damage_per_overload: 1.0,
+            ..Default::default()
+        })
+        .generate_with_context(&family, &context, &[]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+
+        apply_fracture_commands(&mut family, &commands);
+        let mut broken_context = StressContext2D::from_family(&family);
+        broken_context.gravity = Vec2::new(0.0, -1.0);
+        broken_context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(2, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+        assert!(
+            StressSolver2D::new(StressSettings {
+                max_iterations: 32,
+                damage_per_overload: 1.0,
+                ..Default::default()
+            })
+            .generate_with_context(&family, &broken_context, &[])
+            .is_empty(),
+            "a broken external bond must stop acting as a fixed endpoint"
+        );
+    }
+
+    #[test]
+    fn stress_remote_contact_loads_static_anchor() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            100.0,
+            100.0,
+        ));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(0.0, -1.0),
+            source: DamageSource::ContactImpulse,
+        };
+
+        let commands = StressSolver2D::new(StressSettings {
+            max_iterations: 32,
+            damage_per_overload: 1.0,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+        assert_eq!(commands[0].source, DamageSource::ContactImpulse);
+    }
+
+    #[test]
+    fn stress_convergence_epsilon_can_stop_propagation() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            convergence_epsilon: 25.0,
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        assert!(solver.generate(&family, &[input]).is_empty());
+    }
+
+    #[test]
+    fn stress_gravity_context_static_anchor_generates_external_command() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+
+        let commands = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        })
+        .generate_with_context(&family, &context, &[]);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::ExternalBond(anchor));
+    }
+
+    #[test]
+    fn stress_broken_fixed_endpoint_no_longer_participates() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let family_id = family.id;
+        apply_fracture_commands(
+            &mut family,
+            &[FractureCommand {
+                order_key: DeterministicOrderKey::new(0, 1, family_id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                target: FractureTarget::ExternalBond(anchor),
+                health_loss: 1.0,
+                effective_length_loss: 1.0,
+                source: DamageSource::Script,
+            }],
+        );
+        let mut context = StressContext2D::from_family(&family);
+        context.gravity = Vec2::new(0.0, -1.0);
+        context.fallback_order_keys = vec![(
+            FxActorId(0),
+            DeterministicOrderKey::new(1, 30, family.id, FxActorId(0), CommandId(0)),
+        )];
+
+        let commands = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_iterations: 1,
+            ..Default::default()
+        })
+        .generate_with_context(&family, &context, &[]);
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn deterministic_stress_shuffled_inputs_and_context_order_match() {
+        let family = family_for(asset_from_rows(&["###"], &[Some(0), Some(1), Some(2)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            max_iterations: 3,
+            ..Default::default()
+        });
+        let inputs = vec![
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                node: SupportNodeId(2),
+                force: Vec2::new(-20.0, 0.0),
+                source: DamageSource::Stress,
+            },
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(20.0, 0.0),
+                source: DamageSource::Stress,
+            },
+        ];
+        let context = StressContext2D::from_family(&family);
+        let mut shuffled_inputs = inputs.clone();
+        shuffled_inputs.reverse();
+        let mut shuffled_context = context.clone();
+        shuffled_context.nodes.reverse();
+
+        assert_eq!(
+            solver.generate_with_context(&family, &context, &inputs),
+            solver.generate_with_context(&family, &shuffled_context, &shuffled_inputs)
         );
     }
 

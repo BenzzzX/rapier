@@ -1001,6 +1001,43 @@ fn stress_frame_cap_is_global_across_families() {
 }
 
 #[test]
+fn stress_gravity_static_anchor_without_contact_or_joint_input() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::new(0.0, -9.81));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    let anchor = world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.contact_impulses.is_empty());
+    assert!(step.report.joint_feedback.is_empty());
+    assert!(step.report.stress_inputs.is_empty());
+    assert_eq!(step.report.fracture_events.len(), 1);
+    assert_eq!(
+        step.report.fracture_events[0].target,
+        fracture_core::FractureTarget::ExternalBond(anchor)
+    );
+    assert_eq!(
+        step.report.fracture_events[0].source,
+        fracture_core::DamageSource::Stress
+    );
+}
+
+#[test]
 fn joint_feedback_stress() {
     let mut world = FxRapierWorld2D::new();
     world
@@ -1726,6 +1763,9 @@ fn snapshot_restore_stress_settings() {
         shear_limit_scale: 0.25,
         damage_per_overload: 3.0,
         max_fractures_per_frame: 2,
+        max_iterations: 6,
+        convergence_epsilon: 0.125,
+        enable_gravity: false,
     });
     world
         .add_destructible(FxFamilyId(1), two_node_asset(7))
