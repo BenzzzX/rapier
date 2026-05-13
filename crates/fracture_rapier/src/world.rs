@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use fracture_core::{
     CommandId, ConnectionError, ConnectionId, DeterministicOrderKey, DynamicConnectionPolicy,
     ExternalBondId, FractureCommand, FxActorId, FxFamily, FxFamilyId, GridCoord, MergeActorsResult,
-    SplitEvent, StressContext2D, StressLoadBaseline2D, StressSettings, StressSolver2D,
-    SupportNodeId, Vec2, apply_fracture_commands,
+    SplitEvent, StressBaselineEdge2D, StressBaselineTarget2D, StressContext2D,
+    StressLoadBaseline2D, StressSettings, StressSolver2D, SupportNodeId, Vec2,
+    apply_fracture_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
@@ -33,6 +34,7 @@ use crate::snapshot::{
     ActorPhysicsSnapshot, AppliedStaticAnchorPolicySnapshot, BodyActorSnapshot,
     BodyBaselineSnapshot, BodyTypeSnapshot, ColliderActorSnapshot, ColliderVoxelSnapshot,
     FxRapierFamilySnapshot, FxRapierSnapshotError, FxRapierWorldSnapshot,
+    PrestressBaselineEdgeSnapshot, PrestressBaselineSnapshot, PrestressBaselineTargetSnapshot,
     StaticAnchorPolicySnapshot, StressSettingsSnapshot, VoxelContactSnapshot,
     decode_rapier_owned_state, decode_world_snapshot, encode_rapier_owned_state,
     encode_world_snapshot,
@@ -1091,6 +1093,16 @@ impl FxRapierWorld2D {
             .map(|baseline| baseline.topology_signature)
     }
 
+    #[cfg(test)]
+    pub(crate) fn prestress_baseline_load_count_for_test(
+        &self,
+        family_id: FxFamilyId,
+    ) -> Option<usize> {
+        self.prestress_baselines
+            .get(&family_id)
+            .map(|baseline| baseline.loads.len())
+    }
+
     fn capture_snapshot(&self) -> Result<FxRapierWorldSnapshot, FxRapierError> {
         let registry = self
             .hooks
@@ -1243,11 +1255,17 @@ impl FxRapierWorld2D {
                     body_type: BodyTypeSnapshot::from_body_type(*body_type),
                 })
                 .collect(),
+            prestress_baselines: self
+                .prestress_baselines
+                .iter()
+                .map(|(family, baseline)| prestress_baseline_to_snapshot(*family, baseline))
+                .collect(),
         })
     }
 
     fn from_snapshot(snapshot: FxRapierWorldSnapshot) -> Result<Self, FxRapierError> {
         validate_snapshot_metadata(&snapshot)?;
+        let prestress_baselines = snapshot.prestress_baselines;
         let mut world = Self::new();
         world.snapshot_mode = snapshot.mode;
         world.tick = snapshot.tick;
@@ -1431,6 +1449,7 @@ impl FxRapierWorld2D {
             let registry = registry.read().expect("contact material registry poisoned");
             world.validate_checkpoint_state(&registry, VoxelMetadataValidation::Captured)?;
         }
+        world.restore_prestress_baselines(prestress_baselines)?;
         Ok(world)
     }
 
@@ -2305,6 +2324,70 @@ impl FxRapierWorld2D {
         }
         Ok(())
     }
+
+    fn restore_prestress_baselines(
+        &mut self,
+        baselines: Vec<PrestressBaselineSnapshot>,
+    ) -> Result<(), FxRapierError> {
+        let mut restored = BTreeMap::new();
+        for snapshot in baselines {
+            let Some(entry) = self.families.get(&snapshot.family) else {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "prestress baseline unknown family",
+                )
+                .into());
+            };
+            let context = self.stress_context_for_family(snapshot.family, entry);
+            let current = self
+                .stress_solver
+                .capture_load_baseline(&entry.family, &context);
+            if snapshot.topology_signature != current.topology_signature {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "prestress baseline topology mismatch",
+                )
+                .into());
+            }
+
+            let current_targets = current
+                .loads
+                .iter()
+                .map(|load| load.target)
+                .collect::<BTreeSet<_>>();
+            let mut snapshot_targets = BTreeSet::new();
+            for load in &snapshot.loads {
+                let target = StressBaselineTarget2D::from(load.target);
+                if !snapshot_targets.insert(target) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "duplicate prestress baseline target",
+                    )
+                    .into());
+                }
+                if !current_targets.contains(&target) {
+                    return Err(FxRapierSnapshotError::StateMismatch(
+                        "prestress baseline unknown target",
+                    )
+                    .into());
+                }
+            }
+            if snapshot_targets != current_targets {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "prestress baseline missing target",
+                )
+                .into());
+            }
+
+            let family = snapshot.family;
+            let baseline = prestress_baseline_from_snapshot(snapshot);
+            if restored.insert(family, baseline).is_some() {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "duplicate prestress baseline family",
+                )
+                .into());
+            }
+        }
+        self.prestress_baselines = restored;
+        Ok(())
+    }
 }
 
 fn apply_body_snapshot(body: &mut RigidBody, snapshot: BodySnapshot) {
@@ -2367,6 +2450,44 @@ fn stress_to_snapshot(settings: StressSettings) -> StressSettingsSnapshot {
 
 fn stress_from_snapshot(snapshot: StressSettingsSnapshot) -> StressSettings {
     snapshot.into()
+}
+
+fn prestress_baseline_to_snapshot(
+    family: FxFamilyId,
+    baseline: &StressLoadBaseline2D,
+) -> PrestressBaselineSnapshot {
+    let mut loads = baseline
+        .loads
+        .iter()
+        .map(|load| PrestressBaselineEdgeSnapshot {
+            target: PrestressBaselineTargetSnapshot::from(load.target),
+            node_a_force: [load.node_a_force.x, load.node_a_force.y],
+            node_b_force: [load.node_b_force.x, load.node_b_force.y],
+        })
+        .collect::<Vec<_>>();
+    loads.sort_by_key(|load| load.target);
+    PrestressBaselineSnapshot {
+        family,
+        topology_signature: baseline.topology_signature,
+        gravity: [baseline.gravity.x, baseline.gravity.y],
+        loads,
+    }
+}
+
+fn prestress_baseline_from_snapshot(snapshot: PrestressBaselineSnapshot) -> StressLoadBaseline2D {
+    StressLoadBaseline2D {
+        topology_signature: snapshot.topology_signature,
+        gravity: Vec2::new(snapshot.gravity[0], snapshot.gravity[1]),
+        loads: snapshot
+            .loads
+            .into_iter()
+            .map(|load| StressBaselineEdge2D {
+                target: load.target.into(),
+                node_a_force: Vec2::new(load.node_a_force[0], load.node_a_force[1]),
+                node_b_force: Vec2::new(load.node_b_force[0], load.node_b_force[1]),
+            })
+            .collect(),
+    }
 }
 
 pub(crate) fn ensure_snapshot_mode_available(mode: SnapshotMode) -> Result<(), FxRapierError> {
@@ -2456,6 +2577,36 @@ fn validate_snapshot_metadata(snapshot: &FxRapierWorldSnapshot) -> Result<(), Fx
     for item in &snapshot.static_anchor_body_baselines {
         if !baselines.insert((item.family, item.actor)) {
             return Err(FxRapierSnapshotError::StateMismatch("duplicate body baseline").into());
+        }
+    }
+    let mut prestress_baselines = BTreeSet::new();
+    for item in &snapshot.prestress_baselines {
+        if !prestress_baselines.insert(item.family) {
+            return Err(FxRapierSnapshotError::StateMismatch(
+                "duplicate prestress baseline family",
+            )
+            .into());
+        }
+        if !item.gravity[0].is_finite() || !item.gravity[1].is_finite() {
+            return Err(FxRapierSnapshotError::InvalidValue("prestress baseline gravity").into());
+        }
+        let mut targets = BTreeSet::new();
+        for load in &item.loads {
+            if !targets.insert(load.target) {
+                return Err(FxRapierSnapshotError::StateMismatch(
+                    "duplicate prestress baseline target",
+                )
+                .into());
+            }
+            let force_values = [
+                load.node_a_force[0],
+                load.node_a_force[1],
+                load.node_b_force[0],
+                load.node_b_force[1],
+            ];
+            if force_values.into_iter().any(|value| !value.is_finite()) {
+                return Err(FxRapierSnapshotError::InvalidValue("prestress baseline load").into());
+            }
         }
     }
     let mut materials = BTreeSet::new();

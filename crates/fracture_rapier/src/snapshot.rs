@@ -1,6 +1,6 @@
 use fracture_core::{
-    CompressionDamageMode2D, FxActorId, FxFamilyId, GridCoord, StressSettings, SupportNodeId,
-    snapshot::SnapshotMode,
+    BondId, CompressionDamageMode2D, ConnectionId, ExternalBondId, FxActorId, FxFamilyId,
+    GridCoord, StressBaselineTarget2D, StressSettings, SupportNodeId, snapshot::SnapshotMode,
 };
 use rapier2d::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use crate::connect_api::StaticAnchorBodyPolicy;
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -186,6 +186,48 @@ pub struct BodyBaselineSnapshot {
     pub body_type: BodyTypeSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PrestressBaselineTargetSnapshot {
+    Bond(BondId),
+    ExternalBond(ExternalBondId),
+    Connection(ConnectionId),
+}
+
+impl From<StressBaselineTarget2D> for PrestressBaselineTargetSnapshot {
+    fn from(value: StressBaselineTarget2D) -> Self {
+        match value {
+            StressBaselineTarget2D::Bond(id) => Self::Bond(id),
+            StressBaselineTarget2D::ExternalBond(id) => Self::ExternalBond(id),
+            StressBaselineTarget2D::Connection(id) => Self::Connection(id),
+        }
+    }
+}
+
+impl From<PrestressBaselineTargetSnapshot> for StressBaselineTarget2D {
+    fn from(value: PrestressBaselineTargetSnapshot) -> Self {
+        match value {
+            PrestressBaselineTargetSnapshot::Bond(id) => Self::Bond(id),
+            PrestressBaselineTargetSnapshot::ExternalBond(id) => Self::ExternalBond(id),
+            PrestressBaselineTargetSnapshot::Connection(id) => Self::Connection(id),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrestressBaselineEdgeSnapshot {
+    pub target: PrestressBaselineTargetSnapshot,
+    pub node_a_force: [f32; 2],
+    pub node_b_force: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrestressBaselineSnapshot {
+    pub family: FxFamilyId,
+    pub topology_signature: u64,
+    pub gravity: [f32; 2],
+    pub loads: Vec<PrestressBaselineEdgeSnapshot>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxRapierWorldSnapshot {
     pub mode: SnapshotMode,
@@ -203,6 +245,7 @@ pub struct FxRapierWorldSnapshot {
     pub static_anchor_policies: Vec<StaticAnchorPolicySnapshot>,
     pub applied_static_anchor_policies: Vec<AppliedStaticAnchorPolicySnapshot>,
     pub static_anchor_body_baselines: Vec<BodyBaselineSnapshot>,
+    pub prestress_baselines: Vec<PrestressBaselineSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -388,6 +431,21 @@ pub fn encode_world_snapshot(snapshot: &FxRapierWorldSnapshot) -> Vec<u8> {
     }
 
     writer
+        .len(snapshot.prestress_baselines.len())
+        .expect("prestress baseline count");
+    for item in &snapshot.prestress_baselines {
+        writer.u32(item.family.0);
+        writer.u64(item.topology_signature);
+        write_vec2(&mut writer, item.gravity).expect("finite prestress gravity");
+        writer.len(item.loads.len()).expect("prestress load count");
+        for load in &item.loads {
+            write_prestress_target(&mut writer, load.target);
+            write_vec2(&mut writer, load.node_a_force).expect("finite prestress load");
+            write_vec2(&mut writer, load.node_b_force).expect("finite prestress load");
+        }
+    }
+
+    writer
         .len(snapshot.contact_materials.len())
         .expect("material count");
     for (material, properties) in &snapshot.contact_materials {
@@ -508,6 +566,29 @@ pub fn decode_world_snapshot(
         });
     }
 
+    let prestress_baseline_count = reader.len("prestress_baselines")?;
+    let mut prestress_baselines = Vec::with_capacity(prestress_baseline_count);
+    for _ in 0..prestress_baseline_count {
+        let family = FxFamilyId(reader.u32("prestress_baseline.family")?);
+        let topology_signature = reader.u64("prestress_baseline.topology_signature")?;
+        let gravity = reader.vec2("prestress_baseline.gravity")?;
+        let load_count = reader.len("prestress_baseline.loads")?;
+        let mut loads = Vec::with_capacity(load_count);
+        for _ in 0..load_count {
+            loads.push(PrestressBaselineEdgeSnapshot {
+                target: read_prestress_target(&mut reader)?,
+                node_a_force: reader.vec2("prestress_baseline.node_a_force")?,
+                node_b_force: reader.vec2("prestress_baseline.node_b_force")?,
+            });
+        }
+        prestress_baselines.push(PrestressBaselineSnapshot {
+            family,
+            topology_signature,
+            gravity,
+            loads,
+        });
+    }
+
     let contact_material_count = reader.len("contact_material_properties")?;
     let mut contact_materials = Vec::with_capacity(contact_material_count);
     for _ in 0..contact_material_count {
@@ -539,6 +620,7 @@ pub fn decode_world_snapshot(
             static_anchor_policies,
             applied_static_anchor_policies,
             static_anchor_body_baselines,
+            prestress_baselines,
         },
     ))
 }
@@ -702,6 +784,42 @@ fn read_body_type(reader: &mut Reader<'_>) -> Result<BodyTypeSnapshot, FxRapierS
         2 => Ok(BodyTypeSnapshot::KinematicPositionBased),
         3 => Ok(BodyTypeSnapshot::KinematicVelocityBased),
         _ => Err(FxRapierSnapshotError::InvalidValue("body_type")),
+    }
+}
+
+fn write_prestress_target(writer: &mut Writer, target: PrestressBaselineTargetSnapshot) {
+    match target {
+        PrestressBaselineTargetSnapshot::Bond(id) => {
+            writer.u8(0);
+            writer.u32(id.0);
+        }
+        PrestressBaselineTargetSnapshot::ExternalBond(id) => {
+            writer.u8(1);
+            writer.u32(id.0);
+        }
+        PrestressBaselineTargetSnapshot::Connection(id) => {
+            writer.u8(2);
+            writer.u32(id.0);
+        }
+    }
+}
+
+fn read_prestress_target(
+    reader: &mut Reader<'_>,
+) -> Result<PrestressBaselineTargetSnapshot, FxRapierSnapshotError> {
+    let kind = reader.u8("prestress_baseline.target_kind")?;
+    let id = reader.u32("prestress_baseline.target_id")?;
+    match kind {
+        0 => Ok(PrestressBaselineTargetSnapshot::Bond(BondId(id))),
+        1 => Ok(PrestressBaselineTargetSnapshot::ExternalBond(
+            ExternalBondId(id),
+        )),
+        2 => Ok(PrestressBaselineTargetSnapshot::Connection(ConnectionId(
+            id,
+        ))),
+        _ => Err(FxRapierSnapshotError::InvalidValue(
+            "prestress_baseline.target_kind",
+        )),
     }
 }
 

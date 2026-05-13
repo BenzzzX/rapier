@@ -13,7 +13,9 @@ use rapier2d::prelude::*;
 #[cfg(feature = "deterministic-replay")]
 use crate::FxRapierReplayCommand;
 use crate::contact_map::{ContactPairSide, collider_key, map_contact_pair};
-use crate::snapshot::{decode_world_snapshot, encode_world_snapshot};
+use crate::snapshot::{
+    PrestressBaselineTargetSnapshot, decode_world_snapshot, encode_world_snapshot,
+};
 use crate::{
     ColliderLodSettings, ContactMaterialProperties, DynamicStructuralConnectionDesc, FxRapierError,
     FxRapierSnapshotError, FxRapierWorld2D, StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
@@ -32,6 +34,17 @@ fn rewrite_snapshot_checksum(bytes: &mut [u8]) {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     bytes[26..34].copy_from_slice(&hash.to_le_bytes());
+}
+
+fn replace_first_f32_bits(bytes: &mut [u8], from: f32, to_bits: u32) {
+    let from = from.to_bits().to_le_bytes();
+    let to = to_bits.to_le_bytes();
+    let offset = bytes
+        .windows(from.len())
+        .position(|window| window == from)
+        .expect("expected f32 marker in snapshot bytes");
+    bytes[offset..offset + from.len()].copy_from_slice(&to);
+    rewrite_snapshot_checksum(bytes);
 }
 
 fn two_node_asset(contact_material: u16) -> fracture_voxel::AuthoredVoxelAsset {
@@ -1242,6 +1255,190 @@ fn prestress_baseline_invalidates_after_stress_settings_change() {
     assert!(recaptured.report.split_events.is_empty());
     assert_eq!(world.prestress_baseline_count_for_test(), 1);
     assert_eq!(world.stress_settings().enable_gravity, false);
+}
+
+fn world_with_prestress_baseline() -> (FxFamilyId, FxRapierWorld2D) {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_snapshot_mode(SnapshotMode::Normal);
+    world.set_gravity(Vector::new(0.0, -1.0));
+    world.set_stress_settings(StressSettings {
+        damage_per_overload: 1.0,
+        max_iterations: 1,
+        ..StressSettings::default()
+    });
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(77, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let initial = world.step_with_diagnostics().unwrap();
+    assert!(initial.report.fracture_events.is_empty());
+    assert!(initial.report.split_events.is_empty());
+    assert_eq!(world.prestress_baseline_count_for_test(), 1);
+    (family, world)
+}
+
+fn snapshot_with_prestress_baseline() -> crate::snapshot::FxRapierWorldSnapshot {
+    let (_, world) = world_with_prestress_baseline();
+    let (_, snapshot) = decode_world_snapshot(&world.snapshot().unwrap()).unwrap();
+    assert_eq!(snapshot.prestress_baselines.len(), 1);
+    snapshot
+}
+
+#[test]
+fn snapshot_restore_prestress_baseline() {
+    let (family, world) = world_with_prestress_baseline();
+    let signature = world
+        .prestress_baseline_signature_for_test(family)
+        .expect("baseline captured");
+    let load_count = world
+        .prestress_baseline_load_count_for_test(family)
+        .expect("baseline captured");
+
+    let mut restored = FxRapierWorld2D::restore_snapshot(&world.snapshot().unwrap()).unwrap();
+
+    assert_eq!(restored.prestress_baseline_count_for_test(), 1);
+    assert_eq!(
+        restored.prestress_baseline_signature_for_test(family),
+        Some(signature)
+    );
+    assert_eq!(
+        restored.prestress_baseline_load_count_for_test(family),
+        Some(load_count)
+    );
+
+    let step = restored.step_with_diagnostics().unwrap();
+
+    assert!(step.report.stress_inputs.is_empty());
+    assert!(step.report.fracture_events.is_empty());
+    assert!(step.report.split_events.is_empty());
+    assert_eq!(restored.prestress_baseline_count_for_test(), 1);
+    assert_eq!(
+        restored.prestress_baseline_signature_for_test(family),
+        Some(signature)
+    );
+    assert_eq!(
+        restored.prestress_baseline_load_count_for_test(family),
+        Some(load_count)
+    );
+}
+
+#[test]
+fn snapshot_restore_rejects_duplicate_prestress_baseline_family() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot
+        .prestress_baselines
+        .push(snapshot.prestress_baselines[0].clone());
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("duplicate prestress baseline family")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_unknown_prestress_baseline_family() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].family = FxFamilyId(99);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("prestress baseline unknown family")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_non_finite_prestress_baseline_gravity() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].gravity[0] = 12_345.0;
+    let mut bytes = encode_world_snapshot(&snapshot);
+    replace_first_f32_bits(&mut bytes, 12_345.0, f32::NAN.to_bits());
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&bytes),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("prestress_baseline.gravity")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_non_finite_prestress_baseline_load() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].loads[0].node_a_force[0] = 12_345.0;
+    let mut bytes = encode_world_snapshot(&snapshot);
+    replace_first_f32_bits(&mut bytes, 12_345.0, f32::NAN.to_bits());
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&bytes),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::InvalidValue("prestress_baseline.node_a_force")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_prestress_baseline_topology_mismatch() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].topology_signature ^= 1;
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("prestress baseline topology mismatch")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_duplicate_prestress_baseline_target() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    let duplicate = snapshot.prestress_baselines[0].loads[0];
+    snapshot.prestress_baselines[0].loads.push(duplicate);
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("duplicate prestress baseline target")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_unknown_prestress_baseline_target() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].loads[0].target =
+        PrestressBaselineTargetSnapshot::ExternalBond(ExternalBondId(999));
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("prestress baseline unknown target")
+        ))
+    ));
+}
+
+#[test]
+fn snapshot_restore_rejects_missing_prestress_baseline_target() {
+    let mut snapshot = snapshot_with_prestress_baseline();
+    snapshot.prestress_baselines[0].loads.clear();
+
+    assert!(matches!(
+        FxRapierWorld2D::restore_snapshot(&encode_world_snapshot(&snapshot)),
+        Err(FxRapierError::Snapshot(
+            FxRapierSnapshotError::StateMismatch("prestress baseline missing target")
+        ))
+    ));
 }
 
 #[test]
