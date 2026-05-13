@@ -191,6 +191,7 @@ fn static_anchor_desc(id: u32, node: u32) -> StaticAnchorDesc {
         health: 100.0,
         effective_length: 1.0,
         tension_limit: 100.0,
+        compression_limit: 100.0,
         shear_limit: 100.0,
     }
 }
