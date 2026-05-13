@@ -1994,6 +1994,43 @@ pub struct StressSolveReport {
     pub profile: StressProfile,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SignedStressLoad2D {
+    tension: f32,
+    compression: f32,
+    shear: f32,
+}
+
+impl SignedStressLoad2D {
+    fn node_a_side(force: Vec2, normal: Vec2, tangent: Vec2) -> Self {
+        Self::from_signed_components(force.dot(normal), force.dot(tangent))
+    }
+
+    fn node_b_side(force: Vec2, normal: Vec2, tangent: Vec2) -> Self {
+        Self::from_signed_components(-force.dot(normal), force.dot(tangent))
+    }
+
+    fn external_node_side(force: Vec2, normal: Vec2, tangent: Vec2) -> Self {
+        Self::from_signed_components(force.dot(normal), force.dot(tangent))
+    }
+
+    fn from_signed_components(normal_load: f32, shear_load: f32) -> Self {
+        Self {
+            tension: normal_load.max(0.0),
+            compression: (-normal_load).max(0.0),
+            shear: shear_load.abs(),
+        }
+    }
+
+    fn combine_sides(a: Self, b: Self) -> Self {
+        Self {
+            tension: a.tension.max(b.tension),
+            compression: a.compression.max(b.compression),
+            shear: a.shear.max(b.shear),
+        }
+    }
+}
+
 impl StressSolver2D {
     pub fn new(settings: StressSettings) -> Self {
         Self { settings }
@@ -2080,17 +2117,11 @@ impl StressSolver2D {
                 let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
                     acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
                 });
-                let load_a = force_a
-                    .dot(bond.normal)
-                    .abs()
-                    .max(force_a.dot(bond.tangent).abs());
-                let load_b = force_b
-                    .dot(bond.normal)
-                    .abs()
-                    .max(force_b.dot(bond.tangent).abs());
-                let side_force = if load_b > load_a { force_b } else { force_a };
-                let tension = side_force.dot(bond.normal).abs();
-                let shear = side_force.dot(bond.tangent).abs();
+                let load_a = SignedStressLoad2D::node_a_side(force_a, bond.normal, bond.tangent);
+                let load_b = SignedStressLoad2D::node_b_side(force_b, bond.normal, bond.tangent);
+                let load = SignedStressLoad2D::combine_sides(load_a, load_b);
+                let tension = load.tension;
+                let shear = load.shear;
                 let state = family.bond_state(bond.id).expect("bond state exists");
                 let health_ratio = if bond.base_health > 0.0 {
                     (state.health / bond.base_health).clamp(0.0, 1.0)
@@ -2162,17 +2193,11 @@ impl StressSolver2D {
                 let force_b = side_b.iter().fold(Vec2::ZERO, |acc, node| {
                     acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
                 });
-                let load_a = force_a
-                    .dot(bond.normal)
-                    .abs()
-                    .max(force_a.dot(bond.tangent).abs());
-                let load_b = force_b
-                    .dot(bond.normal)
-                    .abs()
-                    .max(force_b.dot(bond.tangent).abs());
-                let side_force = if load_b > load_a { force_b } else { force_a };
-                let tension = side_force.dot(bond.normal).abs();
-                let shear = side_force.dot(bond.tangent).abs();
+                let load_a = SignedStressLoad2D::node_a_side(force_a, bond.normal, bond.tangent);
+                let load_b = SignedStressLoad2D::node_b_side(force_b, bond.normal, bond.tangent);
+                let load = SignedStressLoad2D::combine_sides(load_a, load_b);
+                let tension = load.tension;
+                let shear = load.shear;
                 let health_ratio = if bond.base_health > 0.0 {
                     (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
                 } else {
@@ -2213,8 +2238,9 @@ impl StressSolver2D {
                 let force = side.iter().fold(Vec2::ZERO, |acc, node| {
                     acc + *force_by_node.get(node).unwrap_or(&Vec2::ZERO)
                 });
-                let tension = force.dot(bond.normal).abs();
-                let shear = force.dot(bond.tangent).abs();
+                let load = SignedStressLoad2D::external_node_side(force, bond.normal, bond.tangent);
+                let tension = load.tension;
+                let shear = load.shear;
                 let health_ratio = if bond.base_health > 0.0 {
                     (bond.runtime.health / bond.base_health).clamp(0.0, 1.0)
                 } else {
@@ -3192,6 +3218,90 @@ mod tests {
     }
 
     #[test]
+    fn stress_compression_does_not_break_from_node_a() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn stress_compression_does_not_break_from_node_b() {
+        let family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(1),
+            force: Vec2::new(20.0, 0.0),
+            source: DamageSource::Stress,
+        };
+        let commands = solver.generate(&family, &[input]);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn stress_mixed_two_sided_modes_use_mode_wise_limits() {
+        let family = family_for(asset_from_rows_with_limits(
+            &["##"],
+            &[Some(0), Some(1)],
+            10.0,
+            100.0,
+        ));
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 10.0,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(20.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(0.0, 50.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Bond(BondId(0)));
+        assert_eq!(commands[0].effective_length_loss, 1.0);
+    }
+
+    #[test]
     fn impact_breaks_weak_place() {
         let mut family = family_for(asset_from_rows_with_limits(
             &["###"],
@@ -3929,6 +4039,29 @@ mod tests {
     }
 
     #[test]
+    fn static_anchor_compression_does_not_break_external_bond() {
+        let mut family = family_for(asset_from_rows(&["#"], &[Some(0)]));
+        let anchor = family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            ..Default::default()
+        });
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(0),
+            force: Vec2::new(-1.0, 0.0),
+            source: DamageSource::Stress,
+        };
+
+        let commands = solver.generate(&family, &[input]);
+        assert!(commands.is_empty());
+        assert!(!family.external_bond_state(anchor).unwrap().is_broken());
+    }
+
+    #[test]
     fn stress_frame_cap_is_per_actor() {
         let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
         let _anchor0 = family
@@ -4223,6 +4356,99 @@ mod tests {
                 .health,
             0.75
         );
+    }
+
+    #[test]
+    fn graph_only_connection_compression_does_not_break() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        family
+            .connect_dynamic_structural_bond_graph_only(dynamic_graph_only_desc(8, 0, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(-1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn graph_only_connection_mixed_two_sided_modes_use_mode_wise_limits() {
+        let mut family = family_for(asset_from_rows(&["#.#"], &[Some(0), None, Some(1)]));
+        let mut desc = dynamic_graph_only_desc(8, 0, 1);
+        desc.tension_limit = 10.0;
+        desc.shear_limit = 100.0;
+        let connection = family
+            .connect_dynamic_structural_bond_graph_only(desc)
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 0.25,
+            ..Default::default()
+        });
+        let commands = solver.generate(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(20.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(0.0, 50.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].target, FractureTarget::Connection(connection));
+        assert_eq!(commands[0].effective_length_loss, 1.0);
     }
 
     #[test]
