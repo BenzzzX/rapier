@@ -74,6 +74,23 @@ pub struct AlchemyRapierTerrainDesc {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierPixelRigidbodyDesc {
+    pub width: i32,
+    pub height: i32,
+    pub pixel_size: f32,
+    pub local_origin: AlchemyRapierVec2,
+    pub topology_revision: u64,
+    pub topology_version: u32,
+    pub occupancy_words: *const u64,
+    pub occupancy_word_count: usize,
+    pub material_ids: *const u16,
+    pub material_id_count: usize,
+    pub support_mask: *const u8,
+    pub support_mask_count: usize,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AlchemyRapierRigidBodyHandle {
     pub index: u32,
@@ -107,6 +124,7 @@ pub struct AlchemyRapierBodyDesc {
     pub write_velocity: u8,
     pub wake_up: u8,
     pub sleep: u8,
+    pub use_collider_mass: u8,
 }
 
 #[repr(C)]
@@ -152,6 +170,20 @@ pub struct AlchemyRapierBodyStateResult {
 #[derive(Clone, Copy, Debug)]
 pub struct AlchemyRapierMassResult {
     pub status: AlchemyRapierStatus,
+    pub local_center_of_mass: AlchemyRapierVec2,
+    pub mass: f32,
+    pub inertia: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierPixelRigidbodyResult {
+    pub status: AlchemyRapierStatus,
+    pub collider_handle: AlchemyRapierColliderHandle,
+    pub collider_packed_id: u64,
+    pub solid_count: usize,
+    pub shape_count: usize,
+    pub local_center_of_mass: AlchemyRapierVec2,
     pub mass: f32,
     pub inertia: f32,
 }
@@ -233,6 +265,21 @@ struct TerrainChunkState {
     solid_count: usize,
 }
 
+#[allow(dead_code)]
+struct PixelRigidbodyState {
+    asset: AuthoredVoxelAsset,
+    collider: ColliderHandle,
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    local_origin: Vector,
+    topology_revision: u64,
+    topology_version: u32,
+    material_ids: Vec<u16>,
+    support_mask: Vec<u8>,
+    solid_count: usize,
+}
+
 struct AlchemyRapierWorldInner {
     gravity: Vector,
     integration_parameters: IntegrationParameters,
@@ -247,6 +294,7 @@ struct AlchemyRapierWorldInner {
     ccd_solver: CCDSolver,
     terrain_chunks: HashMap<TerrainKey, TerrainChunkState>,
     terrain_by_collider: HashMap<ColliderHandle, TerrainKey>,
+    pixel_rigidbodies: HashMap<RigidBodyHandle, PixelRigidbodyState>,
 }
 
 impl AlchemyRapierWorldInner {
@@ -265,6 +313,7 @@ impl AlchemyRapierWorldInner {
             ccd_solver: CCDSolver::new(),
             terrain_chunks: HashMap::new(),
             terrain_by_collider: HashMap::new(),
+            pixel_rigidbodies: HashMap::new(),
         }
     }
 
@@ -387,12 +436,14 @@ fn body_builder(desc: AlchemyRapierBodyDesc) -> RigidBodyBuilder {
         .linear_damping(desc.linear_damping.max(0.0))
         .angular_damping(desc.angular_damping.max(0.0))
         .gravity_scale(desc.gravity_scale)
-        .can_sleep(desc.can_sleep != 0)
-        .additional_mass_properties(MassProperties::new(
+        .can_sleep(desc.can_sleep != 0);
+    if desc.use_collider_mass == 0 {
+        builder = builder.additional_mass_properties(MassProperties::new(
             vector(desc.local_center_of_mass),
             sanitize_positive(desc.mass, 1.0),
             sanitize_positive(desc.inertia, 1.0),
         ));
+    }
     if desc.fixed_rotation != 0 {
         builder = builder.lock_rotations();
     }
@@ -444,14 +495,18 @@ fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) {
     body.set_angular_damping(desc.angular_damping.max(0.0));
     body.set_gravity_scale(desc.gravity_scale, wake_up);
     body.lock_rotations(desc.fixed_rotation != 0, wake_up);
-    body.set_additional_mass_properties(
-        MassProperties::new(
-            vector(desc.local_center_of_mass),
-            sanitize_positive(desc.mass, 1.0),
-            sanitize_positive(desc.inertia, 1.0),
-        ),
-        wake_up,
-    );
+    if desc.use_collider_mass != 0 {
+        body.set_additional_mass(0.0, wake_up);
+    } else {
+        body.set_additional_mass_properties(
+            MassProperties::new(
+                vector(desc.local_center_of_mass),
+                sanitize_positive(desc.mass, 1.0),
+                sanitize_positive(desc.inertia, 1.0),
+            ),
+            wake_up,
+        );
+    }
     set_body_can_sleep(body, desc.can_sleep != 0);
     if desc.sleep != 0 {
         body.sleep();
@@ -499,6 +554,19 @@ fn empty_terrain_apply_result(status: AlchemyRapierStatus) -> AlchemyRapierTerra
     }
 }
 
+fn empty_pixel_rigidbody_result(status: AlchemyRapierStatus) -> AlchemyRapierPixelRigidbodyResult {
+    AlchemyRapierPixelRigidbodyResult {
+        status,
+        collider_handle: AlchemyRapierColliderHandle::default(),
+        collider_packed_id: 0,
+        solid_count: 0,
+        shape_count: 0,
+        local_center_of_mass: AlchemyRapierVec2::default(),
+        mass: 0.0,
+        inertia: 0.0,
+    }
+}
+
 fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
     AlchemyRapierQueryResult {
         status,
@@ -527,6 +595,30 @@ fn remove_terrain_chunk(world: &mut AlchemyRapierWorldInner, key: TerrainKey) {
     }
 }
 
+fn remove_pixel_rigidbody(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
+    if let Some(existing) = world.pixel_rigidbodies.remove(&body_handle) {
+        let _ = world.colliders.remove(
+            existing.collider,
+            &mut world.islands,
+            &mut world.bodies,
+            true,
+        );
+    }
+}
+
+fn clear_body_colliders(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
+    world.pixel_rigidbodies.remove(&body_handle);
+    let Some(body) = world.bodies.get(body_handle) else {
+        return;
+    };
+    let colliders = body.colliders().to_vec();
+    for collider in colliders {
+        let _ = world
+            .colliders
+            .remove(collider, &mut world.islands, &mut world.bodies, true);
+    }
+}
+
 fn occupancy_from_words(width: u32, height: u32, words: &[u64]) -> Vec<bool> {
     let cell_count = (width as usize).saturating_mul(height as usize);
     let mut occupancy = vec![false; cell_count];
@@ -538,6 +630,116 @@ fn occupancy_from_words(width: u32, height: u32, words: &[u64]) -> Vec<bool> {
         }
     }
     occupancy
+}
+
+fn pixel_desc_payload(
+    desc: AlchemyRapierPixelRigidbodyDesc,
+) -> Result<(Vec<bool>, Vec<u16>, Vec<u8>, usize), AlchemyRapierStatus> {
+    if desc.width <= 0 || desc.height <= 0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    if !desc.pixel_size.is_finite() || desc.pixel_size <= 0.0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    if !desc.local_origin.x.is_finite() || !desc.local_origin.y.is_finite() {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let width = desc.width as u32;
+    let height = desc.height as u32;
+    let cell_count = (width as usize).saturating_mul(height as usize);
+    if cell_count == 0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    let expected_word_count = cell_count.div_ceil(64);
+    if desc.occupancy_words.is_null() || desc.occupancy_word_count < expected_word_count {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
+    let occupancy = occupancy_from_words(width, height, words);
+    let solid_count = occupancy.iter().filter(|occupied| **occupied).count();
+    if solid_count == 0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let material_ids = if !desc.material_ids.is_null() && desc.material_id_count >= cell_count {
+        unsafe { slice::from_raw_parts(desc.material_ids, cell_count) }.to_vec()
+    } else {
+        vec![0; cell_count]
+    };
+    let support_mask = if !desc.support_mask.is_null() && desc.support_mask_count >= cell_count {
+        unsafe { slice::from_raw_parts(desc.support_mask, cell_count) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok((occupancy, material_ids, support_mask, solid_count))
+}
+
+fn author_pixel_asset(
+    desc: AlchemyRapierPixelRigidbodyDesc,
+) -> Result<(AuthoredVoxelAsset, Vec<u16>, Vec<u8>, usize), AlchemyRapierStatus> {
+    let (occupancy, material_ids, support_mask, solid_count) = pixel_desc_payload(desc)?;
+    let width = desc.width as u32;
+    let height = desc.height as u32;
+    let cell_count = (width as usize).saturating_mul(height as usize);
+    let external_id = (0..cell_count)
+        .map(|index| index.min(u32::MAX as usize) as u32)
+        .collect::<Vec<_>>();
+    let input = VoxelAuthoringInput::new(
+        width,
+        height,
+        desc.pixel_size,
+        occupancy,
+        material_ids.clone(),
+        material_ids.clone(),
+        external_id,
+    );
+    let asset = author_voxel_asset(input).map_err(|_| AlchemyRapierStatus::InvalidArgument)?;
+    Ok((asset, material_ids, support_mask, solid_count))
+}
+
+fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Option<Collider> {
+    let voxel_size = asset.core().voxel_size();
+    let occupancy = asset.occupancy();
+    let width = asset.core().occupancy().width();
+    let height = asset.core().occupancy().height();
+    let mut shapes = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y as usize) * (width as usize) + (x as usize);
+            if !occupancy.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let center = Vector::new((x as f32 + 0.5) * voxel_size, (y as f32 + 0.5) * voxel_size);
+            shapes.push((
+                Pose::from_translation(center - local_origin),
+                SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
+            ));
+        }
+    }
+    if shapes.is_empty() {
+        return None;
+    }
+    Some(ColliderBuilder::compound(shapes).density(1.0).build())
+}
+
+fn pixel_result(
+    status: AlchemyRapierStatus,
+    collider_handle: ColliderHandle,
+    solid_count: usize,
+    body: &RigidBody,
+) -> AlchemyRapierPixelRigidbodyResult {
+    AlchemyRapierPixelRigidbodyResult {
+        status,
+        collider_handle: collider_handle_to_ffi(collider_handle),
+        collider_packed_id: pack_collider_handle(collider_handle),
+        solid_count,
+        shape_count: if solid_count > 0 { 1 } else { 0 },
+        local_center_of_mass: ffi_vec(body.local_center_of_mass()),
+        mass: body.mass(),
+        inertia: body.mass_properties().local_mprops.principal_inertia(),
+    }
 }
 
 fn terrain_cell_index(state: &TerrainChunkState, x: u32, y: u32) -> usize {
@@ -945,6 +1147,7 @@ pub extern "C" fn alchemy_rapier_destroy_body(
             return AlchemyRapierStatus::NullPointer;
         };
         let handle = handle_from_ffi(handle);
+        remove_pixel_rigidbody(world, handle);
         if world
             .bodies
             .remove(
@@ -980,6 +1183,7 @@ pub extern "C" fn alchemy_rapier_clear_body_colliders(
         let Some(body) = world.bodies.get(body_handle) else {
             return AlchemyRapierStatus::InvalidHandle;
         };
+        world.pixel_rigidbodies.remove(&body_handle);
         let colliders = body.colliders().to_vec();
         for collider in colliders {
             let _ = world
@@ -1109,6 +1313,126 @@ pub extern "C" fn alchemy_rapier_create_convex_collider(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody(
+    world: *mut AlchemyRapierWorld,
+    body_handle: AlchemyRapierRigidBodyHandle,
+    desc: AlchemyRapierPixelRigidbodyDesc,
+) -> AlchemyRapierPixelRigidbodyResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::NullPointer);
+        };
+        let body_handle = handle_from_ffi(body_handle);
+        if !world.bodies.contains(body_handle) {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
+        }
+        let (asset, material_ids, support_mask, solid_count) = match author_pixel_asset(desc) {
+            Ok(value) => value,
+            Err(status) => return empty_pixel_rigidbody_result(status),
+        };
+        let local_origin = vector(desc.local_origin);
+        let Some(collider) = build_pixel_collider(&asset, local_origin) else {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
+        };
+
+        clear_body_colliders(world, body_handle);
+        let collider_handle =
+            world
+                .colliders
+                .insert_with_parent(collider, body_handle, &mut world.bodies);
+        if let Some(body) = world.bodies.get_mut(body_handle) {
+            body.set_additional_mass(0.0, true);
+            body.recompute_mass_properties_from_colliders(&world.colliders);
+        }
+        let result = {
+            let Some(body) = world.bodies.get(body_handle) else {
+                return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
+            };
+            pixel_result(AlchemyRapierStatus::Ok, collider_handle, solid_count, body)
+        };
+        world.pixel_rigidbodies.insert(
+            body_handle,
+            PixelRigidbodyState {
+                asset,
+                collider: collider_handle,
+                width: desc.width as u32,
+                height: desc.height as u32,
+                pixel_size: desc.pixel_size,
+                local_origin,
+                topology_revision: desc.topology_revision,
+                topology_version: desc.topology_version,
+                material_ids,
+                support_mask,
+                solid_count,
+            },
+        );
+        result
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_pixel_rigidbody_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
+    world: *mut AlchemyRapierWorld,
+    body_handle: AlchemyRapierRigidBodyHandle,
+    local_origin: AlchemyRapierVec2,
+) -> AlchemyRapierPixelRigidbodyResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::NullPointer);
+        };
+        let body_handle = handle_from_ffi(body_handle);
+        if !world.bodies.contains(body_handle) {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
+        }
+        let Some(mut state) = world.pixel_rigidbodies.remove(&body_handle) else {
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
+        };
+        if !local_origin.x.is_finite() || !local_origin.y.is_finite() {
+            world.pixel_rigidbodies.insert(body_handle, state);
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let new_local_origin = vector(local_origin);
+        let Some(collider) = build_pixel_collider(&state.asset, new_local_origin) else {
+            world.pixel_rigidbodies.insert(body_handle, state);
+            return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
+        };
+
+        let _ = world
+            .colliders
+            .remove(state.collider, &mut world.islands, &mut world.bodies, true);
+        let collider_handle =
+            world
+                .colliders
+                .insert_with_parent(collider, body_handle, &mut world.bodies);
+        if let Some(body) = world.bodies.get_mut(body_handle) {
+            body.set_additional_mass(0.0, true);
+            body.recompute_mass_properties_from_colliders(&world.colliders);
+        }
+        let result = {
+            let Some(body) = world.bodies.get(body_handle) else {
+                return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
+            };
+            pixel_result(
+                AlchemyRapierStatus::Ok,
+                collider_handle,
+                state.solid_count,
+                body,
+            )
+        };
+        state.collider = collider_handle;
+        state.local_origin = new_local_origin;
+        world.pixel_rigidbodies.insert(body_handle, state);
+        result
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_pixel_rigidbody_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_destroy_collider(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierColliderHandle,
@@ -1118,6 +1442,13 @@ pub extern "C" fn alchemy_rapier_destroy_collider(
             return AlchemyRapierStatus::NullPointer;
         };
         let handle = collider_handle_from_ffi(handle);
+        let stale_pixel_body = world
+            .pixel_rigidbodies
+            .iter()
+            .find_map(|(body, state)| (state.collider == handle).then_some(*body));
+        if let Some(body) = stale_pixel_body {
+            world.pixel_rigidbodies.remove(&body);
+        }
         if world
             .colliders
             .remove(handle, &mut world.islands, &mut world.bodies, true)
@@ -1365,6 +1696,7 @@ pub extern "C" fn alchemy_rapier_body_mass(
         let Ok(world) = to_inner(world) else {
             return AlchemyRapierMassResult {
                 status: AlchemyRapierStatus::NullPointer,
+                local_center_of_mass: AlchemyRapierVec2::default(),
                 mass: 0.0,
                 inertia: 0.0,
             };
@@ -1373,12 +1705,14 @@ pub extern "C" fn alchemy_rapier_body_mass(
         let Some(body) = world.bodies.get(handle) else {
             return AlchemyRapierMassResult {
                 status: AlchemyRapierStatus::InvalidHandle,
+                local_center_of_mass: AlchemyRapierVec2::default(),
                 mass: 0.0,
                 inertia: 0.0,
             };
         };
         AlchemyRapierMassResult {
             status: AlchemyRapierStatus::Ok,
+            local_center_of_mass: ffi_vec(body.local_center_of_mass()),
             mass: body.mass(),
             inertia: body.mass_properties().local_mprops.principal_inertia(),
         }
@@ -1386,6 +1720,7 @@ pub extern "C" fn alchemy_rapier_body_mass(
         Ok(result) => result,
         Err(_) => AlchemyRapierMassResult {
             status: AlchemyRapierStatus::Panic,
+            local_center_of_mass: AlchemyRapierVec2::default(),
             mass: 0.0,
             inertia: 0.0,
         },
