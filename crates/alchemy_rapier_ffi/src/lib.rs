@@ -1,9 +1,14 @@
+use fracture_voxel::{AuthoredVoxelAsset, VoxelAuthoringInput, author_voxel_asset};
 use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
+use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
+
+const QUERY_SOURCE_TERRAIN: u32 = 1;
+const QUERY_SOURCE_DYNAMIC_RIGIDBODY: u32 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,10 +30,47 @@ pub enum AlchemyRapierBodyType {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlchemyRapierQuerySourceKind {
+    Unknown = 0,
+    StaticTerrain = 1,
+    DynamicPixelRigidbody = 2,
+}
+
+impl Default for AlchemyRapierQuerySourceKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AlchemyRapierVec2 {
     pub x: f32,
     pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierTerrainDesc {
+    pub chunk_x: i32,
+    pub chunk_y: i32,
+    pub source_world_origin_x: i32,
+    pub source_world_origin_y: i32,
+    pub local_origin_x: i32,
+    pub local_origin_y: i32,
+    pub revision: i64,
+    pub width: i32,
+    pub height: i32,
+    pub pixel_size: f32,
+    pub topology_revision: u64,
+    pub topology_version: u32,
+    pub occupancy_words: *const u64,
+    pub occupancy_word_count: usize,
+    pub material_ids: *const u16,
+    pub material_id_count: usize,
+    pub support_mask: *const u8,
+    pub support_mask_count: usize,
 }
 
 #[repr(C)]
@@ -122,10 +164,25 @@ pub struct AlchemyRapierVec2Result {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierTerrainApplyResult {
+    pub status: AlchemyRapierStatus,
+    pub solid_count: usize,
+    pub terrain_chunk_count: usize,
+    pub terrain_collider_count: usize,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AlchemyRapierQueryHit {
+    pub source_kind: AlchemyRapierQuerySourceKind,
     pub body_packed_id: u64,
     pub collider_packed_id: u64,
+    pub terrain_chunk_x: i32,
+    pub terrain_chunk_y: i32,
+    pub terrain_revision: i64,
+    pub world_cell_x: i32,
+    pub world_cell_y: i32,
     pub point: AlchemyRapierVec2,
     pub normal: AlchemyRapierVec2,
     pub local_point: AlchemyRapierVec2,
@@ -148,6 +205,34 @@ pub struct AlchemyRapierWorld {
     _private: [u8; 0],
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TerrainKey {
+    x: i32,
+    y: i32,
+}
+
+#[allow(dead_code)]
+struct TerrainChunkState {
+    asset: AuthoredVoxelAsset,
+    collider: ColliderHandle,
+    chunk_x: i32,
+    chunk_y: i32,
+    source_world_origin_x: i32,
+    source_world_origin_y: i32,
+    local_origin_x: i32,
+    local_origin_y: i32,
+    revision: i64,
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    topology_revision: u64,
+    topology_version: u32,
+    occupancy: Vec<bool>,
+    material_ids: Vec<u16>,
+    support_mask: Vec<u8>,
+    solid_count: usize,
+}
+
 struct AlchemyRapierWorldInner {
     gravity: Vector,
     integration_parameters: IntegrationParameters,
@@ -160,6 +245,8 @@ struct AlchemyRapierWorldInner {
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
+    terrain_chunks: HashMap<TerrainKey, TerrainChunkState>,
+    terrain_by_collider: HashMap<ColliderHandle, TerrainKey>,
 }
 
 impl AlchemyRapierWorldInner {
@@ -176,6 +263,8 @@ impl AlchemyRapierWorldInner {
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
+            terrain_chunks: HashMap::new(),
+            terrain_by_collider: HashMap::new(),
         }
     }
 
@@ -401,6 +490,15 @@ fn status_result(status: AlchemyRapierStatus) -> AlchemyRapierStatus {
     status
 }
 
+fn empty_terrain_apply_result(status: AlchemyRapierStatus) -> AlchemyRapierTerrainApplyResult {
+    AlchemyRapierTerrainApplyResult {
+        status,
+        solid_count: 0,
+        terrain_chunk_count: 0,
+        terrain_collider_count: 0,
+    }
+}
+
 fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
     AlchemyRapierQueryResult {
         status,
@@ -408,6 +506,118 @@ fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
         written_count: 0,
         candidate_count: 0,
     }
+}
+
+fn terrain_key(desc: AlchemyRapierTerrainDesc) -> TerrainKey {
+    TerrainKey {
+        x: desc.chunk_x,
+        y: desc.chunk_y,
+    }
+}
+
+fn remove_terrain_chunk(world: &mut AlchemyRapierWorldInner, key: TerrainKey) {
+    if let Some(existing) = world.terrain_chunks.remove(&key) {
+        world.terrain_by_collider.remove(&existing.collider);
+        let _ = world.colliders.remove(
+            existing.collider,
+            &mut world.islands,
+            &mut world.bodies,
+            true,
+        );
+    }
+}
+
+fn occupancy_from_words(width: u32, height: u32, words: &[u64]) -> Vec<bool> {
+    let cell_count = (width as usize).saturating_mul(height as usize);
+    let mut occupancy = vec![false; cell_count];
+    for (cell_index, occupied) in occupancy.iter_mut().enumerate() {
+        let word_index = cell_index >> 6;
+        let bit_index = cell_index & 63;
+        if word_index < words.len() {
+            *occupied = ((words[word_index] >> bit_index) & 1) != 0;
+        }
+    }
+    occupancy
+}
+
+fn terrain_cell_index(state: &TerrainChunkState, x: u32, y: u32) -> usize {
+    (y as usize) * (state.width as usize) + (x as usize)
+}
+
+fn terrain_cell_occupied(state: &TerrainChunkState, x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 || x as u32 >= state.width || y as u32 >= state.height {
+        return false;
+    }
+    state.occupancy[terrain_cell_index(state, x as u32, y as u32)]
+}
+
+fn terrain_world_cell(state: &TerrainChunkState, point: Vector) -> (i32, i32) {
+    let local_x =
+        ((point.x - state.source_world_origin_x as f32) / state.pixel_size).floor() as i32;
+    let local_y =
+        ((point.y - state.source_world_origin_y as f32) / state.pixel_size).floor() as i32;
+    if terrain_cell_occupied(state, local_x, local_y) {
+        return (
+            state.source_world_origin_x + local_x,
+            state.source_world_origin_y + local_y,
+        );
+    }
+
+    let epsilon = state.pixel_size.max(1.0) * 0.0001;
+    for y in (local_y - 1)..=(local_y + 1) {
+        for x in (local_x - 1)..=(local_x + 1) {
+            if !terrain_cell_occupied(state, x, y) {
+                continue;
+            }
+            let min_x = state.source_world_origin_x as f32 + x as f32 * state.pixel_size;
+            let min_y = state.source_world_origin_y as f32 + y as f32 * state.pixel_size;
+            let max_x = min_x + state.pixel_size;
+            let max_y = min_y + state.pixel_size;
+            if point.x >= min_x - epsilon
+                && point.x <= max_x + epsilon
+                && point.y >= min_y - epsilon
+                && point.y <= max_y + epsilon
+            {
+                return (
+                    state.source_world_origin_x + x,
+                    state.source_world_origin_y + y,
+                );
+            }
+        }
+    }
+
+    let mut best_x = 0;
+    let mut best_y = 0;
+    let mut best_distance_sq = f32::INFINITY;
+    for y in 0..state.height {
+        for x in 0..state.width {
+            if !state.occupancy[terrain_cell_index(state, x, y)] {
+                continue;
+            }
+            let center = Vector::new(
+                state.source_world_origin_x as f32 + (x as f32 + 0.5) * state.pixel_size,
+                state.source_world_origin_y as f32 + (y as f32 + 0.5) * state.pixel_size,
+            );
+            let distance_sq = (point - center).length_squared();
+            if distance_sq < best_distance_sq {
+                best_distance_sq = distance_sq;
+                best_x = x as i32;
+                best_y = y as i32;
+            }
+        }
+    }
+    (
+        state.source_world_origin_x + best_x,
+        state.source_world_origin_y + best_y,
+    )
+}
+
+fn terrain_local_point(state: &TerrainChunkState, point: Vector) -> Vector {
+    point
+        - Vector::new(
+            state.source_world_origin_x as f32,
+            state.source_world_origin_y as f32,
+        )
 }
 
 fn dynamic_query_body(
@@ -427,7 +637,32 @@ fn dynamic_query_body(
     }
 }
 
-fn make_query_hit(
+enum QueryTarget {
+    Dynamic(RigidBodyHandle),
+    Terrain(TerrainKey),
+}
+
+fn query_target(
+    world: &AlchemyRapierWorldInner,
+    collider_handle: ColliderHandle,
+    collider: &Collider,
+    ignored_body: Option<RigidBodyHandle>,
+    source_mask: u32,
+) -> Option<QueryTarget> {
+    if (source_mask & QUERY_SOURCE_DYNAMIC_RIGIDBODY) != 0 {
+        if let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) {
+            return Some(QueryTarget::Dynamic(body_handle));
+        }
+    }
+    if (source_mask & QUERY_SOURCE_TERRAIN) != 0 {
+        if let Some(key) = world.terrain_by_collider.get(&collider_handle) {
+            return Some(QueryTarget::Terrain(*key));
+        }
+    }
+    None
+}
+
+fn make_dynamic_query_hit(
     world: &AlchemyRapierWorldInner,
     body_handle: RigidBodyHandle,
     collider_handle: ColliderHandle,
@@ -438,8 +673,14 @@ fn make_query_hit(
 ) -> Option<AlchemyRapierQueryHit> {
     let body = world.bodies.get(body_handle)?;
     Some(AlchemyRapierQueryHit {
+        source_kind: AlchemyRapierQuerySourceKind::DynamicPixelRigidbody,
         body_packed_id: pack_body_handle(body_handle),
         collider_packed_id: pack_collider_handle(collider_handle),
+        terrain_chunk_x: 0,
+        terrain_chunk_y: 0,
+        terrain_revision: -1,
+        world_cell_x: point.x.floor() as i32,
+        world_cell_y: point.y.floor() as i32,
         point: ffi_vec(point),
         normal: ffi_vec(normalized_or_zero(normal)),
         local_point: ffi_vec(body.position().inverse_transform_point(point)),
@@ -447,6 +688,66 @@ fn make_query_hit(
         distance,
         fraction,
     })
+}
+
+fn make_terrain_query_hit(
+    world: &AlchemyRapierWorldInner,
+    key: TerrainKey,
+    collider_handle: ColliderHandle,
+    point: Vector,
+    normal: Vector,
+    distance: f32,
+    fraction: f32,
+) -> Option<AlchemyRapierQueryHit> {
+    let state = world.terrain_chunks.get(&key)?;
+    let (world_cell_x, world_cell_y) = terrain_world_cell(state, point);
+    Some(AlchemyRapierQueryHit {
+        source_kind: AlchemyRapierQuerySourceKind::StaticTerrain,
+        body_packed_id: 0,
+        collider_packed_id: pack_collider_handle(collider_handle),
+        terrain_chunk_x: state.chunk_x,
+        terrain_chunk_y: state.chunk_y,
+        terrain_revision: state.revision,
+        world_cell_x,
+        world_cell_y,
+        point: ffi_vec(point),
+        normal: ffi_vec(normalized_or_zero(normal)),
+        local_point: ffi_vec(terrain_local_point(state, point)),
+        point_velocity: AlchemyRapierVec2::default(),
+        distance,
+        fraction,
+    })
+}
+
+fn make_query_hit(
+    world: &AlchemyRapierWorldInner,
+    target: QueryTarget,
+    collider_handle: ColliderHandle,
+    point: Vector,
+    normal: Vector,
+    distance: f32,
+    fraction: f32,
+) -> Option<AlchemyRapierQueryHit> {
+    match target {
+        QueryTarget::Dynamic(body_handle) => make_dynamic_query_hit(
+            world,
+            body_handle,
+            collider_handle,
+            point,
+            normal,
+            distance,
+            fraction,
+        ),
+        QueryTarget::Terrain(key) => make_terrain_query_hit(
+            world,
+            key,
+            collider_handle,
+            point,
+            normal,
+            distance,
+            fraction,
+        ),
+    }
 }
 
 fn write_query_hit(
@@ -833,6 +1134,173 @@ pub extern "C" fn alchemy_rapier_destroy_collider(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_apply_terrain(
+    world: *mut AlchemyRapierWorld,
+    desc: AlchemyRapierTerrainDesc,
+) -> AlchemyRapierTerrainApplyResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_terrain_apply_result(AlchemyRapierStatus::NullPointer);
+        };
+        if desc.width <= 0 || desc.height <= 0 {
+            let key = terrain_key(desc);
+            remove_terrain_chunk(world, key);
+            return AlchemyRapierTerrainApplyResult {
+                status: AlchemyRapierStatus::Ok,
+                solid_count: 0,
+                terrain_chunk_count: world.terrain_chunks.len(),
+                terrain_collider_count: world.terrain_by_collider.len(),
+            };
+        }
+        if !desc.pixel_size.is_finite() || desc.pixel_size <= 0.0 {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        }
+
+        let width = desc.width as u32;
+        let height = desc.height as u32;
+        let cell_count = (width as usize).saturating_mul(height as usize);
+        if cell_count == 0 {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let expected_word_count = cell_count.div_ceil(64);
+        if desc.occupancy_words.is_null() || desc.occupancy_word_count < expected_word_count {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        }
+
+        let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
+        let occupancy = occupancy_from_words(width, height, words);
+        let solid_count = occupancy.iter().filter(|occupied| **occupied).count();
+        let key = terrain_key(desc);
+        remove_terrain_chunk(world, key);
+        if solid_count == 0 {
+            return AlchemyRapierTerrainApplyResult {
+                status: AlchemyRapierStatus::Ok,
+                solid_count: 0,
+                terrain_chunk_count: world.terrain_chunks.len(),
+                terrain_collider_count: world.terrain_by_collider.len(),
+            };
+        }
+
+        let material_ids = if !desc.material_ids.is_null() && desc.material_id_count >= cell_count {
+            unsafe { slice::from_raw_parts(desc.material_ids, cell_count) }.to_vec()
+        } else {
+            vec![0; cell_count]
+        };
+        let support_mask = if !desc.support_mask.is_null() && desc.support_mask_count >= cell_count
+        {
+            unsafe { slice::from_raw_parts(desc.support_mask, cell_count) }.to_vec()
+        } else {
+            Vec::new()
+        };
+        let external_id = (0..cell_count)
+            .map(|index| index.min(u32::MAX as usize) as u32)
+            .collect::<Vec<_>>();
+        let input = VoxelAuthoringInput::new(
+            width,
+            height,
+            desc.pixel_size,
+            occupancy.clone(),
+            material_ids.clone(),
+            material_ids.clone(),
+            external_id,
+        );
+        let Ok(asset) = author_voxel_asset(input) else {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        };
+
+        let mut shapes = Vec::with_capacity(solid_count);
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y as usize) * (width as usize) + (x as usize);
+                if !occupancy[idx] {
+                    continue;
+                }
+                let center = Vector::new(
+                    desc.source_world_origin_x as f32 + (x as f32 + 0.5) * desc.pixel_size,
+                    desc.source_world_origin_y as f32 + (y as f32 + 0.5) * desc.pixel_size,
+                );
+                shapes.push((
+                    Pose::from_translation(center),
+                    SharedShape::cuboid(desc.pixel_size * 0.5, desc.pixel_size * 0.5),
+                ));
+            }
+        }
+        if shapes.is_empty() {
+            return AlchemyRapierTerrainApplyResult {
+                status: AlchemyRapierStatus::Ok,
+                solid_count: 0,
+                terrain_chunk_count: world.terrain_chunks.len(),
+                terrain_collider_count: world.terrain_by_collider.len(),
+            };
+        }
+
+        let collider = ColliderBuilder::compound(shapes).build();
+        let collider_handle = world.colliders.insert(collider);
+        let state = TerrainChunkState {
+            asset,
+            collider: collider_handle,
+            chunk_x: desc.chunk_x,
+            chunk_y: desc.chunk_y,
+            source_world_origin_x: desc.source_world_origin_x,
+            source_world_origin_y: desc.source_world_origin_y,
+            local_origin_x: desc.local_origin_x,
+            local_origin_y: desc.local_origin_y,
+            revision: desc.revision,
+            width,
+            height,
+            pixel_size: desc.pixel_size,
+            topology_revision: desc.topology_revision,
+            topology_version: desc.topology_version,
+            occupancy,
+            material_ids,
+            support_mask,
+            solid_count,
+        };
+        world.terrain_by_collider.insert(collider_handle, key);
+        world.terrain_chunks.insert(key, state);
+
+        AlchemyRapierTerrainApplyResult {
+            status: AlchemyRapierStatus::Ok,
+            solid_count,
+            terrain_chunk_count: world.terrain_chunks.len(),
+            terrain_collider_count: world.terrain_by_collider.len(),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_terrain_apply_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_clear_terrain(
+    world: *mut AlchemyRapierWorld,
+    chunk_x: i32,
+    chunk_y: i32,
+) -> AlchemyRapierTerrainApplyResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_terrain_apply_result(AlchemyRapierStatus::NullPointer);
+        };
+        remove_terrain_chunk(
+            world,
+            TerrainKey {
+                x: chunk_x,
+                y: chunk_y,
+            },
+        );
+        AlchemyRapierTerrainApplyResult {
+            status: AlchemyRapierStatus::Ok,
+            solid_count: 0,
+            terrain_chunk_count: world.terrain_chunks.len(),
+            terrain_collider_count: world.terrain_by_collider.len(),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_terrain_apply_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_body_state(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierRigidBodyHandle,
@@ -1048,6 +1516,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
     radius: f32,
     ignored_body: AlchemyRapierRigidBodyHandle,
     has_ignored_body: u8,
+    source_mask: u32,
     hits: *mut AlchemyRapierQueryHit,
     hit_capacity: usize,
 ) -> AlchemyRapierQueryResult {
@@ -1057,6 +1526,9 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
         }
         if !radius.is_finite() || radius < 0.0 {
             return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
         }
         let Ok(world) = to_inner(world) else {
             return empty_query_result(AlchemyRapierStatus::NullPointer);
@@ -1089,7 +1561,9 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
         if radius <= 0.000001 {
             let ray = Ray::new(from, delta / distance);
             for (collider_handle, collider) in world.colliders.iter_enabled() {
-                let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+                let Some(target) =
+                    query_target(world, collider_handle, collider, ignored_body, source_mask)
+                else {
                     continue;
                 };
                 candidate_count += 1;
@@ -1103,7 +1577,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
                     let point = ray.point_at(intersection.time_of_impact);
                     if let Some(hit) = make_query_hit(
                         world,
-                        body_handle,
+                        target,
                         collider_handle,
                         point,
                         intersection.normal,
@@ -1131,7 +1605,9 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
             };
             let dispatcher = world.narrow_phase.query_dispatcher();
             for (collider_handle, collider) in world.colliders.iter_enabled() {
-                let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+                let Some(target) =
+                    query_target(world, collider_handle, collider, ignored_body, source_mask)
+                else {
                     continue;
                 };
                 candidate_count += 1;
@@ -1147,7 +1623,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
                 let normal = collider.position().rotation * shape_hit.normal1;
                 if let Some(hit) = make_query_hit(
                     world,
-                    body_handle,
+                    target,
                     collider_handle,
                     point,
                     normal,
@@ -1179,6 +1655,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
     half_height: f32,
     ignored_body: AlchemyRapierRigidBodyHandle,
     has_ignored_body: u8,
+    source_mask: u32,
     hits: *mut AlchemyRapierQueryHit,
     hit_capacity: usize,
 ) -> AlchemyRapierQueryResult {
@@ -1188,6 +1665,9 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
         }
         if !radius.is_finite() || radius < 0.0 || !half_height.is_finite() || half_height < 0.0 {
             return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
         }
         let Ok(world) = to_inner(world) else {
             return empty_query_result(AlchemyRapierStatus::NullPointer);
@@ -1209,7 +1689,9 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
         let mut written_count = 0;
         let mut candidate_count = 0;
         for (collider_handle, collider) in world.colliders.iter_enabled() {
-            let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
                 continue;
             };
             candidate_count += 1;
@@ -1224,15 +1706,9 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
 
             let (point, normal, distance) =
                 capsule_overlap_hit_point(collider, origin, half_height);
-            if let Some(hit) = make_query_hit(
-                world,
-                body_handle,
-                collider_handle,
-                point,
-                normal,
-                distance,
-                0.0,
-            ) {
+            if let Some(hit) =
+                make_query_hit(world, target, collider_handle, point, normal, distance, 0.0)
+            {
                 write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
             }
         }
@@ -1252,7 +1728,12 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
 #[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_query_surface_anchor(
     world: *mut AlchemyRapierWorld,
+    source_kind: AlchemyRapierQuerySourceKind,
     target_body: AlchemyRapierRigidBodyHandle,
+    has_target_body: u8,
+    terrain_cell_x: i32,
+    terrain_cell_y: i32,
+    has_terrain_cell: u8,
     anchor_world: AlchemyRapierVec2,
     max_distance: f32,
     hits: *mut AlchemyRapierQueryHit,
@@ -1272,51 +1753,100 @@ pub extern "C" fn alchemy_rapier_query_surface_anchor(
             .bodies
             .propagate_modified_body_positions_to_colliders(&mut world.colliders);
 
-        let target_body = handle_from_ffi(target_body);
-        let Some(body) = world.bodies.get(target_body) else {
-            return empty_query_result(AlchemyRapierStatus::InvalidHandle);
-        };
-        if body.body_type() != RigidBodyType::Dynamic {
-            return empty_query_result(AlchemyRapierStatus::Ok);
-        }
-
         let anchor = vector(anchor_world);
         let mut hit_count = 0;
         let mut written_count = 0;
         let mut candidate_count = 0;
-        for collider_handle in body.colliders() {
-            let Some(collider) = world.colliders.get(*collider_handle) else {
-                continue;
-            };
-            candidate_count += 1;
-            let projection = collider
-                .shape()
-                .project_point(collider.position(), anchor, true);
-            let point = projection.point;
-            let distance = if projection.is_inside {
-                0.0
-            } else {
-                (anchor - point).length()
-            };
-            if distance > max_distance {
-                continue;
+
+        if source_kind == AlchemyRapierQuerySourceKind::DynamicPixelRigidbody {
+            if has_target_body == 0 {
+                return empty_query_result(AlchemyRapierStatus::InvalidArgument);
             }
-            let normal = if projection.is_inside {
-                Vector::ZERO
-            } else {
-                normalized_or_zero(anchor - point)
+            let target_body = handle_from_ffi(target_body);
+            let Some(body) = world.bodies.get(target_body) else {
+                return empty_query_result(AlchemyRapierStatus::InvalidHandle);
             };
-            if let Some(hit) = make_query_hit(
-                world,
-                target_body,
-                *collider_handle,
-                point,
-                normal,
-                distance,
-                0.0,
-            ) {
+            if body.body_type() != RigidBodyType::Dynamic {
+                return empty_query_result(AlchemyRapierStatus::Ok);
+            }
+
+            for collider_handle in body.colliders() {
+                let Some(collider) = world.colliders.get(*collider_handle) else {
+                    continue;
+                };
+                candidate_count += 1;
+                let projection = collider
+                    .shape()
+                    .project_point(collider.position(), anchor, true);
+                let point = projection.point;
+                let distance = if projection.is_inside {
+                    0.0
+                } else {
+                    (anchor - point).length()
+                };
+                if distance > max_distance {
+                    continue;
+                }
+                let normal = if projection.is_inside {
+                    Vector::ZERO
+                } else {
+                    normalized_or_zero(anchor - point)
+                };
+                if let Some(hit) = make_query_hit(
+                    world,
+                    QueryTarget::Dynamic(target_body),
+                    *collider_handle,
+                    point,
+                    normal,
+                    distance,
+                    0.0,
+                ) {
+                    write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+                }
+            }
+        } else if source_kind == AlchemyRapierQuerySourceKind::StaticTerrain {
+            for (collider_handle, collider) in world.colliders.iter_enabled() {
+                let Some(key) = world.terrain_by_collider.get(&collider_handle).copied() else {
+                    continue;
+                };
+                candidate_count += 1;
+                let projection = collider
+                    .shape()
+                    .project_point(collider.position(), anchor, true);
+                let point = projection.point;
+                let distance = if projection.is_inside {
+                    0.0
+                } else {
+                    (anchor - point).length()
+                };
+                if distance > max_distance {
+                    continue;
+                }
+                let normal = if projection.is_inside {
+                    Vector::ZERO
+                } else {
+                    normalized_or_zero(anchor - point)
+                };
+                let Some(hit) = make_terrain_query_hit(
+                    world,
+                    key,
+                    collider_handle,
+                    point,
+                    normal,
+                    distance,
+                    0.0,
+                ) else {
+                    continue;
+                };
+                if has_terrain_cell != 0
+                    && (hit.world_cell_x != terrain_cell_x || hit.world_cell_y != terrain_cell_y)
+                {
+                    continue;
+                }
                 write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
             }
+        } else {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
         }
 
         AlchemyRapierQueryResult {
