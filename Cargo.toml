@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/alchemy_rapier_ffi",
     "crates/fracture_core",
     "crates/fracture_rapier",
     "crates/fracture_voxel",

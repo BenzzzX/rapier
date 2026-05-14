@@ -1,0 +1,20 @@
+[package]
+name = "alchemy_rapier_ffi"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+fracture_rapier = { path = "../fracture_rapier", default-features = false }
+
+[features]
+default = ["deterministic-replay"]
+deterministic-replay = ["fracture_rapier/deterministic-replay"]
