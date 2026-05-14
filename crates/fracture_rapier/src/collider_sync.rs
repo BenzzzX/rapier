@@ -155,7 +155,9 @@ pub(crate) fn actor_collider_build(
                 .density(1.0)
                 .friction(material.friction)
                 .restitution(material.restitution)
-                .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+                .active_hooks(
+                    ActiveHooks::MODIFY_SOLVER_CONTACTS | ActiveHooks::FILTER_CONTACT_PAIRS,
+                ),
             voxels: vec![first],
             kind: ActorColliderBuildKind::SmallDebrisPrimitive,
         });
@@ -179,7 +181,7 @@ pub(crate) fn actor_collider_build(
             .density(1.0)
             .friction(material.friction)
             .restitution(material.restitution)
-            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS),
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS | ActiveHooks::FILTER_CONTACT_PAIRS),
         voxels,
         kind: ActorColliderBuildKind::VoxelCompound,
     })

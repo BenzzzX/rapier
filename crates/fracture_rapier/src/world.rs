@@ -507,6 +507,32 @@ impl FxRapierWorld2D {
         self.hooks.quick_impact_settings()
     }
 
+    #[cfg(test)]
+    pub(crate) fn suppress_tunnel_window_active_for_test(
+        &self,
+        projectile_collider: ColliderHandle,
+        family: FxFamilyId,
+    ) -> bool {
+        self.hooks
+            .suppress_tunnel_window_active(projectile_collider, family)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contact_pair_solver_flags_for_test(
+        &self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+    ) -> Option<SolverFlags> {
+        self.hooks.filter_contact_pair(&PairFilterContext {
+            bodies: &self.bodies,
+            colliders: &self.colliders,
+            collider1,
+            collider2,
+            rigid_body1: self.colliders[collider1].parent(),
+            rigid_body2: self.colliders[collider2].parent(),
+        })
+    }
+
     pub fn set_material_impact_hardness(&self, material: u16, hardness: f32) {
         self.hooks.set_material_impact_hardness(material, hardness);
     }
@@ -716,6 +742,7 @@ impl FxRapierWorld2D {
             self.sync_family_actors(family_id)?;
         }
 
+        self.hooks.begin_step(self.tick);
         self.hooks.clear_pre_solver_contact_cache();
         self.pipeline.step(
             self.gravity,

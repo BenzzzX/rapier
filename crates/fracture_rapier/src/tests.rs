@@ -224,6 +224,38 @@ fn add_fixed_box(
     (body, collider)
 }
 
+fn add_dynamic_box(
+    world: &mut FxRapierWorld2D,
+    translation: Vector,
+    half_extents: Vector,
+    linvel: Vector,
+    density: f32,
+) -> (RigidBodyHandle, ColliderHandle) {
+    let body = world.insert_rigid_body(
+        RigidBodyBuilder::dynamic()
+            .translation(translation)
+            .linvel(linvel),
+    );
+    let collider = world.insert_collider_with_parent(
+        ColliderBuilder::cuboid(half_extents.x, half_extents.y)
+            .density(density)
+            .build(),
+        body,
+    );
+    (body, collider)
+}
+
+fn first_dynamic_collider(world: &FxRapierWorld2D) -> ColliderHandle {
+    world
+        .colliders()
+        .iter()
+        .find_map(|(handle, collider)| {
+            let body = collider.parent()?;
+            world.rigid_bodies()[body].is_dynamic().then_some(handle)
+        })
+        .expect("world should contain a dynamic collider")
+}
+
 fn overlapping_side_contact_world() -> (FxRapierWorld2D, ColliderHandle, ColliderHandle) {
     let mut world = FxRapierWorld2D::new();
     world.set_gravity(Vector::ZERO);
@@ -277,17 +309,20 @@ fn quick_impact_wall_world(
     world
         .add_destructible(FxFamilyId(1), two_node_asset(7))
         .unwrap();
-    let handles = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
     world
-        .rigid_bodies_mut()
-        .get_mut(handles.body)
-        .unwrap()
-        .set_linvel(Vector::new(speed, 0.0), true);
-    add_fixed_box(
+        .connect_static_anchor(
+            FxFamilyId(1),
+            StaticAnchorConnectionDesc::new(static_anchor_desc(101, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    let handles = world.actor_handles(FxFamilyId(1), FxActorId(0)).unwrap();
+    add_dynamic_box(
         &mut world,
-        Vector::new(2.0, 0.5),
+        Vector::new(-0.5, 0.5),
         Vector::new(0.5, 0.5),
-        1.0,
+        Vector::new(speed, 0.0),
+        12.0,
     );
     (world, handles)
 }
@@ -867,15 +902,28 @@ fn contact_hook_material() {
 #[test]
 fn quick_impact_suppression_generates_quick_stress_without_post_solve_double_count() {
     let settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
-    let (mut world, _) = quick_impact_wall_world(settings, 8.0);
+    let (mut world, handles) = quick_impact_wall_world(settings, 8.0);
 
     let step = world.step_with_diagnostics().unwrap();
+    let observations = world.drain_contact_hook_observations();
 
     assert!(
         step.report
             .quick_impacts
             .iter()
             .any(|input| input.impact.estimate.action == QuickImpactAction::Suppress)
+    );
+    assert!(
+        observations
+            .iter()
+            .filter(|obs| obs.destructible_collider == handles.collider)
+            .any(|obs| {
+                obs.quick_impact
+                    .is_some_and(|impact| impact.action == QuickImpactAction::Suppress)
+                    && obs.before_solver_contacts > 0
+                    && obs.after_solver_contacts == 0
+            }),
+        "quick-impact suppression must remove the initial solver contacts"
     );
     assert!(
         step.report
@@ -1025,20 +1073,21 @@ fn quick_impact_mixed_small_debris_pair_preserves_solver_contacts_and_readback()
 }
 
 #[test]
-fn quick_impact_dynamic_opponent_uses_higher_threshold_than_static() {
+fn quick_impact_allows_dynamic_projectile_against_fixed_target() {
     let settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
-    let (mut static_world, _) = quick_impact_wall_world(settings, 8.0);
-    let static_step = static_world.step_with_diagnostics().unwrap();
+    let (mut fixed_target_world, _) = quick_impact_wall_world(settings, 8.0);
+    let fixed_target_step = fixed_target_world.step_with_diagnostics().unwrap();
 
     let (mut dynamic_world, _, _) = quick_impact_dynamic_world(settings, 8.0);
     let dynamic_step = dynamic_world.step_with_diagnostics().unwrap();
 
     assert!(
-        static_step.report.quick_impacts.iter().any(|input| !input
-            .impact
-            .estimate
-            .dynamic_opponent
-            && input.impact.estimate.action == QuickImpactAction::Suppress)
+        fixed_target_step
+            .report
+            .quick_impacts
+            .iter()
+            .any(|input| input.impact.estimate.dynamic_opponent
+                && input.impact.estimate.action == QuickImpactAction::Suppress)
     );
     assert!(
         dynamic_step.report.quick_impacts.is_empty(),
@@ -1047,20 +1096,84 @@ fn quick_impact_dynamic_opponent_uses_higher_threshold_than_static() {
 }
 
 #[test]
-fn quick_impact_destructible_vs_destructible_is_generic() {
+fn quick_impact_skips_dynamic_destructible_bodies() {
     let settings = quick_impact_settings(0.01, 0.02, 0.01, 0.02);
     let (mut world, _, _) = quick_impact_dynamic_world(settings, 8.0);
 
     let step = world.step_with_diagnostics().unwrap();
-    let families = step
-        .report
-        .quick_impacts
-        .iter()
-        .map(|input| input.stress.order_key.family_id)
-        .collect::<BTreeSet<_>>();
 
-    assert!(families.contains(&FxFamilyId(1)));
-    assert!(families.contains(&FxFamilyId(2)));
+    assert!(
+        step.report.quick_impacts.is_empty(),
+        "dynamic destructible bodies must stay on the normal solver/readback path"
+    );
+}
+
+#[test]
+fn quick_impact_suppress_opens_tunnel_window_for_ordinary_projectile() {
+    let mut settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
+    settings.suppress_tunnel_window_frames = 2;
+    let (mut world, handles) = quick_impact_wall_world(settings, 8.0);
+    let projectile = first_dynamic_collider(&world);
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(
+        step.report
+            .quick_impacts
+            .iter()
+            .any(|input| input.impact.estimate.action == QuickImpactAction::Suppress)
+    );
+    assert!(world.suppress_tunnel_window_active_for_test(projectile, FxFamilyId(1)));
+    assert_eq!(
+        world.contact_pair_solver_flags_for_test(handles.collider, projectile),
+        Some(SolverFlags::empty()),
+        "same projectile should not produce solver impulses against the same fracture family during the tunnel window"
+    );
+}
+
+#[test]
+fn quick_impact_skips_destructible_projectile_against_fixed_destructible_target() {
+    let settings = quick_impact_settings(0.01, 0.02, 1000.0, 2000.0);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.integration_parameters_mut().dt = 1.0 / 60.0;
+    world.set_quick_impact_settings(settings);
+    world.set_material_impact_hardness(7, 1.0);
+    world
+        .add_destructible(FxFamilyId(1), two_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            FxFamilyId(1),
+            StaticAnchorConnectionDesc::new(static_anchor_desc(101, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+    world
+        .add_destructible(FxFamilyId(2), two_node_asset(7))
+        .unwrap();
+    let projectile = world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap();
+    {
+        let body = world.rigid_bodies_mut().get_mut(projectile.body).unwrap();
+        body.set_position(Pose::from_translation(Vector::new(-0.5, 0.0)), true);
+        body.set_linvel(Vector::new(8.0, 0.0), true);
+    }
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.quick_impacts.is_empty());
+    assert!(!world.suppress_tunnel_window_active_for_test(projectile.collider, FxFamilyId(1)));
+    assert_eq!(
+        world.contact_pair_solver_flags_for_test(
+            world
+                .actor_handles(FxFamilyId(1), FxActorId(0))
+                .unwrap()
+                .collider,
+            projectile.collider,
+        ),
+        Some(SolverFlags::COMPUTE_IMPULSES),
+        "destructible-vs-destructible contacts must stay on the normal solver path"
+    );
 }
 
 #[test]

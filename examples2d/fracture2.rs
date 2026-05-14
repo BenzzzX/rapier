@@ -353,6 +353,7 @@ fn configure_high_energy_impact_solver(world: &mut FxRapierWorld2D) {
         stress_force_scale: 0.35,
         softened_friction_scale: 0.35,
         softened_restitution_scale: 0.0,
+        suppress_tunnel_window_frames: 3,
         ..QuickImpactSettings::default()
     });
     world.set_material_impact_hardness(1, 1.0);

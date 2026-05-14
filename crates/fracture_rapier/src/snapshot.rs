@@ -758,6 +758,7 @@ fn write_quick_impact_settings(
     writer.f32(settings.stress_force_scale)?;
     writer.f32(settings.softened_friction_scale)?;
     writer.f32(settings.softened_restitution_scale)?;
+    writer.u16(settings.suppress_tunnel_window_frames);
     Ok(())
 }
 
@@ -777,6 +778,7 @@ fn read_quick_impact_settings(
         stress_force_scale: reader.f32("quick_impact.stress_force_scale")?,
         softened_friction_scale: reader.f32("quick_impact.softened_friction_scale")?,
         softened_restitution_scale: reader.f32("quick_impact.softened_restitution_scale")?,
+        suppress_tunnel_window_frames: reader.u16("quick_impact.suppress_tunnel_window_frames")?,
     })
 }
 

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rapier2d::prelude::*;
@@ -59,6 +60,7 @@ pub struct QuickImpactSettings {
     pub stress_force_scale: f32,
     pub softened_friction_scale: f32,
     pub softened_restitution_scale: f32,
+    pub suppress_tunnel_window_frames: u16,
 }
 
 impl Default for QuickImpactSettings {
@@ -75,8 +77,15 @@ impl Default for QuickImpactSettings {
             stress_force_scale: 1.0,
             softened_friction_scale: 0.25,
             softened_restitution_scale: 0.0,
+            suppress_tunnel_window_frames: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SuppressTunnelWindowKey {
+    projectile_collider: (u32, u32),
+    family: fracture_core::FxFamilyId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -94,6 +103,8 @@ pub struct FxContactHooks {
     registry: Arc<RwLock<ContactMaterialRegistry>>,
     pre_solver_cache: Arc<Mutex<Vec<PreSolverContactMapping>>>,
     observations: Arc<Mutex<Vec<HookObservation>>>,
+    current_tick: Arc<AtomicU64>,
+    suppress_tunnel_windows: Arc<Mutex<BTreeMap<SuppressTunnelWindowKey, u64>>>,
 }
 
 impl Default for FxContactHooks {
@@ -108,6 +119,8 @@ impl FxContactHooks {
             registry: Arc::new(RwLock::new(ContactMaterialRegistry::default())),
             pre_solver_cache: Arc::new(Mutex::new(Vec::new())),
             observations: Arc::new(Mutex::new(Vec::new())),
+            current_tick: Arc::new(AtomicU64::new(0)),
+            suppress_tunnel_windows: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -172,6 +185,31 @@ impl FxContactHooks {
             .clear();
     }
 
+    pub(crate) fn begin_step(&self, tick: u64) {
+        self.current_tick.store(tick, Ordering::Relaxed);
+        self.suppress_tunnel_windows
+            .lock()
+            .expect("suppress tunnel windows poisoned")
+            .retain(|_, expires_at| *expires_at >= tick);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppress_tunnel_window_active(
+        &self,
+        projectile_collider: ColliderHandle,
+        family: fracture_core::FxFamilyId,
+    ) -> bool {
+        let tick = self.current_tick.load(Ordering::Relaxed);
+        self.suppress_tunnel_windows
+            .lock()
+            .expect("suppress tunnel windows poisoned")
+            .get(&SuppressTunnelWindowKey {
+                projectile_collider: collider_key(projectile_collider),
+                family,
+            })
+            .is_some_and(|expires_at| *expires_at >= tick)
+    }
+
     pub(crate) fn pre_solver_contact_cache_snapshot(&self) -> Vec<PreSolverContactMapping> {
         self.pre_solver_cache
             .lock()
@@ -181,6 +219,46 @@ impl FxContactHooks {
 }
 
 impl PhysicsHooks for FxContactHooks {
+    fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
+        let registry = self
+            .registry
+            .read()
+            .expect("contact material registry poisoned");
+        let family1 = registry
+            .collider_actors
+            .get(&collider_key(context.collider1))
+            .map(|actor| actor.family);
+        let family2 = registry
+            .collider_actors
+            .get(&collider_key(context.collider2))
+            .map(|actor| actor.family);
+        drop(registry);
+
+        let tick = self.current_tick.load(Ordering::Relaxed);
+        let windows = self
+            .suppress_tunnel_windows
+            .lock()
+            .expect("suppress tunnel windows poisoned");
+        let suppress = match (family1, family2) {
+            (Some(family), None) => windows.get(&SuppressTunnelWindowKey {
+                projectile_collider: collider_key(context.collider2),
+                family,
+            }),
+            (None, Some(family)) => windows.get(&SuppressTunnelWindowKey {
+                projectile_collider: collider_key(context.collider1),
+                family,
+            }),
+            _ => None,
+        }
+        .is_some_and(|expires_at| *expires_at >= tick);
+
+        if suppress {
+            Some(SolverFlags::empty())
+        } else {
+            Some(SolverFlags::COMPUTE_IMPULSES)
+        }
+    }
+
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
         let registry = self
             .registry
@@ -204,7 +282,8 @@ impl PhysicsHooks for FxContactHooks {
             .iter()
             .copied()
             .any(|mapping| mapping_is_small_debris(mapping, &registry));
-        let quick_impacts = if pair_contains_small_debris {
+        let pair_is_destructible_vs_destructible = mappings.len() > 1;
+        let quick_impacts = if pair_contains_small_debris || pair_is_destructible_vs_destructible {
             vec![None; mappings.len()]
         } else {
             mappings
@@ -228,6 +307,14 @@ impl PhysicsHooks for FxContactHooks {
                 contact.restitution *= settings.softened_restitution_scale;
             }
         } else if strongest_action == Some(QuickImpactAction::Suppress) {
+            register_suppress_tunnel_windows(
+                context,
+                &registry,
+                &mappings,
+                &quick_impacts,
+                &self.current_tick,
+                &self.suppress_tunnel_windows,
+            );
             context.solver_contacts.clear();
         }
         let after = context.solver_contacts.len();
@@ -314,6 +401,52 @@ fn mapping_is_small_debris(
         .is_some_and(|metadata| metadata.small_debris)
 }
 
+fn register_suppress_tunnel_windows(
+    context: &ContactModificationContext,
+    registry: &ContactMaterialRegistry,
+    mappings: &[ContactPairMapping],
+    quick_impacts: &[Option<QuickImpactEstimate>],
+    current_tick: &AtomicU64,
+    suppress_tunnel_windows: &Mutex<BTreeMap<SuppressTunnelWindowKey, u64>>,
+) {
+    let settings = registry.quick_impact_settings;
+    let window_frames = u64::from(settings.suppress_tunnel_window_frames);
+    if window_frames == 0 {
+        return;
+    }
+
+    let tick = current_tick.load(Ordering::Relaxed);
+    let expires_at = tick.saturating_add(window_frames);
+    let mut windows = suppress_tunnel_windows
+        .lock()
+        .expect("suppress tunnel windows poisoned");
+    for (mapping, quick_impact) in mappings.iter().copied().zip(quick_impacts.iter().copied()) {
+        let Some(quick_impact) = quick_impact else {
+            continue;
+        };
+        if quick_impact.action != QuickImpactAction::Suppress {
+            continue;
+        }
+        let Some(destructible_body) = destructible_body_for_mapping(mapping, context) else {
+            continue;
+        };
+        if destructible_body.is_dynamic()
+            || registry
+                .collider_actors
+                .contains_key(&collider_key(mapping.other_collider))
+        {
+            continue;
+        }
+        windows.insert(
+            SuppressTunnelWindowKey {
+                projectile_collider: collider_key(mapping.other_collider),
+                family: mapping.destructible.family,
+            },
+            expires_at,
+        );
+    }
+}
+
 fn sanitize_quick_impact_settings(mut settings: QuickImpactSettings) -> QuickImpactSettings {
     settings.static_soften_impulse_threshold = settings.static_soften_impulse_threshold.max(0.0);
     settings.static_suppress_impulse_threshold = settings
@@ -328,6 +461,20 @@ fn sanitize_quick_impact_settings(mut settings: QuickImpactSettings) -> QuickImp
     settings.softened_friction_scale = settings.softened_friction_scale.clamp(0.0, 1.0);
     settings.softened_restitution_scale = settings.softened_restitution_scale.clamp(0.0, 1.0);
     settings
+}
+
+fn destructible_body_for_mapping<'a>(
+    mapping: ContactPairMapping,
+    context: &'a ContactModificationContext<'a>,
+) -> Option<&'a RigidBody> {
+    match mapping.side {
+        ContactPairSide::Collider1 => context
+            .rigid_body1
+            .and_then(|handle| context.bodies.get(handle)),
+        ContactPairSide::Collider2 => context
+            .rigid_body2
+            .and_then(|handle| context.bodies.get(handle)),
+    }
 }
 
 fn quick_impact_for_mapping(
@@ -377,18 +524,15 @@ fn quick_impact_for_mapping(
         ContactPairSide::Collider1 => 1.0,
         ContactPairSide::Collider2 => -1.0,
     };
+    if destructible_body.is_dynamic() {
+        return None;
+    }
+
     let dynamic_opponent = other_body.is_some_and(RigidBody::is_dynamic);
-    let (soften_threshold, suppress_threshold) = if dynamic_opponent {
-        (
-            settings.dynamic_soften_impulse_threshold,
-            settings.dynamic_suppress_impulse_threshold,
-        )
-    } else {
-        (
-            settings.static_soften_impulse_threshold,
-            settings.static_suppress_impulse_threshold,
-        )
-    };
+    let (soften_threshold, suppress_threshold) = (
+        settings.static_soften_impulse_threshold,
+        settings.static_suppress_impulse_threshold,
+    );
 
     let destructible_mass = destructible_body.mass().max(0.0);
     let other_mass = other_body
@@ -398,6 +542,7 @@ fn quick_impact_for_mapping(
         Some(other_mass) if destructible_mass > 0.0 && other_mass > 0.0 => {
             1.0 / (1.0 / destructible_mass + 1.0 / other_mass)
         }
+        Some(other_mass) if other_mass > 0.0 => other_mass,
         _ => destructible_mass,
     };
     if !effective_mass.is_finite() || effective_mass <= 0.0 {
