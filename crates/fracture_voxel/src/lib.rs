@@ -11,6 +11,8 @@ use fracture_core::{
     FxFamilyId, GridAabb, GridCoord, NodeRuntimeState, RepairError, RepairPlan, SplitEvent,
     SupportNodeId, ValidationError, Vec2,
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 pub mod snapshot;
@@ -1319,6 +1321,23 @@ fn build_authoring_support_node_map(
     input: &VoxelAuthoringInput,
     options: &VoxelAuthoringOptions,
 ) -> Vec<Option<SupportNodeId>> {
+    if input.support_node_hint.is_some() {
+        return build_authoring_support_node_map_with_natural_voronoi_bins(input, options, None);
+    }
+
+    let natural_voronoi_bins = build_natural_voronoi_bins(input, options);
+    build_authoring_support_node_map_with_natural_voronoi_bins(
+        input,
+        options,
+        natural_voronoi_bins.as_deref(),
+    )
+}
+
+fn build_authoring_support_node_map_with_natural_voronoi_bins(
+    input: &VoxelAuthoringInput,
+    options: &VoxelAuthoringOptions,
+    natural_voronoi_bins: Option<&[Option<u32>]>,
+) -> Vec<Option<SupportNodeId>> {
     let mut support_node_map = vec![None; cell_count(input.width, input.height)];
     if let Some(hints) = &input.support_node_hint {
         let components = connected_components_by_key(input.width, input.height, |coord| {
@@ -1349,7 +1368,6 @@ fn build_authoring_support_node_map(
             }
         }
     } else {
-        let natural_voronoi_bins = build_natural_voronoi_bins(input, options);
         let components = connected_components_by_key(input.width, input.height, |coord| {
             let idx = index(input.width, coord);
             if !input.occupancy[idx] {
@@ -1358,12 +1376,7 @@ fn build_authoring_support_node_map(
             Some((
                 AuthorClusterKey {
                     material: input.fracture_material[idx],
-                    bin: cluster_bin_for_voxel(
-                        input,
-                        coord,
-                        options,
-                        natural_voronoi_bins.as_deref(),
-                    ),
+                    bin: cluster_bin_for_voxel(input, coord, options, natural_voronoi_bins),
                 },
                 None,
             ))
@@ -1404,12 +1417,87 @@ fn build_natural_voronoi_bins(
         if seeds.is_empty() {
             continue;
         }
-        for coord in all_coords(input.width, input.height) {
-            let idx = index(input.width, coord);
-            if input.occupancy[idx] && input.fracture_material[idx] == *material {
-                bins[idx] = Some(assign_natural_voronoi_seed(coord, &seeds, natural));
-            }
+        assign_natural_voronoi_bins_for_material(input, *material, natural, &seeds, &mut bins);
+    }
+
+    Some(bins)
+}
+
+fn assign_natural_voronoi_bins_for_material(
+    input: &VoxelAuthoringInput,
+    material: u16,
+    natural: &NaturalVoronoi,
+    seeds: &[NaturalVoronoiRuntimeSeed],
+    bins: &mut [Option<u32>],
+) {
+    #[cfg(feature = "parallel")]
+    {
+        assign_natural_voronoi_bins_for_material_parallel(input, material, natural, seeds, bins);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        assign_natural_voronoi_bins_for_material_serial(input, material, natural, seeds, bins);
+    }
+}
+
+#[cfg(any(not(feature = "parallel"), test))]
+fn assign_natural_voronoi_bins_for_material_serial(
+    input: &VoxelAuthoringInput,
+    material: u16,
+    natural: &NaturalVoronoi,
+    seeds: &[NaturalVoronoiRuntimeSeed],
+    bins: &mut [Option<u32>],
+) {
+    for coord in all_coords(input.width, input.height) {
+        let idx = index(input.width, coord);
+        if input.occupancy[idx] && input.fracture_material[idx] == material {
+            bins[idx] = Some(assign_natural_voronoi_seed(coord, seeds, natural));
         }
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn assign_natural_voronoi_bins_for_material_parallel(
+    input: &VoxelAuthoringInput,
+    material: u16,
+    natural: &NaturalVoronoi,
+    seeds: &[NaturalVoronoiRuntimeSeed],
+    bins: &mut [Option<u32>],
+) {
+    let width = input.width as usize;
+    bins.par_iter_mut().enumerate().for_each(|(idx, bin)| {
+        if input.occupancy[idx] && input.fracture_material[idx] == material {
+            let coord = GridCoord::new((idx % width) as u32, (idx / width) as u32);
+            *bin = Some(assign_natural_voronoi_seed(coord, seeds, natural));
+        }
+    });
+}
+
+#[cfg(all(test, feature = "parallel"))]
+fn build_natural_voronoi_bins_serial(
+    input: &VoxelAuthoringInput,
+    options: &VoxelAuthoringOptions,
+) -> Option<Vec<Option<u32>>> {
+    let has_natural_rule = options
+        .material_cluster_rules
+        .values()
+        .any(|rule| matches!(rule.mode, VoxelClusterMode::NaturalVoronoi(_)));
+    if !has_natural_rule {
+        return None;
+    }
+
+    let mut bins = vec![None; cell_count(input.width, input.height)];
+    for (material, rule) in &options.material_cluster_rules {
+        let VoxelClusterMode::NaturalVoronoi(natural) = &rule.mode else {
+            continue;
+        };
+        let seeds = natural_voronoi_seeds(input, *material, natural);
+        if seeds.is_empty() {
+            continue;
+        }
+        assign_natural_voronoi_bins_for_material_serial(
+            input, *material, natural, &seeds, &mut bins,
+        );
     }
 
     Some(bins)
@@ -2153,6 +2241,70 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "parallel")]
+    fn author_voxel_asset_with_serial_natural_voronoi(
+        input: VoxelAuthoringInput,
+        options: VoxelAuthoringOptions,
+    ) -> Result<AuthoredVoxelAsset, VoxelError> {
+        validate_input_maps(&input)?;
+        let natural_voronoi_bins = if input.support_node_hint.is_some() {
+            None
+        } else {
+            build_natural_voronoi_bins_serial(&input, &options)
+        };
+        let support_node_map = build_authoring_support_node_map_with_natural_voronoi_bins(
+            &input,
+            &options,
+            natural_voronoi_bins.as_deref(),
+        );
+        let authored_chunks = build_authored_chunks(
+            input.width,
+            &input.fracture_material,
+            &support_node_map,
+            &options,
+        );
+        let core = make_core_asset(
+            input.width,
+            input.height,
+            input.voxel_size,
+            input.occupancy.clone(),
+            input.fracture_material.clone(),
+            input.orientation.clone(),
+            support_node_map,
+            authored_chunks,
+            input.default_bond_health,
+            input.default_tension_limit,
+            input.default_shear_limit,
+        )?;
+        let asset = AuthoredVoxelAsset {
+            summaries: node_summaries(
+                &core,
+                &input.contact_material,
+                &input.external_id,
+                input.width,
+            ),
+            bond_summaries: bond_summaries(
+                &core,
+                &input.contact_material,
+                &input.external_id,
+                input.width,
+                input.height,
+            ),
+            core,
+            width: input.width,
+            height: input.height,
+            contact_material: input.contact_material,
+            fracture_material: input.fracture_material,
+            external_id: input.external_id,
+            orientation: input.orientation,
+            default_bond_health: input.default_bond_health,
+            default_tension_limit: input.default_tension_limit,
+            default_shear_limit: input.default_shear_limit,
+        };
+        asset.validate_exact_cover()?;
+        Ok(asset)
+    }
+
     #[test]
     fn authoring_exact_cover_property_small_grids() {
         for width in 1..=3 {
@@ -2305,6 +2457,59 @@ mod tests {
         assert_eq!(
             first.core().internal_bonds(),
             second.core().internal_bonds()
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn natural_voronoi_parallel_matches_serial_generated_noise_authoring() {
+        let width = 32;
+        let height = 32;
+        let cells = cell_count(width, height);
+        let input = VoxelAuthoringInput::new(
+            width,
+            height,
+            1.0,
+            vec![true; cells],
+            vec![1; cells],
+            vec![0; cells],
+            (0..cells as u32).collect(),
+        );
+        let options = VoxelAuthoringOptions::default().with_material_rule(
+            1,
+            VoxelClusterPolicy {
+                mode: VoxelClusterMode::NaturalVoronoi(
+                    NaturalVoronoi::generated(29, 0xA11C_E501)
+                        .with_noise(0x51A7_EE55, 700)
+                        .with_field(
+                            NaturalVoronoiClusterField::new(GridCoord::new(11, 10), 9)
+                                .with_extra_seeds(6, 0xF1E1_D501)
+                                .with_distance_bias(384, 224),
+                        ),
+                ),
+            },
+        );
+
+        let serial =
+            author_voxel_asset_with_serial_natural_voronoi(input.clone(), options.clone()).unwrap();
+        let parallel = author_voxel_asset_with_options(input, options).unwrap();
+
+        assert_eq!(node_assignment(&parallel), node_assignment(&serial));
+        assert_eq!(
+            parallel.core().support_nodes().len(),
+            serial.core().support_nodes().len()
+        );
+        assert_eq!(
+            parallel.core().internal_bonds().len(),
+            serial.core().internal_bonds().len()
+        );
+        assert_eq!(
+            parallel.core().support_nodes(),
+            serial.core().support_nodes()
+        );
+        assert_eq!(
+            parallel.core().internal_bonds(),
+            serial.core().internal_bonds()
         );
     }
 

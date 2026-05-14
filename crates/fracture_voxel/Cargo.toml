@@ -9,6 +9,10 @@ license.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 
+[features]
+parallel = ["dep:rayon"]
+
 [dependencies]
 fracture_core = { path = "../fracture_core" }
+rayon = { workspace = true, optional = true }
 thiserror.workspace = true

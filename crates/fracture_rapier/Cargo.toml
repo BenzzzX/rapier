@@ -16,9 +16,10 @@ rapier2d = { path = "../rapier2d", features = ["serde-serialize"] }
 thiserror.workspace = true
 bincode.workspace = true
 serde.workspace = true
+rayon = { workspace = true, optional = true }
 
 [features]
 deterministic-replay = ["rapier2d/enhanced-determinism", "rapier2d/serde-serialize"]
-parallel = ["rapier2d/parallel"]
+parallel = ["dep:rayon", "fracture_voxel/parallel", "rapier2d/parallel"]
 simd-stable = ["rapier2d/simd-stable"]
 simd-nightly = ["rapier2d/simd-nightly"]

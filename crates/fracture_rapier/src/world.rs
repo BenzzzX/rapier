@@ -4,13 +4,16 @@ use fracture_core::{
     CommandId, ConnectionError, ConnectionId, DamageInput, DamageSource, DeterministicOrderKey,
     DynamicConnectionPolicy, ExternalBondId, FractureCommand, FractureTarget, FxActorId, FxFamily,
     FxFamilyId, GridCoord, MergeActorsResult, SplitEvent, StressBaselineEdge2D,
-    StressBaselineTarget2D, StressContext2D, StressInput, StressLoadBaseline2D, StressSettings,
-    StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands, generate_damage_commands,
+    StressBaselineTarget2D, StressContext2D, StressInput, StressLoadBaseline2D, StressProfile,
+    StressSettings, StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands,
+    generate_damage_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, split_dirty_actors,
 };
 use fracture_voxel::AuthoredVoxelAsset;
 use rapier2d::prelude::*;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::collider_sync::{
@@ -156,6 +159,36 @@ pub(crate) struct DestructibleFamily {
 pub(crate) struct ActorPhysicsState {
     pub(crate) handles: ActorPhysicsHandles,
     pub(crate) body_local_origin_in_asset: Vec2,
+}
+
+#[derive(Clone, Debug)]
+struct FamilyStressSolveJob<'a> {
+    family_id: FxFamilyId,
+    family: &'a FxFamily,
+    context: StressContext2D,
+    inputs: Vec<StressInput>,
+}
+
+#[derive(Clone, Debug)]
+struct FamilyStressSolveResult {
+    family_id: FxFamilyId,
+    profile: StressProfile,
+    commands: Vec<FractureCommand>,
+}
+
+impl FamilyStressSolveJob<'_> {
+    fn solve(self, solver: &StressSolver2D, frame_cap: u16) -> FamilyStressSolveResult {
+        let stress_report =
+            solver.generate_with_context_and_profile(self.family, &self.context, &self.inputs);
+        let mut profile = stress_report.profile;
+        profile.frame_cap = frame_cap;
+        profile.generated_commands_after_cap = 0;
+        FamilyStressSolveResult {
+            family_id: self.family_id,
+            profile,
+            commands: stress_report.commands,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -836,45 +869,62 @@ impl FxRapierWorld2D {
         let mut uncapped_settings = self.stress_solver.settings;
         uncapped_settings.max_fractures_per_frame = u16::MAX;
         let uncapped_solver = StressSolver2D::new(uncapped_settings);
-        let mut family_profiles = BTreeMap::new();
-        let mut candidate_commands = Vec::new();
         let mut input_family_count = 0usize;
 
-        for family_id in &family_ids {
-            let stress_inputs = report
-                .stress_inputs
-                .iter()
-                .filter(|input| input.order_key.family_id == *family_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !stress_inputs.is_empty() {
-                input_family_count += 1;
-            }
-            let Some(entry) = self.families.get(family_id) else {
-                return Err(FxRapierError::UnknownFamily(*family_id));
-            };
-            let mut stress_context = self.stress_context_for_family(*family_id, entry);
-            let baseline = match self.prestress_baselines.get(family_id) {
-                Some(baseline) => baseline.clone(),
-                None => {
-                    let baseline =
-                        uncapped_solver.capture_load_baseline(&entry.family, &stress_context);
-                    self.prestress_baselines
-                        .insert(*family_id, baseline.clone());
-                    baseline
+        let mut stress_results = {
+            let mut stress_jobs = Vec::new();
+            for family_id in &family_ids {
+                let stress_inputs = report
+                    .stress_inputs
+                    .iter()
+                    .filter(|input| input.order_key.family_id == *family_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !stress_inputs.is_empty() {
+                    input_family_count += 1;
                 }
-            };
-            stress_context.load_baseline = Some(baseline);
-            let stress_report = uncapped_solver.generate_with_context_and_profile(
-                &entry.family,
-                &stress_context,
-                &stress_inputs,
-            );
-            let mut profile = stress_report.profile;
-            profile.frame_cap = global_cap;
-            profile.generated_commands_after_cap = 0;
-            family_profiles.insert(*family_id, profile);
-            candidate_commands.extend(stress_report.commands);
+                let Some(entry) = self.families.get(family_id) else {
+                    return Err(FxRapierError::UnknownFamily(*family_id));
+                };
+                let mut stress_context = self.stress_context_for_family(*family_id, entry);
+                let baseline = match self.prestress_baselines.get(family_id) {
+                    Some(baseline) => baseline.clone(),
+                    None => {
+                        let baseline =
+                            uncapped_solver.capture_load_baseline(&entry.family, &stress_context);
+                        self.prestress_baselines
+                            .insert(*family_id, baseline.clone());
+                        baseline
+                    }
+                };
+                stress_context.load_baseline = Some(baseline);
+                stress_jobs.push(FamilyStressSolveJob {
+                    family_id: *family_id,
+                    family: &entry.family,
+                    context: stress_context,
+                    inputs: stress_inputs,
+                });
+            }
+
+            #[cfg(feature = "parallel")]
+            let stress_results = stress_jobs
+                .into_par_iter()
+                .map(|job| job.solve(&uncapped_solver, global_cap))
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "parallel"))]
+            let stress_results = stress_jobs
+                .into_iter()
+                .map(|job| job.solve(&uncapped_solver, global_cap))
+                .collect::<Vec<_>>();
+            stress_results
+        };
+        stress_results.sort_by_key(|result| result.family_id);
+
+        let mut family_profiles = BTreeMap::new();
+        let mut candidate_commands = Vec::new();
+        for result in stress_results {
+            family_profiles.insert(result.family_id, result.profile);
+            candidate_commands.extend(result.commands);
         }
 
         sort_fracture_commands(&mut candidate_commands);
