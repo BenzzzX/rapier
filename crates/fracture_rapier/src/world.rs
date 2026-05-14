@@ -869,23 +869,28 @@ impl FxRapierWorld2D {
         let mut uncapped_settings = self.stress_solver.settings;
         uncapped_settings.max_fractures_per_frame = u16::MAX;
         let uncapped_solver = StressSolver2D::new(uncapped_settings);
+        let mut inputs_by_family: BTreeMap<FxFamilyId, Vec<StressInput>> = BTreeMap::new();
+        for input in &report.stress_inputs {
+            inputs_by_family
+                .entry(input.order_key.family_id)
+                .or_default()
+                .push(input.clone());
+        }
         let mut input_family_count = 0usize;
 
         let mut stress_results = {
             let mut stress_jobs = Vec::new();
             for family_id in &family_ids {
-                let stress_inputs = report
-                    .stress_inputs
-                    .iter()
-                    .filter(|input| input.order_key.family_id == *family_id)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let stress_inputs = inputs_by_family.remove(family_id).unwrap_or_default();
                 if !stress_inputs.is_empty() {
                     input_family_count += 1;
                 }
                 let Some(entry) = self.families.get(family_id) else {
                     return Err(FxRapierError::UnknownFamily(*family_id));
                 };
+                if !self.should_solve_family_stress(*family_id, &entry.family, &stress_inputs) {
+                    continue;
+                }
                 let mut stress_context = self.stress_context_for_family(*family_id, entry);
                 let baseline = match self.prestress_baselines.get(family_id) {
                     Some(baseline) => baseline.clone(),
@@ -1002,6 +1007,24 @@ impl FxRapierWorld2D {
         }
 
         Ok(())
+    }
+
+    fn should_solve_family_stress(
+        &self,
+        family_id: FxFamilyId,
+        family: &FxFamily,
+        stress_inputs: &[StressInput],
+    ) -> bool {
+        if !stress_inputs.is_empty() || self.prestress_baselines.contains_key(&family_id) {
+            return true;
+        }
+        if family.external_bonds().next().is_some() {
+            return true;
+        }
+        self.stress_solver.settings.enable_gravity
+            && self.gravity.x.is_finite()
+            && self.gravity.y.is_finite()
+            && (self.gravity.x != 0.0 || self.gravity.y != 0.0)
     }
 
     fn consume_fracture_fields(&mut self, report: &mut FxStepReport) -> Result<(), FxRapierError> {

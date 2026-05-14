@@ -1700,6 +1700,7 @@ fn stress_gravity_static_anchor_without_contact_or_joint_input() {
     assert!(step.report.stress_inputs.is_empty());
     assert!(step.report.fracture_events.is_empty());
     assert!(step.report.split_events.is_empty());
+    assert!(!step.diagnostics.stress_profiles.is_empty());
     assert_eq!(world.prestress_baseline_count_for_test(), 1);
 
     let step = world.step_with_diagnostics().unwrap();
@@ -1709,7 +1710,26 @@ fn stress_gravity_static_anchor_without_contact_or_joint_input() {
     assert!(step.report.stress_inputs.is_empty());
     assert!(step.report.fracture_events.is_empty());
     assert!(step.report.split_events.is_empty());
+    assert!(!step.diagnostics.stress_profiles.is_empty());
     assert_eq!(world.prestress_baseline_count_for_test(), 1);
+}
+
+#[test]
+fn stress_skips_empty_family_without_gravity_or_baseline() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world.add_destructible(family, two_node_asset(7)).unwrap();
+
+    let step = world.step_with_diagnostics().unwrap();
+
+    assert!(step.report.stress_inputs.is_empty());
+    assert!(step.report.fracture_events.is_empty());
+    assert!(step.report.split_events.is_empty());
+    assert!(step.diagnostics.stress_profiles.is_empty());
+    assert_eq!(step.diagnostics.global_stress_cap.input_count, 0);
+    assert_eq!(step.diagnostics.global_stress_cap.family_count, 0);
+    assert_eq!(world.prestress_baseline_count_for_test(), 0);
 }
 
 #[test]

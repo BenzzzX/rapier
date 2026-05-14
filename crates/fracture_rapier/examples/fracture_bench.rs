@@ -662,7 +662,7 @@ fn measure_world_idle_step(
 fn build_world_stress_voronoi_state_100() -> Result<FxRapierWorld2D, Box<dyn Error>> {
     let asset = voronoi_asset_100()?;
     let mut world = FxRapierWorld2D::new();
-    world.set_gravity(Vector::ZERO);
+    world.set_gravity(Vector::new(0.0, -9.81));
     world.set_stress_settings(StressSettings {
         damage_per_overload: 2.0,
         max_fractures_per_frame: 8,
