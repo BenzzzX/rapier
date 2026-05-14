@@ -1069,6 +1069,10 @@ fn author_pixel_asset(
     Ok((asset, material_ids, support_mask, solid_count))
 }
 
+fn asset_point_to_body_local(local_origin: Vector, asset_point: Vector) -> Vector {
+    asset_point - local_origin
+}
+
 fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Option<Collider> {
     let voxel_size = asset.core().voxel_size();
     let occupancy = asset.occupancy();
@@ -1083,7 +1087,7 @@ fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Opt
             }
             let center = Vector::new((x as f32 + 0.5) * voxel_size, (y as f32 + 0.5) * voxel_size);
             shapes.push((
-                Pose::from_translation(center - local_origin),
+                Pose::from_translation(asset_point_to_body_local(local_origin, center)),
                 SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
             ));
         }
@@ -1151,7 +1155,7 @@ fn build_actor_collider(
             (coord.y as f32 + 0.5) * voxel_size,
         );
         shapes.push((
-            Pose::from_translation(center - local_origin),
+            Pose::from_translation(asset_point_to_body_local(local_origin, center)),
             SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
         ));
     }
@@ -1195,10 +1199,7 @@ fn build_cropped_actor_payload(
         actor.local_com.x - min_x as f32,
         actor.local_com.y - min_y as f32,
     );
-    let local_origin = Vector::new(
-        width as f32 * 0.5 - cropped_com.x,
-        height as f32 * 0.5 - cropped_com.y,
-    );
+    let local_origin = cropped_com;
     let row = AlchemyRapierBlastTransitionAdoptionRow {
         source_min_x: min_x.min(i32::MAX as u32) as i32,
         source_min_y: min_y.min(i32::MAX as u32) as i32,
@@ -1269,16 +1270,9 @@ fn material_hash(material_ids: &[u16]) -> u64 {
 }
 
 fn actor_host_local_origin(runtime: &VoxelRuntime, actor_id: FxActorId) -> AlchemyRapierVec2 {
-    let width = runtime.asset().core().occupancy().width() as f32;
-    let height = runtime.asset().core().occupancy().height() as f32;
-    if let Some(actor) = runtime.family().actor(actor_id) {
-        ffi_vec(Vector::new(
-            width * 0.5 - actor.local_com.x,
-            height * 0.5 - actor.local_com.y,
-        ))
-    } else {
-        AlchemyRapierVec2::default()
-    }
+    actor_com(runtime, actor_id)
+        .map(ffi_vec)
+        .unwrap_or_default()
 }
 
 fn actor_solid_count(runtime: &VoxelRuntime, actor_id: FxActorId) -> usize {
@@ -1338,7 +1332,8 @@ fn actor_com(runtime: &VoxelRuntime, actor_id: FxActorId) -> Option<Vector> {
 }
 
 fn asset_point_to_world(body_pose: &Pose, old_local_origin: Vector, asset_point: Vector) -> Vector {
-    body_pose.translation + body_pose.rotation * (asset_point - old_local_origin)
+    body_pose.translation
+        + body_pose.rotation * asset_point_to_body_local(old_local_origin, asset_point)
 }
 
 fn try_apply_dirty_pixel_split(
@@ -1439,6 +1434,7 @@ fn try_apply_dirty_pixel_split(
             world,
             body_handle,
             source_collider_handle,
+            source_pose,
             &state,
             event,
             source_linvel,
@@ -1488,6 +1484,7 @@ fn create_pending_split_adoptions(
     world: &mut AlchemyRapierWorldInner,
     source_body_handle: RigidBodyHandle,
     source_collider_handle: ColliderHandle,
+    source_pose: Pose,
     source_state: &PixelRigidbodyState,
     event: &SplitEvent,
     source_linvel: Vector,
@@ -1497,10 +1494,9 @@ fn create_pending_split_adoptions(
     source_rotation: f32,
     material_ids: &[u16],
 ) -> bool {
-    let Some(source_body) = world.bodies.get(source_body_handle) else {
+    if !world.bodies.contains(source_body_handle) {
         return false;
-    };
-    let source_pose = *source_body.position();
+    }
     let mut created_any = false;
     for child_actor in &event.created_children {
         let Some((mut row, source_cells, child_words, child_materials)) =
@@ -1527,15 +1523,12 @@ fn create_pending_split_adoptions(
         let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin) else {
             continue;
         };
-        let child_source_local_origin = Vector::new(
+        let child_source_com = Vector::new(
             row.source_min_x as f32 + child_local_origin.x,
             row.source_min_y as f32 + child_local_origin.y,
         );
-        let child_position = asset_point_to_world(
-            &source_pose,
-            source_state.local_origin,
-            child_source_local_origin,
-        );
+        let child_position =
+            asset_point_to_world(&source_pose, source_state.local_origin, child_source_com);
         let child_body = world.bodies.insert(
             RigidBodyBuilder::dynamic()
                 .translation(child_position)
@@ -1711,7 +1704,20 @@ fn terrain_local_point(state: &TerrainChunkState, point: Vector) -> Vector {
         )
 }
 
-fn dynamic_query_body(
+fn is_alchemy_rigidbody_query_body_type(body_type: RigidBodyType) -> bool {
+    matches!(
+        body_type,
+        RigidBodyType::Dynamic
+            | RigidBodyType::KinematicPositionBased
+            | RigidBodyType::KinematicVelocityBased
+    )
+}
+
+fn collider_supports_kinematic_alchemy_query(collider: &Collider) -> bool {
+    collider.shape().as_compound().is_some()
+}
+
+fn alchemy_rigidbody_query_body(
     world: &AlchemyRapierWorldInner,
     collider: &Collider,
     ignored_body: Option<RigidBodyHandle>,
@@ -1721,7 +1727,13 @@ fn dynamic_query_body(
         return None;
     }
     let body = world.bodies.get(body_handle)?;
-    if body.body_type() == RigidBodyType::Dynamic {
+    let body_type = body.body_type();
+    if is_alchemy_rigidbody_query_body_type(body_type) {
+        if body_type != RigidBodyType::Dynamic
+            && !collider_supports_kinematic_alchemy_query(collider)
+        {
+            return None;
+        }
         Some(body_handle)
     } else {
         None
@@ -1741,7 +1753,7 @@ fn query_target(
     source_mask: u32,
 ) -> Option<QueryTarget> {
     if (source_mask & QUERY_SOURCE_DYNAMIC_RIGIDBODY) != 0 {
-        if let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) {
+        if let Some(body_handle) = alchemy_rigidbody_query_body(world, collider, ignored_body) {
             return Some(QueryTarget::Dynamic(body_handle));
         }
     }
@@ -3222,14 +3234,20 @@ pub extern "C" fn alchemy_rapier_query_surface_anchor(
             let Some(body) = world.bodies.get(target_body) else {
                 return empty_query_result(AlchemyRapierStatus::InvalidHandle);
             };
-            if body.body_type() != RigidBodyType::Dynamic {
+            if !is_alchemy_rigidbody_query_body_type(body.body_type()) {
                 return empty_query_result(AlchemyRapierStatus::Ok);
             }
+            let body_type = body.body_type();
 
             for collider_handle in body.colliders() {
                 let Some(collider) = world.colliders.get(*collider_handle) else {
                     continue;
                 };
+                if body_type != RigidBodyType::Dynamic
+                    && !collider_supports_kinematic_alchemy_query(collider)
+                {
+                    continue;
+                }
                 candidate_count += 1;
                 let projection = collider
                     .shape()
