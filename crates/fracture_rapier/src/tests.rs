@@ -143,6 +143,23 @@ fn four_node_line_asset() -> fracture_voxel::AuthoredVoxelAsset {
     author_voxel_asset(input).unwrap()
 }
 
+fn two_by_two_four_node_asset() -> fracture_voxel::AuthoredVoxelAsset {
+    let mut input = VoxelAuthoringInput::new(
+        2,
+        2,
+        1.0,
+        vec![true, true, true, true],
+        vec![1, 1, 1, 1],
+        vec![5, 5, 5, 5],
+        vec![0, 1, 2, 3],
+    );
+    input.support_node_hint = Some(vec![Some(0), Some(1), Some(2), Some(3)]);
+    input.default_bond_health = 1.0;
+    input.default_tension_limit = 1.0;
+    input.default_shear_limit = 100.0;
+    author_voxel_asset(input).unwrap()
+}
+
 fn static_anchor_desc(id: u32, node: u32) -> StaticAnchorDesc {
     StaticAnchorDesc {
         id: ExternalBondId(id),
@@ -1509,63 +1526,140 @@ fn step_diagnostics_include_budget_when_no_fracture_occurs() {
 
 #[test]
 fn stress_frame_cap_is_global_across_families() {
-    let family_a = FxFamilyId(1);
-    let family_b = FxFamilyId(2);
-    let mut world = FxRapierWorld2D::new();
-    world.set_gravity(Vector::ZERO);
-    world.set_stress_settings(StressSettings {
-        damage_per_overload: 2.0,
-        max_fractures_per_frame: 1,
-        ..StressSettings::default()
-    });
-    world.add_destructible(family_a, two_node_asset(7)).unwrap();
-    world.add_destructible(family_b, two_node_asset(7)).unwrap();
+    {
+        let family_a = FxFamilyId(1);
+        let family_b = FxFamilyId(2);
+        let mut world = FxRapierWorld2D::new();
+        world.set_gravity(Vector::ZERO);
+        world.set_stress_settings(StressSettings {
+            damage_per_overload: 2.0,
+            max_fractures_per_frame: 1,
+            ..StressSettings::default()
+        });
+        world.add_destructible(family_a, two_node_asset(7)).unwrap();
+        world.add_destructible(family_b, two_node_asset(7)).unwrap();
 
-    let step = world
-        .step_with_stress_inputs_for_test(vec![
-            StressInput {
-                order_key: DeterministicOrderKey::new(0, 1, family_a, FxActorId(0), CommandId(0)),
-                actor: FxActorId(0),
-                node: SupportNodeId(0),
-                force: Vec2::new(10.0, 0.0),
-                source: DamageSource::Stress,
-            },
-            StressInput {
-                order_key: DeterministicOrderKey::new(0, 1, family_b, FxActorId(0), CommandId(0)),
-                actor: FxActorId(0),
-                node: SupportNodeId(0),
-                force: Vec2::new(10.0, 0.0),
-                source: DamageSource::Stress,
-            },
-        ])
-        .unwrap();
+        let step = world
+            .step_with_stress_inputs_for_test(vec![
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        0,
+                        1,
+                        family_a,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(10.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        0,
+                        1,
+                        family_b,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(10.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ])
+            .unwrap();
 
-    assert_eq!(step.report.fracture_events.len(), 1);
-    assert_eq!(step.report.split_events.len(), 1);
-    assert_eq!(step.report.fracture_events[0].family, family_a);
-    assert_eq!(step.diagnostics.global_stress_cap.input_count, 2);
-    assert_eq!(step.diagnostics.global_stress_cap.family_count, 2);
-    assert_eq!(
-        step.diagnostics
-            .global_stress_cap
-            .generated_commands_before_cap,
-        2
-    );
-    assert_eq!(
-        step.diagnostics
-            .global_stress_cap
-            .generated_commands_after_cap,
-        1
-    );
-    assert_eq!(step.diagnostics.global_stress_cap.frame_cap, 1);
-    assert_eq!(
-        step.diagnostics
-            .stress_profiles
-            .iter()
-            .map(|profile| profile.generated_commands_after_cap)
-            .sum::<usize>(),
-        1
-    );
+        assert_eq!(step.report.fracture_events.len(), 1);
+        assert_eq!(step.report.split_events.len(), 1);
+        assert_eq!(step.report.fracture_events[0].family, family_a);
+        assert_eq!(step.diagnostics.global_stress_cap.input_count, 2);
+        assert_eq!(step.diagnostics.global_stress_cap.family_count, 2);
+        assert_eq!(
+            step.diagnostics
+                .global_stress_cap
+                .generated_commands_before_cap,
+            2
+        );
+        assert_eq!(
+            step.diagnostics
+                .global_stress_cap
+                .generated_commands_after_cap,
+            1
+        );
+        assert_eq!(step.diagnostics.global_stress_cap.frame_cap, 1);
+        assert_eq!(
+            step.diagnostics
+                .stress_profiles
+                .iter()
+                .map(|profile| profile.generated_commands_after_cap)
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    {
+        let family = FxFamilyId(10);
+        let mut world = FxRapierWorld2D::new();
+        world.set_gravity(Vector::ZERO);
+        world.set_stress_settings(StressSettings {
+            damage_per_overload: 1.0,
+            beam_bending_moment_scale: 1.0,
+            section_aggregation_max_bonds: 4,
+            max_fractures_per_frame: 1,
+            max_iterations: 32,
+            ..StressSettings::default()
+        });
+        world
+            .add_destructible(family, two_by_two_four_node_asset())
+            .unwrap();
+        for (id, node) in [(7, 0), (8, 2)] {
+            let mut anchor = static_anchor_desc(id, node);
+            anchor.tension_limit = 100.0;
+            anchor.shear_limit = 100.0;
+            world
+                .connect_static_anchor(
+                    family,
+                    StaticAnchorConnectionDesc::new(anchor)
+                        .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+                )
+                .unwrap();
+        }
+
+        let step = world
+            .step_with_stress_inputs_for_test(vec![
+                StressInput {
+                    order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(0)),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(0.0, -4.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(1)),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(3),
+                    force: Vec2::new(0.0, -4.0),
+                    source: DamageSource::Stress,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            step.diagnostics
+                .global_stress_cap
+                .generated_commands_before_cap,
+            2
+        );
+        assert_eq!(
+            step.diagnostics
+                .global_stress_cap
+                .generated_commands_after_cap,
+            0
+        );
+        assert!(step.report.fracture_events.is_empty());
+        assert!(step.report.split_events.is_empty());
+    }
 }
 
 #[test]
@@ -2971,6 +3065,10 @@ fn snapshot_restore_stress_settings() {
         compression_limit_scale: 0.75,
         compression_damage_mode: CompressionDamageMode2D::Break,
         damage_per_overload: 3.0,
+        fracture_energy_budget: 4.0,
+        beam_bending_moment_scale: 5.0,
+        section_aggregation_max_bonds: 6,
+        section_axis_dot_min: 0.95,
         max_fractures_per_frame: 2,
         max_iterations: 6,
         convergence_epsilon: 0.125,

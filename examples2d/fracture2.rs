@@ -1,7 +1,7 @@
 use fracture_core::{
     CommandId, DamageSource, DeterministicOrderKey, ExternalBondId, ExternalTarget2D,
-    ExternalTargetKind, ExternalTargetToken, FxActorId, FxFamilyId, GridCoord, StaticAnchorDesc,
-    StressInput, StressSettings, StressSolver2D, SupportNodeId,
+    ExternalTargetKind, ExternalTargetToken, FractureTarget, FxActorId, FxFamilyId, GridCoord,
+    StaticAnchorDesc, StressInput, StressSettings, StressSolver2D, SupportNodeId,
 };
 use fracture_rapier::{
     FractureField2D, FxRapierWorld2D, QuickImpactSettings, StaticAnchorBodyPolicy,
@@ -57,7 +57,9 @@ enum DemoDriver {
     PhysicsOnly,
     BridgeGravity {
         apply_after_tick: u64,
-        applied: bool,
+        load_scale: f32,
+        load_step: f32,
+        fractured: bool,
     },
     VoxelCollisionFractureField {
         apply_after_tick: u64,
@@ -87,7 +89,9 @@ pub fn init_bridge_collapse(testbed: &mut Testbed) {
         BRIDGE_SCENE_CENTER,
         DemoDriver::BridgeGravity {
             apply_after_tick: 45,
-            applied: false,
+            load_scale: 0.25,
+            load_step: 0.20,
+            fractured: false,
         },
     );
 }
@@ -149,13 +153,16 @@ fn install_fracture_world(
             DemoDriver::PhysicsOnly => {}
             DemoDriver::BridgeGravity {
                 apply_after_tick,
-                applied,
+                load_scale,
+                load_step,
+                fractured,
             } => {
-                if !*applied && fracture_world.tick() >= *apply_after_tick {
-                    match apply_bridge_gravity_load(&mut fracture_world) {
+                if !*fractured && fracture_world.tick() >= *apply_after_tick {
+                    match apply_bridge_gravity_load(&mut fracture_world, *load_scale) {
                         Ok(step) => {
                             rebuild_graphics |= !step.report.split_events.is_empty();
-                            *applied = true;
+                            *fractured |= !step.report.split_events.is_empty();
+                            *load_scale += *load_step;
                         }
                         Err(err) => eprintln!("bridge fracture load failed: {err}"),
                     }
@@ -220,11 +227,7 @@ fn build_high_speed_wall_world() -> FxRapierWorld2D {
 }
 
 fn build_bridge_collapse_world() -> FxRapierWorld2D {
-    let mut world = base_world(StressSettings {
-        damage_per_overload: 2.0,
-        max_fractures_per_frame: 64,
-        ..StressSettings::default()
-    });
+    let mut world = base_world(bridge_stress_settings());
 
     world
         .add_destructible(BRIDGE_FAMILY, bridge_asset())
@@ -463,9 +466,9 @@ fn wall_asset() -> AuthoredVoxelAsset {
 
 fn bridge_asset() -> AuthoredVoxelAsset {
     let mut input = rect_voxel_input(BRIDGE_VOXEL_WIDTH, BRIDGE_VOXEL_HEIGHT, 6);
-    input.default_bond_health = 0.10;
-    input.default_tension_limit = 0.003;
-    input.default_shear_limit = 0.003;
+    input.default_bond_health = 8.0;
+    input.default_tension_limit = 0.40;
+    input.default_shear_limit = 0.40;
     author_demo_asset(
         input,
         VoxelClusterPolicy::structural_beam(VoxelClusterAxis::X, 16, 2),
@@ -628,6 +631,7 @@ fn place_actor_body_with_motion(
 
 fn apply_bridge_gravity_load(
     world: &mut FxRapierWorld2D,
+    load_scale: f32,
 ) -> Result<fracture_rapier::FxStepWithDiagnostics, fracture_rapier::FxRapierError> {
     let Some(family) = world.family(BRIDGE_FAMILY) else {
         return world.apply_fracture_commands_to_family(BRIDGE_FAMILY, &[]);
@@ -657,19 +661,27 @@ fn apply_bridge_gravity_load(
                 ),
                 actor: FxActorId(0),
                 node: node.id,
-                force: fracture_core::Vec2::new(0.0, GRAVITY.y * lever),
+                force: fracture_core::Vec2::new(0.0, GRAVITY.y * lever * load_scale.max(0.0)),
                 source: DamageSource::Stress,
             }
         })
         .collect::<Vec<_>>();
 
-    let solver = StressSolver2D::new(StressSettings {
-        damage_per_overload: 2.0,
-        max_fractures_per_frame: 64,
-        ..StressSettings::default()
-    });
+    let solver = StressSolver2D::new(bridge_stress_settings());
     let commands = solver.generate(family, &stress_inputs);
     world.apply_fracture_commands_to_family(BRIDGE_FAMILY, &commands)
+}
+
+fn bridge_stress_settings() -> StressSettings {
+    StressSettings {
+        damage_per_overload: 0.45,
+        fracture_energy_budget: 2.5,
+        beam_bending_moment_scale: 0.08,
+        section_aggregation_max_bonds: 8,
+        section_axis_dot_min: 0.92,
+        max_fractures_per_frame: 8,
+        ..StressSettings::default()
+    }
 }
 
 fn mirror_fracture_world(world: &FxRapierWorld2D, physics: &mut PhysicsState) {
@@ -792,11 +804,62 @@ mod tests {
             RigidBodyType::Fixed
         );
 
-        let step =
-            apply_bridge_gravity_load(&mut world).expect("bridge gravity fracture should apply");
+        let mut split_events = 0;
+        let mut fracture_events = 0;
+        let mut first_split_fractures = 0;
+        let mut first_split_fragments = 0;
+        let mut first_structural_break_max_root_distance = None;
+        for i in 0..120 {
+            let step = apply_bridge_gravity_load(&mut world, 0.25 + i as f32 * 0.20)
+                .expect("bridge gravity fracture should apply");
+            fracture_events += step.report.fracture_events.len();
+            split_events += step.report.split_events.len();
+            if split_events > 0 {
+                let family = world
+                    .family(BRIDGE_FAMILY)
+                    .expect("bridge family should exist after split");
+                first_split_fractures = step.report.fracture_events.len();
+                first_split_fragments = step.report.split_events[0].fragments.len();
+                first_structural_break_max_root_distance = Some(
+                    step.report
+                        .fracture_events
+                        .iter()
+                        .filter_map(|event| match event.target {
+                            FractureTarget::Bond(bond_id) => {
+                                let bond = family.asset().bond(bond_id)?;
+                                let node_a_min_x = family
+                                    .asset()
+                                    .node(bond.node_a)?
+                                    .voxels
+                                    .iter()
+                                    .map(|voxel| voxel.x)
+                                    .min()?;
+                                let node_b_min_x = family
+                                    .asset()
+                                    .node(bond.node_b)?
+                                    .voxels
+                                    .iter()
+                                    .map(|voxel| voxel.x)
+                                    .min()?;
+                                Some(node_a_min_x.min(node_b_min_x))
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .expect("first bridge split should include structural bond fractures"),
+                );
+                break;
+            }
+        }
 
-        assert!(!step.report.fracture_events.is_empty());
-        assert!(!step.report.split_events.is_empty());
+        assert!(fracture_events > 0);
+        assert!(split_events > 0);
+        assert!(first_split_fractures <= 8);
+        assert!(first_split_fragments <= 3);
+        assert!(
+            first_structural_break_max_root_distance.unwrap() <= 24,
+            "first structural bridge split should occur near the anchored root section"
+        );
         assert!(world.family(BRIDGE_FAMILY).unwrap().actor_count() > 1);
     }
 

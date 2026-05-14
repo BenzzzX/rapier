@@ -14,7 +14,7 @@ use crate::world::{FractureField2D, FractureFieldMode};
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -278,6 +278,10 @@ pub struct StressSettingsSnapshot {
     pub compression_limit_scale: f32,
     pub compression_damage_mode: CompressionDamageMode2D,
     pub damage_per_overload: f32,
+    pub fracture_energy_budget: f32,
+    pub beam_bending_moment_scale: f32,
+    pub section_aggregation_max_bonds: u16,
+    pub section_axis_dot_min: f32,
     pub max_fractures_per_frame: u16,
     pub max_iterations: u16,
     pub convergence_epsilon: f32,
@@ -292,6 +296,10 @@ impl From<StressSettings> for StressSettingsSnapshot {
             compression_limit_scale: value.compression_limit_scale,
             compression_damage_mode: value.compression_damage_mode,
             damage_per_overload: value.damage_per_overload,
+            fracture_energy_budget: value.fracture_energy_budget,
+            beam_bending_moment_scale: value.beam_bending_moment_scale,
+            section_aggregation_max_bonds: value.section_aggregation_max_bonds,
+            section_axis_dot_min: value.section_axis_dot_min,
             max_fractures_per_frame: value.max_fractures_per_frame,
             max_iterations: value.max_iterations,
             convergence_epsilon: value.convergence_epsilon,
@@ -308,6 +316,10 @@ impl From<StressSettingsSnapshot> for StressSettings {
             compression_limit_scale: value.compression_limit_scale,
             compression_damage_mode: value.compression_damage_mode,
             damage_per_overload: value.damage_per_overload,
+            fracture_energy_budget: value.fracture_energy_budget,
+            beam_bending_moment_scale: value.beam_bending_moment_scale,
+            section_aggregation_max_bonds: value.section_aggregation_max_bonds,
+            section_axis_dot_min: value.section_axis_dot_min,
             max_fractures_per_frame: value.max_fractures_per_frame,
             max_iterations: value.max_iterations,
             convergence_epsilon: value.convergence_epsilon,
@@ -717,6 +729,10 @@ fn write_stress(
     writer.f32(settings.compression_limit_scale)?;
     write_compression_damage_mode(writer, settings.compression_damage_mode);
     writer.f32(settings.damage_per_overload)?;
+    writer.f32(settings.fracture_energy_budget)?;
+    writer.f32(settings.beam_bending_moment_scale)?;
+    writer.u16(settings.section_aggregation_max_bonds);
+    writer.f32(settings.section_axis_dot_min)?;
     writer.u16(settings.max_fractures_per_frame);
     writer.u16(settings.max_iterations);
     writer.f32(settings.convergence_epsilon)?;
@@ -731,6 +747,10 @@ fn read_stress(reader: &mut Reader<'_>) -> Result<StressSettingsSnapshot, FxRapi
         compression_limit_scale: reader.f32("stress.compression_limit_scale")?,
         compression_damage_mode: read_compression_damage_mode(reader)?,
         damage_per_overload: reader.f32("stress.damage_per_overload")?,
+        fracture_energy_budget: reader.f32("stress.fracture_energy_budget")?,
+        beam_bending_moment_scale: reader.f32("stress.beam_bending_moment_scale")?,
+        section_aggregation_max_bonds: reader.u16("stress.section_aggregation_max_bonds")?,
+        section_axis_dot_min: reader.f32("stress.section_axis_dot_min")?,
         max_fractures_per_frame: reader.u16("stress.max_fractures_per_frame")?,
         max_iterations: reader.u16("stress.max_iterations")?,
         convergence_epsilon: reader.f32("stress.convergence_epsilon")?,

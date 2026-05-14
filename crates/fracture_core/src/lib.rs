@@ -1826,16 +1826,20 @@ pub struct FractureCommand {
 
 impl FractureCommand {
     fn stable_cmp(&self, rhs: &Self) -> Ordering {
-        self.order_key
-            .cmp(&rhs.order_key)
-            .then_with(|| self.target.cmp(&rhs.target))
-            .then_with(|| self.health_loss.to_bits().cmp(&rhs.health_loss.to_bits()))
-            .then_with(|| {
-                self.effective_length_loss
-                    .to_bits()
-                    .cmp(&rhs.effective_length_loss.to_bits())
-            })
+        compare_fracture_commands(self, rhs)
     }
+}
+
+pub fn compare_fracture_commands(lhs: &FractureCommand, rhs: &FractureCommand) -> Ordering {
+    lhs.order_key
+        .cmp(&rhs.order_key)
+        .then_with(|| lhs.target.cmp(&rhs.target))
+        .then_with(|| lhs.health_loss.to_bits().cmp(&rhs.health_loss.to_bits()))
+        .then_with(|| {
+            lhs.effective_length_loss
+                .to_bits()
+                .cmp(&rhs.effective_length_loss.to_bits())
+        })
 }
 
 pub fn sort_fracture_commands(commands: &mut [FractureCommand]) {
@@ -2350,6 +2354,10 @@ pub struct StressSettings {
     pub shear_limit_scale: f32,
     pub compression_damage_mode: CompressionDamageMode2D,
     pub damage_per_overload: f32,
+    pub fracture_energy_budget: f32,
+    pub beam_bending_moment_scale: f32,
+    pub section_aggregation_max_bonds: u16,
+    pub section_axis_dot_min: f32,
     pub max_fractures_per_frame: u16,
     pub max_iterations: u16,
     pub convergence_epsilon: f32,
@@ -2364,6 +2372,10 @@ impl Default for StressSettings {
             shear_limit_scale: 1.0,
             compression_damage_mode: CompressionDamageMode2D::Ignore,
             damage_per_overload: 1.0,
+            fracture_energy_budget: f32::MAX,
+            beam_bending_moment_scale: 0.0,
+            section_aggregation_max_bonds: 1,
+            section_axis_dot_min: 0.90,
             max_fractures_per_frame: u16::MAX,
             max_iterations: 8,
             convergence_epsilon: 0.000_1,
@@ -2377,7 +2389,7 @@ pub struct StressSolver2D {
     pub settings: StressSettings,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StressProfile {
     pub input_count: usize,
     pub actor_count_visited: usize,
@@ -2389,13 +2401,93 @@ pub struct StressProfile {
     pub dynamic_structural_bonds_tested: usize,
     pub generated_commands_before_cap: usize,
     pub generated_commands_after_cap: usize,
+    pub commands_culled_by_budget: usize,
     pub frame_cap: u16,
+    pub fracture_energy_budget: f32,
+    pub fracture_energy_spent: f32,
+    pub section_aggregation_max_bonds: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StressSolveReport {
     pub commands: Vec<FractureCommand>,
+    pub command_groups: Vec<StressFractureCommandGroup>,
     pub profile: StressProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StressFracturePriority {
+    pub energy_proxy: f32,
+    pub overload_ratio: f32,
+    pub fracture_cost: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StressFractureCommandGroup {
+    pub commands: Vec<FractureCommand>,
+    pub priority: StressFracturePriority,
+}
+
+impl StressFractureCommandGroup {
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    fn first_command(&self) -> &FractureCommand {
+        self.commands
+            .first()
+            .expect("stress fracture command groups must contain at least one command")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StressFractureCandidate {
+    commands: Vec<FractureCommand>,
+    overload_ratio: f32,
+    energy_proxy: f32,
+    fracture_cost: f32,
+    section_key: Option<StressSectionKey>,
+}
+
+impl StressFractureCandidate {
+    fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    fn first_command(&self) -> &FractureCommand {
+        self.commands
+            .first()
+            .expect("stress fracture candidates must contain at least one command")
+    }
+
+    fn priority(&self) -> StressFracturePriority {
+        StressFracturePriority {
+            energy_proxy: self.energy_proxy,
+            overload_ratio: self.overload_ratio,
+            fracture_cost: self.fracture_cost,
+        }
+    }
+
+    fn into_group(self) -> StressFractureCommandGroup {
+        let priority = self.priority();
+        StressFractureCommandGroup {
+            commands: self.commands,
+            priority,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StressSectionKey {
+    axis_x: i32,
+    axis_y: i32,
+    section_coord: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StressFixedPathStep {
+    parent: SupportNodeId,
+    edge: StressEdgeKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -2503,6 +2595,149 @@ fn stress_overload_ratio(load: f32, limit: f32) -> Option<f32> {
     } else {
         f32::INFINITY
     })
+}
+
+fn stress_select_failure(
+    load_failure: Option<StressFailureDecision2D>,
+    bending_failure: Option<StressFailureDecision2D>,
+) -> Option<StressFailureDecision2D> {
+    match (load_failure, bending_failure) {
+        (Some(load), Some(bending)) if bending.overload_ratio > load.overload_ratio => {
+            Some(bending)
+        }
+        (Some(load), _) => Some(load),
+        (None, Some(bending)) => Some(bending),
+        (None, None) => None,
+    }
+}
+
+fn stress_bending_overload_mode(
+    edge: &StressGraphEdge,
+    bending_moment: f32,
+    tension_limit: f32,
+) -> Option<StressFailureDecision2D> {
+    if edge.key.kind != StressEdgeKind::Internal || bending_moment <= 0.0 {
+        return None;
+    }
+    let section_limit = tension_limit * edge.effective_length.max(0.000_001);
+    stress_overload_ratio(bending_moment, section_limit).map(|overload_ratio| {
+        StressFailureDecision2D {
+            mode: StressFailureMode2D::Tension,
+            overload_ratio,
+        }
+    })
+}
+
+fn sort_stress_fracture_candidates(candidates: &mut [StressFractureCandidate]) {
+    candidates.sort_by(|a, b| {
+        compare_stress_priorities(b.priority(), a.priority())
+            .then_with(|| a.first_command().stable_cmp(b.first_command()))
+    });
+}
+
+fn compare_stress_priorities(lhs: StressFracturePriority, rhs: StressFracturePriority) -> Ordering {
+    lhs.energy_proxy
+        .total_cmp(&rhs.energy_proxy)
+        .then_with(|| lhs.overload_ratio.total_cmp(&rhs.overload_ratio))
+        .then_with(|| lhs.fracture_cost.total_cmp(&rhs.fracture_cost))
+}
+
+pub fn sort_stress_fracture_command_groups(groups: &mut [StressFractureCommandGroup]) {
+    groups.sort_by(|a, b| {
+        compare_stress_priorities(b.priority, a.priority)
+            .then_with(|| compare_fracture_commands(a.first_command(), b.first_command()))
+    });
+}
+
+fn stress_candidate_selection_enabled(settings: StressSettings) -> bool {
+    settings.fracture_energy_budget < f32::MAX
+        || settings.beam_bending_moment_scale > 0.0
+        || settings.section_aggregation_max_bonds > 1
+}
+
+fn aggregate_stress_section_candidates(
+    candidates: Vec<StressFractureCandidate>,
+    settings: StressSettings,
+) -> Vec<StressFractureCandidate> {
+    let max_bonds = settings.section_aggregation_max_bonds.max(1) as usize;
+    if max_bonds <= 1 {
+        return candidates;
+    }
+
+    let mut grouped = BTreeMap::<StressSectionKey, Vec<StressFractureCandidate>>::new();
+    let mut ungrouped = Vec::new();
+    for candidate in candidates {
+        if candidate.command_count() != 1 {
+            ungrouped.push(candidate);
+            continue;
+        }
+        if let Some(key) = candidate.section_key {
+            grouped.entry(key).or_default().push(candidate);
+        } else {
+            ungrouped.push(candidate);
+        }
+    }
+
+    let mut aggregated = ungrouped;
+    for (_, mut section_candidates) in grouped {
+        section_candidates.sort_by(|a, b| a.first_command().stable_cmp(b.first_command()));
+        for chunk in section_candidates.chunks(max_bonds) {
+            let mut commands = chunk
+                .iter()
+                .flat_map(|candidate| candidate.commands.iter().cloned())
+                .collect::<Vec<_>>();
+            sort_fracture_commands(&mut commands);
+            aggregated.push(StressFractureCandidate {
+                commands,
+                overload_ratio: chunk
+                    .iter()
+                    .map(|candidate| candidate.overload_ratio)
+                    .fold(0.0, f32::max),
+                energy_proxy: chunk.iter().map(|candidate| candidate.energy_proxy).sum(),
+                fracture_cost: chunk.iter().map(|candidate| candidate.fracture_cost).sum(),
+                section_key: Some(chunk[0].section_key.expect("section chunk key must exist")),
+            });
+        }
+    }
+    aggregated
+}
+
+fn select_stress_fracture_candidates(
+    candidates: Vec<StressFractureCandidate>,
+    settings: StressSettings,
+    profile: &mut StressProfile,
+) -> Vec<StressFractureCandidate> {
+    let cap = settings.max_fractures_per_frame as usize;
+    let budget = settings.fracture_energy_budget.max(0.0);
+    let budget_enabled = budget < f32::MAX;
+    let mut remaining = budget;
+    let mut selected_command_count = 0usize;
+    let mut selected = Vec::new();
+
+    for candidate in candidates {
+        let command_count = candidate.command_count();
+        if command_count == 0 {
+            continue;
+        }
+        if selected_command_count + command_count > cap {
+            continue;
+        }
+
+        if budget_enabled {
+            let cost = candidate.fracture_cost.max(f32::EPSILON);
+            if cost > remaining && !(selected.is_empty() && budget > 0.0) {
+                profile.commands_culled_by_budget += command_count;
+                continue;
+            }
+            remaining = (remaining - cost).max(0.0);
+            profile.fracture_energy_spent += cost.min(budget);
+        }
+
+        selected_command_count += command_count;
+        selected.push(candidate);
+    }
+
+    selected
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2613,12 +2848,16 @@ impl StressSolver2D {
         inputs: &[StressInput],
     ) -> StressSolveReport {
         let mut initial_force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
+        let mut explicit_force_by_node: BTreeMap<SupportNodeId, Vec2> = BTreeMap::new();
         let mut first_key_by_actor: BTreeMap<FxActorId, DeterministicOrderKey> = BTreeMap::new();
         let mut source_by_actor: BTreeMap<FxActorId, DamageSource> = BTreeMap::new();
         let mut sorted_inputs = inputs.to_vec();
         sorted_inputs.sort_by_key(|input| input.order_key);
-        for input in sorted_inputs {
+        for input in &sorted_inputs {
             *initial_force_by_node
+                .entry(input.node)
+                .or_insert(Vec2::ZERO) += input.force;
+            *explicit_force_by_node
                 .entry(input.node)
                 .or_insert(Vec2::ZERO) += input.force;
             first_key_by_actor
@@ -2684,6 +2923,8 @@ impl StressSolver2D {
             input_count: inputs.len(),
             actors_with_input: first_key_by_actor.len(),
             frame_cap: self.settings.max_fractures_per_frame,
+            fracture_energy_budget: self.settings.fracture_energy_budget,
+            section_aggregation_max_bonds: self.settings.section_aggregation_max_bonds,
             ..StressProfile::default()
         };
 
@@ -2697,7 +2938,15 @@ impl StressSolver2D {
         if let Some(baseline) = &context.load_baseline {
             stress_apply_load_baseline(&mut edge_loads, &edges, &node_context_by_id, baseline);
         }
+        let bending_moments = stress_bending_moments(
+            &edges,
+            &node_context_by_id,
+            &explicit_force_by_node,
+            self.settings.beam_bending_moment_scale,
+        );
 
+        let candidate_selection_enabled = stress_candidate_selection_enabled(self.settings);
+        let mut candidates_by_actor = BTreeMap::<FxActorId, Vec<StressFractureCandidate>>::new();
         let mut commands_by_actor = BTreeMap::<FxActorId, Vec<FractureCommand>>::new();
         for edge in &edges {
             let Some(load) = edge_loads.get(&edge.key).copied() else {
@@ -2735,7 +2984,7 @@ impl StressSolver2D {
                 * health_ratio.max(0.001);
             let shear_limit =
                 edge.shear_limit * self.settings.shear_limit_scale * health_ratio.max(0.001);
-            let Some(failure) = stress_overload_mode_2d(
+            let load_failure = stress_overload_mode_2d(
                 signed_load,
                 StressMaterialLimits2D {
                     tension: tension_limit,
@@ -2744,7 +2993,13 @@ impl StressSolver2D {
                 },
                 edge.effective_length,
                 self.settings.compression_damage_mode,
-            ) else {
+            );
+            let bending_failure = stress_bending_overload_mode(
+                edge,
+                bending_moments.get(&edge.key).copied().unwrap_or(0.0),
+                tension_limit,
+            );
+            let Some(failure) = stress_select_failure(load_failure, bending_failure) else {
                 continue;
             };
             let effective_length_loss = match failure.mode {
@@ -2756,36 +3011,90 @@ impl StressSolver2D {
                     CompressionDamageMode2D::Break => edge.effective_length,
                 },
             };
-            commands_by_actor
-                .entry(actor)
-                .or_default()
-                .push(FractureCommand {
-                    order_key,
-                    actor,
-                    target: match edge.target {
-                        StressEdgeTarget::Bond(id) => FractureTarget::Bond(id),
-                        StressEdgeTarget::ExternalBond(id) => FractureTarget::ExternalBond(id),
-                        StressEdgeTarget::Connection(id) => FractureTarget::Connection(id),
-                    },
-                    health_loss: self.settings.damage_per_overload,
-                    effective_length_loss,
-                    source: *source_by_actor.get(&actor).unwrap_or(&DamageSource::Stress),
-                });
+            let command = FractureCommand {
+                order_key,
+                actor,
+                target: match edge.target {
+                    StressEdgeTarget::Bond(id) => FractureTarget::Bond(id),
+                    StressEdgeTarget::ExternalBond(id) => FractureTarget::ExternalBond(id),
+                    StressEdgeTarget::Connection(id) => FractureTarget::Connection(id),
+                },
+                health_loss: self.settings.damage_per_overload,
+                effective_length_loss,
+                source: *source_by_actor.get(&actor).unwrap_or(&DamageSource::Stress),
+            };
+            if candidate_selection_enabled {
+                let overload_excess = (failure.overload_ratio - 1.0).max(0.0);
+                let energy_proxy = overload_excess * edge.effective_length.max(0.0);
+                let fracture_cost = (edge.base_health * edge.effective_length).max(f32::EPSILON);
+                let section_key =
+                    stress_section_key(edge, normal, &node_context_by_id, self.settings);
+                candidates_by_actor
+                    .entry(actor)
+                    .or_default()
+                    .push(StressFractureCandidate {
+                        commands: vec![command],
+                        overload_ratio: failure.overload_ratio,
+                        energy_proxy,
+                        fracture_cost,
+                        section_key,
+                    });
+            } else {
+                commands_by_actor.entry(actor).or_default().push(command);
+            }
         }
 
+        let mut command_groups = Vec::new();
         let mut commands = Vec::new();
-        for actor_id in family.actors.keys() {
-            let Some(mut actor_commands) = commands_by_actor.remove(actor_id) else {
-                continue;
-            };
-            sort_fracture_commands(&mut actor_commands);
-            profile.generated_commands_before_cap += actor_commands.len();
-            actor_commands.truncate(self.settings.max_fractures_per_frame as usize);
-            profile.generated_commands_after_cap += actor_commands.len();
-            commands.extend(actor_commands);
+        if candidate_selection_enabled {
+            let mut candidates = Vec::new();
+            for actor_id in family.actors.keys() {
+                let Some(actor_candidates) = candidates_by_actor.remove(actor_id) else {
+                    continue;
+                };
+                candidates.extend(aggregate_stress_section_candidates(
+                    actor_candidates,
+                    self.settings,
+                ));
+            }
+            profile.generated_commands_before_cap = candidates
+                .iter()
+                .map(StressFractureCandidate::command_count)
+                .sum::<usize>();
+            sort_stress_fracture_candidates(&mut candidates);
+            let selected =
+                select_stress_fracture_candidates(candidates, self.settings, &mut profile);
+            profile.generated_commands_after_cap = selected
+                .iter()
+                .map(StressFractureCandidate::command_count)
+                .sum::<usize>();
+            command_groups.extend(
+                selected
+                    .into_iter()
+                    .map(StressFractureCandidate::into_group),
+            );
+            commands = command_groups
+                .iter()
+                .flat_map(|group| group.commands.iter().cloned())
+                .collect::<Vec<_>>();
+        } else {
+            for actor_id in family.actors.keys() {
+                let Some(mut actor_commands) = commands_by_actor.remove(actor_id) else {
+                    continue;
+                };
+                sort_fracture_commands(&mut actor_commands);
+                profile.generated_commands_before_cap += actor_commands.len();
+                actor_commands.truncate(self.settings.max_fractures_per_frame as usize);
+                profile.generated_commands_after_cap += actor_commands.len();
+                commands.extend(actor_commands);
+            }
         }
         sort_fracture_commands(&mut commands);
-        StressSolveReport { commands, profile }
+        StressSolveReport {
+            commands,
+            command_groups,
+            profile,
+        }
     }
 
     fn stress_gravity_forces(
@@ -3245,6 +3554,92 @@ fn stress_fixed_reachable_nodes(
     seen
 }
 
+fn stress_fixed_path_tree(
+    edges: &[StressGraphEdge],
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> BTreeMap<SupportNodeId, StressFixedPathStep> {
+    let incident = stress_incident_edges(edges);
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for (node, context) in node_context_by_id {
+        if context.fixed && seen.insert(*node) {
+            queue.push_back(*node);
+        }
+    }
+
+    let mut tree = BTreeMap::new();
+    while let Some(node) = queue.pop_front() {
+        let Some(incident_edges) = incident.get(&node) else {
+            continue;
+        };
+        for edge in incident_edges {
+            let Some(other) = stress_edge_other_node(edge, node) else {
+                continue;
+            };
+            if !node_context_by_id.contains_key(&other) || !seen.insert(other) {
+                continue;
+            }
+            tree.insert(
+                other,
+                StressFixedPathStep {
+                    parent: node,
+                    edge: edge.key,
+                },
+            );
+            queue.push_back(other);
+        }
+    }
+    tree
+}
+
+fn stress_bending_moments(
+    edges: &[StressGraphEdge],
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+    explicit_force_by_node: &BTreeMap<SupportNodeId, Vec2>,
+    scale: f32,
+) -> BTreeMap<StressEdgeKey, f32> {
+    if !scale.is_finite() || scale <= 0.0 || explicit_force_by_node.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let fixed_path_tree = stress_fixed_path_tree(edges, node_context_by_id);
+    let edges_by_key = edges
+        .iter()
+        .map(|edge| (edge.key, edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut moments = BTreeMap::<StressEdgeKey, f32>::new();
+    for (input_node, force) in explicit_force_by_node {
+        if !valid_vec2(*force) {
+            continue;
+        }
+        let Some(input_position) = node_context_by_id.get(input_node).map(|node| node.position)
+        else {
+            continue;
+        };
+        let mut node = *input_node;
+        for _ in 0..node_context_by_id.len() {
+            let Some(step) = fixed_path_tree.get(&node).copied() else {
+                break;
+            };
+            let Some(edge) = edges_by_key.get(&step.edge).copied() else {
+                break;
+            };
+            let Some((axis, center)) = stress_edge_axis_and_center(edge, node_context_by_id) else {
+                node = step.parent;
+                continue;
+            };
+            let perpendicular_force = (*force - axis * force.dot(axis)).length();
+            let lever = (input_position - center).dot(axis).abs();
+            let moment = perpendicular_force * lever * scale;
+            if moment.is_finite() && moment > 0.0 {
+                *moments.entry(step.edge).or_insert(0.0) += moment;
+            }
+            node = step.parent;
+        }
+    }
+    moments
+}
+
 fn stress_accumulate_edge_load(
     edge_loads: &mut BTreeMap<StressEdgeKey, StressEdgeLoad>,
     key: StressEdgeKey,
@@ -3372,6 +3767,64 @@ fn stress_edge_axes(
     }
     stress_edge_center_to_center_axes(edge, node_context_by_id)
         .unwrap_or((edge.normal, edge.tangent))
+}
+
+fn stress_edge_axis_and_center(
+    edge: &StressGraphEdge,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+) -> Option<(Vec2, Vec2)> {
+    let (axis, _) = stress_edge_axes(edge, node_context_by_id);
+    let axis = canonical_stress_axis(axis)?;
+    let position_a = node_context_by_id.get(&edge.node_a)?.position;
+    let position_b = edge
+        .node_b
+        .and_then(|node| node_context_by_id.get(&node).map(|node| node.position));
+    let center = match position_b {
+        Some(position_b) => (position_a + position_b) * 0.5,
+        None => position_a,
+    };
+    valid_vec2(center).then_some((axis, center))
+}
+
+fn stress_section_key(
+    edge: &StressGraphEdge,
+    axis: Vec2,
+    node_context_by_id: &BTreeMap<SupportNodeId, StressNodeContext2D>,
+    settings: StressSettings,
+) -> Option<StressSectionKey> {
+    if edge.key.kind != StressEdgeKind::Internal || settings.section_aggregation_max_bonds <= 1 {
+        return None;
+    }
+    let axis = canonical_stress_axis(axis)?;
+    let center = stress_edge_axis_and_center(edge, node_context_by_id)?.1;
+    let dot_min = settings.section_axis_dot_min.clamp(0.0, 0.999);
+    let axis_scale = (1.0 / (1.0 - dot_min).max(0.001)).max(1.0);
+    let section_scale = 1024.0;
+    Some(StressSectionKey {
+        axis_x: quantize_stress_value(axis.x, axis_scale)?,
+        axis_y: quantize_stress_value(axis.y, axis_scale)?,
+        section_coord: quantize_stress_value(center.dot(axis), section_scale)?,
+    })
+}
+
+fn canonical_stress_axis(axis: Vec2) -> Option<Vec2> {
+    let mut axis = normalized_valid(axis)?;
+    if axis.x < 0.0 || (axis.x == 0.0 && axis.y < 0.0) {
+        axis = axis * -1.0;
+    }
+    Some(axis)
+}
+
+fn quantize_stress_value(value: f32, scale: f32) -> Option<i32> {
+    if !value.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let scaled = (value * scale).round();
+    if scaled < i32::MIN as f32 || scaled > i32::MAX as f32 {
+        None
+    } else {
+        Some(scaled as i32)
+    }
 }
 
 fn stress_internal_edge_authored_axes(
@@ -7016,6 +7469,10 @@ mod tests {
         assert_eq!(report.profile.generated_commands_after_cap, 2);
         assert_eq!(report.profile.frame_cap, 1);
         assert_eq!(report.commands.len(), 2);
+        assert!(
+            report.command_groups.is_empty(),
+            "default stress path must not materialize command groups"
+        );
         assert_eq!(solver.generate(&family, &[]).len(), 0);
         assert_eq!(report.commands[0].actor, FxActorId(0));
         assert_eq!(
@@ -7026,6 +7483,321 @@ mod tests {
         assert_eq!(
             report.commands[1].target,
             FractureTarget::ExternalBond(ExternalBondId(8))
+        );
+    }
+
+    #[test]
+    fn stress_budget_prioritizes_larger_failure_before_deterministic_order() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            fracture_energy_budget: 0.5,
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        });
+
+        let report = solver.generate_with_profile(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(3.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+
+        assert_eq!(report.profile.generated_commands_before_cap, 2);
+        assert_eq!(report.profile.generated_commands_after_cap, 1);
+        assert_eq!(report.commands.len(), 1);
+        assert_eq!(
+            report.commands[0].target,
+            FractureTarget::ExternalBond(ExternalBondId(8))
+        );
+    }
+
+    #[test]
+    fn stress_default_cap_preserves_stable_command_order() {
+        let mut family = family_for(asset_from_rows(&["##"], &[Some(0), Some(1)]));
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 1))
+            .unwrap();
+        let solver = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        });
+
+        let report = solver.generate_with_profile(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(1.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family.id,
+                        FxActorId(0),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(1),
+                    force: Vec2::new(3.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+
+        assert_eq!(report.profile.generated_commands_before_cap, 2);
+        assert_eq!(report.profile.generated_commands_after_cap, 1);
+        assert_eq!(report.commands.len(), 1);
+        assert!(
+            report.command_groups.is_empty(),
+            "default stress path must not materialize command groups"
+        );
+        assert_eq!(
+            report.commands[0].target,
+            FractureTarget::ExternalBond(ExternalBondId(7))
+        );
+    }
+
+    #[test]
+    fn stress_group_cap_skips_oversized_group_without_truncating() {
+        let family_id = FxFamilyId(1);
+        let actor = FxActorId(0);
+        let mut profile = StressProfile::default();
+        let selected = select_stress_fracture_candidates(
+            vec![
+                StressFractureCandidate {
+                    commands: vec![
+                        break_bond_command(1, family_id, actor, BondId(0)),
+                        break_bond_command(2, family_id, actor, BondId(1)),
+                    ],
+                    overload_ratio: 4.0,
+                    energy_proxy: 4.0,
+                    fracture_cost: 1.0,
+                    section_key: None,
+                },
+                StressFractureCandidate {
+                    commands: vec![break_bond_command(3, family_id, actor, BondId(2))],
+                    overload_ratio: 2.0,
+                    energy_proxy: 2.0,
+                    fracture_cost: 1.0,
+                    section_key: None,
+                },
+            ],
+            StressSettings {
+                max_fractures_per_frame: 1,
+                ..Default::default()
+            },
+            &mut profile,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].commands.len(), 1);
+        assert_eq!(
+            selected[0].commands[0].target,
+            FractureTarget::Bond(BondId(2))
+        );
+    }
+
+    #[test]
+    fn stress_energy_budget_is_shared_across_family_actors() {
+        let mut family = family_for(asset_from_rows(
+            &["####"],
+            &[Some(0), Some(1), Some(2), Some(3)],
+        ));
+        let family_id = family.id;
+        apply_fracture_commands(
+            &mut family,
+            &[break_bond_command(0, family_id, FxActorId(0), BondId(1))],
+        );
+        split_dirty_actors(&mut family);
+        family
+            .connect_static_anchor(static_anchor_desc(7, 0))
+            .unwrap();
+        family
+            .connect_static_anchor(static_anchor_desc(8, 2))
+            .unwrap();
+
+        let report = StressSolver2D::new(StressSettings {
+            damage_per_overload: 1.0,
+            fracture_energy_budget: 0.5,
+            max_fractures_per_frame: 4,
+            ..Default::default()
+        })
+        .generate_with_profile(
+            &family,
+            &[
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family_id,
+                        FxActorId(0),
+                        CommandId(0),
+                    ),
+                    actor: FxActorId(0),
+                    node: SupportNodeId(0),
+                    force: Vec2::new(3.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+                StressInput {
+                    order_key: DeterministicOrderKey::new(
+                        1,
+                        1,
+                        family_id,
+                        FxActorId(1),
+                        CommandId(1),
+                    ),
+                    actor: FxActorId(1),
+                    node: SupportNodeId(2),
+                    force: Vec2::new(3.0, 0.0),
+                    source: DamageSource::Stress,
+                },
+            ],
+        );
+
+        assert_eq!(report.profile.generated_commands_before_cap, 2);
+        assert_eq!(report.profile.generated_commands_after_cap, 1);
+        assert_eq!(report.profile.commands_culled_by_budget, 1);
+        assert_eq!(report.commands.len(), 1);
+    }
+
+    #[test]
+    fn stress_beam_bending_is_default_off_and_prioritizes_root_path_bond() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["###"],
+            &[Some(0), Some(1), Some(2)],
+            1.0,
+            100.0,
+        ));
+        let mut anchor = static_anchor_desc(7, 0);
+        anchor.tension_limit = 100.0;
+        anchor.shear_limit = 100.0;
+        family.connect_static_anchor(anchor).unwrap();
+        let input = StressInput {
+            order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+            actor: FxActorId(0),
+            node: SupportNodeId(2),
+            force: Vec2::new(0.0, -4.0),
+            source: DamageSource::Stress,
+        };
+
+        let default_commands = StressSolver2D::new(StressSettings {
+            max_iterations: 32,
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        })
+        .generate(&family, &[input.clone()]);
+        assert!(
+            default_commands.is_empty(),
+            "bending moment must remain opt-in"
+        );
+
+        let bending_commands = StressSolver2D::new(StressSettings {
+            beam_bending_moment_scale: 1.0,
+            max_iterations: 32,
+            max_fractures_per_frame: 1,
+            ..Default::default()
+        })
+        .generate(&family, &[input]);
+
+        assert_eq!(bending_commands.len(), 1);
+        assert_eq!(bending_commands[0].target, FractureTarget::Bond(BondId(0)));
+    }
+
+    #[test]
+    fn stress_section_aggregation_selects_whole_section_over_budget() {
+        let mut family = family_for(asset_from_rows_with_limits(
+            &["##", "##"],
+            &[Some(0), Some(1), Some(2), Some(3)],
+            1.0,
+            100.0,
+        ));
+        for (id, node) in [(7, 0), (8, 2)] {
+            let mut anchor = static_anchor_desc(id, node);
+            anchor.tension_limit = 100.0;
+            anchor.shear_limit = 100.0;
+            family.connect_static_anchor(anchor).unwrap();
+        }
+        let inputs = [
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                node: SupportNodeId(1),
+                force: Vec2::new(0.0, -4.0),
+                source: DamageSource::Stress,
+            },
+            StressInput {
+                order_key: DeterministicOrderKey::new(1, 1, family.id, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                node: SupportNodeId(3),
+                force: Vec2::new(0.0, -4.0),
+                source: DamageSource::Stress,
+            },
+        ];
+
+        let report = StressSolver2D::new(StressSettings {
+            beam_bending_moment_scale: 1.0,
+            section_aggregation_max_bonds: 4,
+            fracture_energy_budget: 0.5,
+            max_fractures_per_frame: 2,
+            max_iterations: 32,
+            ..Default::default()
+        })
+        .generate_with_profile(&family, &inputs);
+
+        assert_eq!(report.profile.generated_commands_before_cap, 2);
+        assert_eq!(report.profile.generated_commands_after_cap, 2);
+        assert_eq!(report.commands.len(), 2);
+        assert!(
+            report
+                .commands
+                .iter()
+                .all(|command| matches!(command.target, FractureTarget::Bond(_)))
         );
     }
 

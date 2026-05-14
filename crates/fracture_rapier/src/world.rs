@@ -4,11 +4,11 @@ use fracture_core::{
     CommandId, ConnectionError, ConnectionId, DamageInput, DamageSource, DeterministicOrderKey,
     DynamicConnectionPolicy, ExternalBondId, FractureCommand, FractureTarget, FxActorId, FxFamily,
     FxFamilyId, GridCoord, MergeActorsResult, SplitEvent, StressBaselineEdge2D,
-    StressBaselineTarget2D, StressContext2D, StressInput, StressLoadBaseline2D, StressProfile,
-    StressSettings, StressSolver2D, SupportNodeId, Vec2, apply_fracture_commands,
-    generate_damage_commands,
+    StressBaselineTarget2D, StressContext2D, StressFractureCommandGroup, StressInput,
+    StressLoadBaseline2D, StressProfile, StressSettings, StressSolver2D, SupportNodeId, Vec2,
+    apply_fracture_commands, generate_damage_commands,
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
-    sort_fracture_commands, split_dirty_actors,
+    sort_fracture_commands, sort_stress_fracture_command_groups, split_dirty_actors,
 };
 use fracture_voxel::AuthoredVoxelAsset;
 use rapier2d::prelude::*;
@@ -174,6 +174,7 @@ struct FamilyStressSolveResult {
     family_id: FxFamilyId,
     profile: StressProfile,
     commands: Vec<FractureCommand>,
+    command_groups: Vec<StressFractureCommandGroup>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,8 +194,15 @@ impl FamilyStressSolveJob<'_> {
             family_id: self.family_id,
             profile,
             commands: stress_report.commands,
+            command_groups: stress_report.command_groups,
         }
     }
+}
+
+fn stress_command_group_cap_enabled(settings: StressSettings) -> bool {
+    settings.fracture_energy_budget < f32::MAX
+        || settings.beam_bending_moment_scale > 0.0
+        || settings.section_aggregation_max_bonds > 1
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -926,23 +934,54 @@ impl FxRapierWorld2D {
         stress_results.sort_by_key(|result| result.family_id);
 
         let mut family_profiles = BTreeMap::new();
-        let mut candidate_commands = Vec::new();
-        for result in stress_results {
-            family_profiles.insert(result.family_id, result.profile);
-            candidate_commands.extend(result.commands);
-        }
-
-        sort_fracture_commands(&mut candidate_commands);
-        let generated_commands_before_cap = candidate_commands.len();
-        candidate_commands.truncate(global_cap as usize);
-        let generated_commands_after_cap = candidate_commands.len();
-
         let mut selected_by_family: BTreeMap<FxFamilyId, Vec<FractureCommand>> = BTreeMap::new();
-        for command in candidate_commands {
-            selected_by_family
-                .entry(command.order_key.family_id)
-                .or_default()
-                .push(command);
+        let generated_commands_before_cap;
+        let generated_commands_after_cap;
+        if stress_command_group_cap_enabled(self.stress_solver.settings) {
+            let mut candidate_groups = Vec::new();
+            for result in stress_results {
+                family_profiles.insert(result.family_id, result.profile);
+                candidate_groups.extend(result.command_groups);
+            }
+            sort_stress_fracture_command_groups(&mut candidate_groups);
+            generated_commands_before_cap = candidate_groups
+                .iter()
+                .map(StressFractureCommandGroup::command_count)
+                .sum();
+            let mut selected_command_count = 0usize;
+            for group in candidate_groups {
+                let group_command_count = group.command_count();
+                if group_command_count == 0 {
+                    continue;
+                }
+                if selected_command_count + group_command_count > global_cap as usize {
+                    continue;
+                }
+                selected_command_count += group_command_count;
+                for command in group.commands {
+                    selected_by_family
+                        .entry(command.order_key.family_id)
+                        .or_default()
+                        .push(command);
+                }
+            }
+            generated_commands_after_cap = selected_command_count;
+        } else {
+            let mut candidate_commands = Vec::new();
+            for result in stress_results {
+                family_profiles.insert(result.family_id, result.profile);
+                candidate_commands.extend(result.commands);
+            }
+            sort_fracture_commands(&mut candidate_commands);
+            generated_commands_before_cap = candidate_commands.len();
+            candidate_commands.truncate(global_cap as usize);
+            generated_commands_after_cap = candidate_commands.len();
+            for command in candidate_commands {
+                selected_by_family
+                    .entry(command.order_key.family_id)
+                    .or_default()
+                    .push(command);
+            }
         }
         let capped_stress_counts = selected_by_family
             .iter()
@@ -3089,6 +3128,13 @@ fn validate_stress_snapshot(snapshot: StressSettingsSnapshot) -> Result<(), FxRa
     if !snapshot.tension_limit_scale.is_finite()
         || !snapshot.shear_limit_scale.is_finite()
         || !snapshot.damage_per_overload.is_finite()
+        || !snapshot.fracture_energy_budget.is_finite()
+        || snapshot.fracture_energy_budget < 0.0
+        || !snapshot.beam_bending_moment_scale.is_finite()
+        || snapshot.beam_bending_moment_scale < 0.0
+        || !snapshot.section_axis_dot_min.is_finite()
+        || snapshot.section_axis_dot_min < 0.0
+        || snapshot.section_axis_dot_min > 1.0
         || !snapshot.convergence_epsilon.is_finite()
     {
         return Err(FxRapierSnapshotError::InvalidValue("stress").into());
