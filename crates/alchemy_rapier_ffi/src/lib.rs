@@ -1,3 +1,4 @@
+use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -121,6 +122,28 @@ pub struct AlchemyRapierVec2Result {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierQueryHit {
+    pub body_packed_id: u64,
+    pub collider_packed_id: u64,
+    pub point: AlchemyRapierVec2,
+    pub normal: AlchemyRapierVec2,
+    pub local_point: AlchemyRapierVec2,
+    pub point_velocity: AlchemyRapierVec2,
+    pub distance: f32,
+    pub fraction: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierQueryResult {
+    pub status: AlchemyRapierStatus,
+    pub hit_count: usize,
+    pub written_count: usize,
+    pub candidate_count: usize,
+}
+
+#[repr(C)]
 pub struct AlchemyRapierWorld {
     _private: [u8; 0],
 }
@@ -224,6 +247,19 @@ fn ffi_vec(value: Vector) -> AlchemyRapierVec2 {
     AlchemyRapierVec2 {
         x: value.x,
         y: value.y,
+    }
+}
+
+fn pose_translation(value: Vector) -> Pose {
+    Pose::from_parts(value, Rotation::identity())
+}
+
+fn normalized_or_zero(value: Vector) -> Vector {
+    let length = value.length();
+    if length > 0.000001 && length.is_finite() {
+        value / length
+    } else {
+        Vector::ZERO
     }
 }
 
@@ -363,6 +399,132 @@ fn make_body_state(handle: RigidBodyHandle, body: &RigidBody) -> AlchemyRapierBo
 
 fn status_result(status: AlchemyRapierStatus) -> AlchemyRapierStatus {
     status
+}
+
+fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
+    AlchemyRapierQueryResult {
+        status,
+        hit_count: 0,
+        written_count: 0,
+        candidate_count: 0,
+    }
+}
+
+fn dynamic_query_body(
+    world: &AlchemyRapierWorldInner,
+    collider: &Collider,
+    ignored_body: Option<RigidBodyHandle>,
+) -> Option<RigidBodyHandle> {
+    let body_handle = collider.parent()?;
+    if ignored_body == Some(body_handle) {
+        return None;
+    }
+    let body = world.bodies.get(body_handle)?;
+    if body.body_type() == RigidBodyType::Dynamic {
+        Some(body_handle)
+    } else {
+        None
+    }
+}
+
+fn make_query_hit(
+    world: &AlchemyRapierWorldInner,
+    body_handle: RigidBodyHandle,
+    collider_handle: ColliderHandle,
+    point: Vector,
+    normal: Vector,
+    distance: f32,
+    fraction: f32,
+) -> Option<AlchemyRapierQueryHit> {
+    let body = world.bodies.get(body_handle)?;
+    Some(AlchemyRapierQueryHit {
+        body_packed_id: pack_body_handle(body_handle),
+        collider_packed_id: pack_collider_handle(collider_handle),
+        point: ffi_vec(point),
+        normal: ffi_vec(normalized_or_zero(normal)),
+        local_point: ffi_vec(body.position().inverse_transform_point(point)),
+        point_velocity: ffi_vec(body.velocity_at_point(point)),
+        distance,
+        fraction,
+    })
+}
+
+fn write_query_hit(
+    hit: AlchemyRapierQueryHit,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+    hit_count: &mut usize,
+    written_count: &mut usize,
+) {
+    if *written_count < hit_capacity {
+        unsafe {
+            *hits.add(*written_count) = hit;
+        }
+        *written_count += 1;
+    }
+    *hit_count += 1;
+}
+
+fn query_output_valid(hits: *mut AlchemyRapierQueryHit, hit_capacity: usize) -> bool {
+    hit_capacity == 0 || !hits.is_null()
+}
+
+fn closest_capsule_axis_point(point: Vector, origin: Vector, half_height: f32) -> Vector {
+    Vector::new(
+        origin.x,
+        point
+            .y
+            .max(origin.y - half_height)
+            .min(origin.y + half_height),
+    )
+}
+
+fn capsule_overlap_hit_point(
+    collider: &Collider,
+    origin: Vector,
+    half_height: f32,
+) -> (Vector, Vector, f32) {
+    let aabb = collider.shape().compute_aabb(collider.position());
+    let aabb_center_y = 0.5 * (aabb.mins.y + aabb.maxs.y);
+    let sample_points = [
+        Vector::new(origin.x, origin.y - half_height),
+        Vector::new(origin.x, origin.y + half_height),
+        Vector::new(
+            origin.x,
+            aabb_center_y
+                .max(origin.y - half_height)
+                .min(origin.y + half_height),
+        ),
+    ];
+
+    let mut best_point = sample_points[0];
+    let mut best_axis_point = sample_points[0];
+    let mut best_distance_sq = f32::INFINITY;
+    for sample in sample_points {
+        let projection = collider
+            .shape()
+            .project_point(collider.position(), sample, true);
+        let shape_point = projection.point;
+        let axis_point = if projection.is_inside {
+            sample
+        } else {
+            closest_capsule_axis_point(shape_point, origin, half_height)
+        };
+        let distance_sq = (shape_point - axis_point).length_squared();
+        if distance_sq < best_distance_sq {
+            best_distance_sq = distance_sq;
+            best_point = shape_point;
+            best_axis_point = axis_point;
+        }
+    }
+
+    let distance = best_distance_sq.max(0.0).sqrt();
+    let normal = if distance > 0.000001 {
+        (best_point - best_axis_point) / distance
+    } else {
+        Vector::ZERO
+    };
+    (best_point, normal, distance)
 }
 
 #[unsafe(no_mangle)]
@@ -876,6 +1038,297 @@ pub extern "C" fn alchemy_rapier_apply_body_torque_impulse(
     body_mutation(world, handle, |body| {
         body.apply_torque_impulse(impulse, wake_up != 0);
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_cast_segment(
+    world: *mut AlchemyRapierWorld,
+    from: AlchemyRapierVec2,
+    to: AlchemyRapierVec2,
+    radius: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let from = vector(from);
+        let to = vector(to);
+        let delta = to - from;
+        let distance = delta.length();
+        if !distance.is_finite() || distance <= 0.000001 {
+            return AlchemyRapierQueryResult {
+                status: AlchemyRapierStatus::Ok,
+                hit_count: 0,
+                written_count: 0,
+                candidate_count: 0,
+            };
+        }
+
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        if radius <= 0.000001 {
+            let ray = Ray::new(from, delta / distance);
+            for (collider_handle, collider) in world.colliders.iter_enabled() {
+                let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+                    continue;
+                };
+                candidate_count += 1;
+                if let Some(intersection) = collider.shape().cast_ray_and_get_normal(
+                    collider.position(),
+                    &ray,
+                    distance,
+                    true,
+                ) {
+                    let fraction = (intersection.time_of_impact / distance).clamp(0.0, 1.0);
+                    let point = ray.point_at(intersection.time_of_impact);
+                    if let Some(hit) = make_query_hit(
+                        world,
+                        body_handle,
+                        collider_handle,
+                        point,
+                        intersection.normal,
+                        intersection.time_of_impact,
+                        fraction,
+                    ) {
+                        write_query_hit(
+                            hit,
+                            hits,
+                            hit_capacity,
+                            &mut hit_count,
+                            &mut written_count,
+                        );
+                    }
+                }
+            }
+        } else {
+            let ball = Ball::new(radius);
+            let ball_pose = pose_translation(from);
+            let options = ShapeCastOptions {
+                max_time_of_impact: 1.0,
+                target_distance: 0.0,
+                stop_at_penetration: true,
+                compute_impact_geometry_on_penetration: true,
+            };
+            let dispatcher = world.narrow_phase.query_dispatcher();
+            for (collider_handle, collider) in world.colliders.iter_enabled() {
+                let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+                    continue;
+                };
+                candidate_count += 1;
+                let pos12 = collider.position().inv_mul(&ball_pose);
+                let local_vel12 = collider.position().inverse_transform_vector(delta);
+                let Ok(Some(shape_hit)) =
+                    dispatcher.cast_shapes(&pos12, local_vel12, collider.shape(), &ball, options)
+                else {
+                    continue;
+                };
+                let fraction = shape_hit.time_of_impact.clamp(0.0, 1.0);
+                let point = collider.position().transform_point(shape_hit.witness1);
+                let normal = collider.position().rotation * shape_hit.normal1;
+                if let Some(hit) = make_query_hit(
+                    world,
+                    body_handle,
+                    collider_handle,
+                    point,
+                    normal,
+                    fraction * distance,
+                    fraction,
+                ) {
+                    write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+                }
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_overlap_capsule(
+    world: *mut AlchemyRapierWorld,
+    origin: AlchemyRapierVec2,
+    radius: f32,
+    half_height: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 || !half_height.is_finite() || half_height < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let origin = vector(origin);
+        let capsule = Capsule::new_y(half_height, radius.max(0.000001));
+        let capsule_pose = pose_translation(origin);
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(body_handle) = dynamic_query_body(world, collider, ignored_body) else {
+                continue;
+            };
+            candidate_count += 1;
+            let pos12 = capsule_pose.inv_mul(collider.position());
+            let Ok(intersects) = dispatcher.intersection_test(&pos12, &capsule, collider.shape())
+            else {
+                continue;
+            };
+            if !intersects {
+                continue;
+            }
+
+            let (point, normal, distance) =
+                capsule_overlap_hit_point(collider, origin, half_height);
+            if let Some(hit) = make_query_hit(
+                world,
+                body_handle,
+                collider_handle,
+                point,
+                normal,
+                distance,
+                0.0,
+            ) {
+                write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_surface_anchor(
+    world: *mut AlchemyRapierWorld,
+    target_body: AlchemyRapierRigidBodyHandle,
+    anchor_world: AlchemyRapierVec2,
+    max_distance: f32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !max_distance.is_finite() || max_distance < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let target_body = handle_from_ffi(target_body);
+        let Some(body) = world.bodies.get(target_body) else {
+            return empty_query_result(AlchemyRapierStatus::InvalidHandle);
+        };
+        if body.body_type() != RigidBodyType::Dynamic {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+
+        let anchor = vector(anchor_world);
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        for collider_handle in body.colliders() {
+            let Some(collider) = world.colliders.get(*collider_handle) else {
+                continue;
+            };
+            candidate_count += 1;
+            let projection = collider
+                .shape()
+                .project_point(collider.position(), anchor, true);
+            let point = projection.point;
+            let distance = if projection.is_inside {
+                0.0
+            } else {
+                (anchor - point).length()
+            };
+            if distance > max_distance {
+                continue;
+            }
+            let normal = if projection.is_inside {
+                Vector::ZERO
+            } else {
+                normalized_or_zero(anchor - point)
+            };
+            if let Some(hit) = make_query_hit(
+                world,
+                target_body,
+                *collider_handle,
+                point,
+                normal,
+                distance,
+                0.0,
+            ) {
+                write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
 }
 
 fn body_mutation<F>(
