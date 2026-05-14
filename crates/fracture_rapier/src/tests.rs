@@ -1568,9 +1568,8 @@ fn stress_frame_cap_is_global_across_families() {
     );
 }
 
-#[cfg(feature = "parallel")]
 #[test]
-fn parallel_multi_family_stress_solve_is_deterministic_after_serial_reduce() {
+fn stress_input_buckets_are_deterministic_with_multiple_inputs_per_family() {
     fn build_world() -> FxRapierWorld2D {
         let mut world = FxRapierWorld2D::new();
         world.set_gravity(Vector::ZERO);
@@ -1585,12 +1584,12 @@ fn parallel_multi_family_stress_solve_is_deterministic_after_serial_reduce() {
         world
     }
 
-    fn stress_input(family: FxFamilyId) -> StressInput {
+    fn stress_input(family: FxFamilyId, command: u32, force: f32) -> StressInput {
         StressInput {
-            order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(0)),
+            order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(command)),
             actor: FxActorId(0),
             node: SupportNodeId(0),
-            force: Vec2::new(10.0, 0.0),
+            force: Vec2::new(force, 0.0),
             source: DamageSource::Stress,
         }
     }
@@ -1626,26 +1625,162 @@ fn parallel_multi_family_stress_solve_is_deterministic_after_serial_reduce() {
         )
     }
 
+    let unknown_family_input = stress_input(FxFamilyId(99), 0, 10.0);
     let ordered = vec![
-        stress_input(FxFamilyId(1)),
-        stress_input(FxFamilyId(2)),
-        stress_input(FxFamilyId(3)),
+        stress_input(FxFamilyId(1), 0, 6.0),
+        stress_input(FxFamilyId(1), 1, 4.0),
+        stress_input(FxFamilyId(2), 0, 6.0),
+        stress_input(FxFamilyId(2), 1, 4.0),
+        stress_input(FxFamilyId(3), 0, 6.0),
+        stress_input(FxFamilyId(3), 1, 4.0),
+        unknown_family_input.clone(),
     ];
-    let reversed = vec![
-        stress_input(FxFamilyId(3)),
-        stress_input(FxFamilyId(2)),
-        stress_input(FxFamilyId(1)),
+    let shuffled = vec![
+        stress_input(FxFamilyId(2), 1, 4.0),
+        unknown_family_input,
+        stress_input(FxFamilyId(3), 0, 6.0),
+        stress_input(FxFamilyId(1), 1, 4.0),
+        stress_input(FxFamilyId(2), 0, 6.0),
+        stress_input(FxFamilyId(3), 1, 4.0),
+        stress_input(FxFamilyId(1), 0, 6.0),
     ];
+    let reversed = ordered.iter().cloned().rev().collect::<Vec<_>>();
+
+    let ordered_result = run(build_world(), ordered);
+    let shuffled_result = run(build_world(), shuffled);
+    let reversed_result = run(build_world(), reversed);
+
+    assert_eq!(ordered_result, shuffled_result);
+    assert_eq!(ordered_result, reversed_result);
+    assert_eq!(ordered_result.0.input_count, 7);
+    assert_eq!(ordered_result.0.family_count, 3);
+    assert_eq!(ordered_result.0.generated_commands_before_cap, 3);
+    assert_eq!(ordered_result.0.generated_commands_after_cap, 2);
+    assert_eq!(ordered_result.0.frame_cap, 2);
+    assert_eq!(
+        ordered_result
+            .1
+            .iter()
+            .map(|profile| profile.input_count)
+            .collect::<Vec<_>>(),
+        vec![2, 2, 2]
+    );
+    assert_eq!(
+        ordered_result
+            .1
+            .iter()
+            .map(|profile| profile.generated_commands_after_cap)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 0]
+    );
+    assert_eq!(
+        ordered_result
+            .2
+            .iter()
+            .map(|event| event.family)
+            .collect::<Vec<_>>(),
+        vec![FxFamilyId(1), FxFamilyId(2)]
+    );
+    assert_eq!(
+        ordered_result
+            .3
+            .iter()
+            .map(|event| event.family)
+            .collect::<Vec<_>>(),
+        vec![FxFamilyId(1), FxFamilyId(2)]
+    );
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn parallel_multi_family_stress_solve_is_deterministic_after_serial_reduce() {
+    fn build_world() -> FxRapierWorld2D {
+        let mut world = FxRapierWorld2D::new();
+        world.set_gravity(Vector::ZERO);
+        world.set_stress_settings(StressSettings {
+            damage_per_overload: 2.0,
+            max_fractures_per_frame: 2,
+            ..StressSettings::default()
+        });
+        for family in [FxFamilyId(1), FxFamilyId(2), FxFamilyId(3)] {
+            world.add_destructible(family, two_node_asset(7)).unwrap();
+        }
+        world
+    }
+
+    fn stress_inputs(family: FxFamilyId) -> [StressInput; 2] {
+        [
+            StressInput {
+                order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(0)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(6.0, 0.0),
+                source: DamageSource::Stress,
+            },
+            StressInput {
+                order_key: DeterministicOrderKey::new(0, 1, family, FxActorId(0), CommandId(1)),
+                actor: FxActorId(0),
+                node: SupportNodeId(0),
+                force: Vec2::new(4.0, 0.0),
+                source: DamageSource::Stress,
+            },
+        ]
+    }
+
+    fn run(
+        mut world: FxRapierWorld2D,
+        stress_inputs: Vec<StressInput>,
+    ) -> (
+        crate::FxGlobalStressCapReport,
+        Vec<fracture_core::StressProfile>,
+        Vec<fracture_core::FractureEvent>,
+        Vec<fracture_core::SplitEvent>,
+        Vec<(FxFamilyId, u64)>,
+    ) {
+        let step = world
+            .step_with_stress_inputs_for_test(stress_inputs)
+            .unwrap();
+        let digests = [FxFamilyId(1), FxFamilyId(2), FxFamilyId(3)]
+            .into_iter()
+            .map(|family| {
+                (
+                    family,
+                    world.family(family).unwrap().deterministic_state_digest(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            step.diagnostics.global_stress_cap,
+            step.diagnostics.stress_profiles,
+            step.report.fracture_events,
+            step.report.split_events,
+            digests,
+        )
+    }
+
+    let ordered = [FxFamilyId(1), FxFamilyId(2), FxFamilyId(3)]
+        .into_iter()
+        .flat_map(stress_inputs)
+        .collect::<Vec<_>>();
+    let reversed = ordered.iter().cloned().rev().collect::<Vec<_>>();
 
     let ordered_result = run(build_world(), ordered);
     let reversed_result = run(build_world(), reversed);
 
     assert_eq!(ordered_result, reversed_result);
-    assert_eq!(ordered_result.0.input_count, 3);
+    assert_eq!(ordered_result.0.input_count, 6);
     assert_eq!(ordered_result.0.family_count, 3);
     assert_eq!(ordered_result.0.generated_commands_before_cap, 3);
     assert_eq!(ordered_result.0.generated_commands_after_cap, 2);
     assert_eq!(ordered_result.0.frame_cap, 2);
+    assert_eq!(
+        ordered_result
+            .1
+            .iter()
+            .map(|profile| profile.input_count)
+            .collect::<Vec<_>>(),
+        vec![2, 2, 2]
+    );
     assert_eq!(
         ordered_result
             .1

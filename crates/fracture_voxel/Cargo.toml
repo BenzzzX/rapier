@@ -10,7 +10,7 @@ rust-version.workspace = true
 edition.workspace = true
 
 [features]
-parallel = ["dep:rayon"]
+parallel = ["dep:rayon", "fracture_core/parallel"]
 
 [dependencies]
 fracture_core = { path = "../fracture_core" }

@@ -9,5 +9,9 @@ license.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 
+[features]
+parallel = ["dep:rayon"]
+
 [dependencies]
+rayon = { workspace = true, optional = true }
 thiserror.workspace = true

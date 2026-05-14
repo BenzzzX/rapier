@@ -176,6 +176,12 @@ struct FamilyStressSolveResult {
     commands: Vec<FractureCommand>,
 }
 
+#[derive(Clone, Debug)]
+struct StressInputBuckets {
+    inputs_by_family: BTreeMap<FxFamilyId, Vec<StressInput>>,
+    known_non_empty_family_count: usize,
+}
+
 impl FamilyStressSolveJob<'_> {
     fn solve(self, solver: &StressSolver2D, frame_cap: u16) -> FamilyStressSolveResult {
         let stress_report =
@@ -869,22 +875,16 @@ impl FxRapierWorld2D {
         let mut uncapped_settings = self.stress_solver.settings;
         uncapped_settings.max_fractures_per_frame = u16::MAX;
         let uncapped_solver = StressSolver2D::new(uncapped_settings);
-        let mut inputs_by_family: BTreeMap<FxFamilyId, Vec<StressInput>> = BTreeMap::new();
-        for input in &report.stress_inputs {
-            inputs_by_family
-                .entry(input.order_key.family_id)
-                .or_default()
-                .push(input.clone());
-        }
-        let mut input_family_count = 0usize;
+        let mut input_buckets = Self::bucket_step_stress_inputs(&family_ids, &report.stress_inputs);
+        let input_family_count = input_buckets.known_non_empty_family_count;
 
         let mut stress_results = {
             let mut stress_jobs = Vec::new();
             for family_id in &family_ids {
-                let stress_inputs = inputs_by_family.remove(family_id).unwrap_or_default();
-                if !stress_inputs.is_empty() {
-                    input_family_count += 1;
-                }
+                let stress_inputs = input_buckets
+                    .inputs_by_family
+                    .remove(family_id)
+                    .unwrap_or_default();
                 let Some(entry) = self.families.get(family_id) else {
                     return Err(FxRapierError::UnknownFamily(*family_id));
                 };
@@ -1007,6 +1007,36 @@ impl FxRapierWorld2D {
         }
 
         Ok(())
+    }
+
+    fn bucket_step_stress_inputs(
+        family_ids: &[FxFamilyId],
+        stress_inputs: &[StressInput],
+    ) -> StressInputBuckets {
+        let mut inputs_by_family = family_ids
+            .iter()
+            .map(|family_id| (*family_id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+
+        for input in stress_inputs {
+            if let Some(bucket) = inputs_by_family.get_mut(&input.order_key.family_id) {
+                bucket.push(input.clone());
+            }
+        }
+
+        for inputs in inputs_by_family.values_mut() {
+            inputs.sort_by_key(|input| input.order_key);
+        }
+
+        let known_non_empty_family_count = inputs_by_family
+            .values()
+            .filter(|inputs| !inputs.is_empty())
+            .count();
+
+        StressInputBuckets {
+            inputs_by_family,
+            known_non_empty_family_count,
+        }
     }
 
     fn should_solve_family_stress(

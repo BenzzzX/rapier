@@ -7,6 +7,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 pub mod replay;
@@ -614,10 +616,25 @@ impl FxAsset {
         compression_limit: f32,
         shear_limit: f32,
     ) -> Result<Vec<Bond2D>, ValidationError> {
-        let mut grouped: BTreeMap<
-            (SupportNodeId, SupportNodeId),
-            Vec<impl_edge_sample::EdgeSample>,
-        > = BTreeMap::new();
+        #[cfg(feature = "parallel")]
+        let grouped = self.collect_internal_bond_edges_parallel();
+        #[cfg(not(feature = "parallel"))]
+        let grouped = self.collect_internal_bond_edges_serial();
+
+        self.generate_internal_bonds_from_edge_groups(
+            grouped,
+            base_health,
+            tension_limit,
+            compression_limit,
+            shear_limit,
+        )
+    }
+
+    #[cfg(any(not(feature = "parallel"), test))]
+    fn collect_internal_bond_edges_serial(
+        &self,
+    ) -> BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>> {
+        let mut grouped = BTreeMap::new();
         for y in 0..self.occupancy.height {
             for x in 0..self.occupancy.width {
                 let here = GridCoord::new(x, y);
@@ -627,7 +644,7 @@ impl FxAsset {
                 if x + 1 < self.occupancy.width {
                     let there = GridCoord::new(x + 1, y);
                     if let Some(there_node) = self.node_at(there) {
-                        self.record_interface_edge(
+                        Self::record_interface_edge(
                             &mut grouped,
                             here_node,
                             there_node,
@@ -642,7 +659,7 @@ impl FxAsset {
                 if y + 1 < self.occupancy.height {
                     let there = GridCoord::new(x, y + 1);
                     if let Some(there_node) = self.node_at(there) {
-                        self.record_interface_edge(
+                        Self::record_interface_edge(
                             &mut grouped,
                             here_node,
                             there_node,
@@ -656,7 +673,84 @@ impl FxAsset {
                 }
             }
         }
+        grouped
+    }
 
+    #[cfg(feature = "parallel")]
+    fn collect_internal_bond_edges_parallel(
+        &self,
+    ) -> BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>> {
+        let row_samples = (0..self.occupancy.height)
+            .into_par_iter()
+            .map(|y| {
+                let mut row_samples = Vec::new();
+                for x in 0..self.occupancy.width {
+                    self.collect_cell_interface_edges(x, y, &mut row_samples);
+                }
+                row_samples
+            })
+            .collect::<Vec<_>>();
+
+        let mut grouped = BTreeMap::new();
+        for grouped_sample in row_samples.into_iter().flatten() {
+            Self::record_grouped_edge_sample(&mut grouped, grouped_sample);
+        }
+        grouped
+    }
+
+    #[cfg(feature = "parallel")]
+    fn collect_cell_interface_edges(
+        &self,
+        x: u32,
+        y: u32,
+        out: &mut Vec<impl_edge_sample::GroupedEdgeSample>,
+    ) {
+        let here = GridCoord::new(x, y);
+        let Some(here_node) = self.node_at(here) else {
+            return;
+        };
+        if x + 1 < self.occupancy.width {
+            let there = GridCoord::new(x + 1, y);
+            if let Some(there_node) = self.node_at(there) {
+                if let Some(sample) = Self::canonical_interface_edge_sample(
+                    here_node,
+                    there_node,
+                    InterfaceEdge::new(
+                        LatticePoint::new(x + 1, y),
+                        LatticePoint::new(x + 1, y + 1),
+                    ),
+                    Vec2::new(1.0, 0.0),
+                ) {
+                    out.push(sample);
+                }
+            }
+        }
+        if y + 1 < self.occupancy.height {
+            let there = GridCoord::new(x, y + 1);
+            if let Some(there_node) = self.node_at(there) {
+                if let Some(sample) = Self::canonical_interface_edge_sample(
+                    here_node,
+                    there_node,
+                    InterfaceEdge::new(
+                        LatticePoint::new(x, y + 1),
+                        LatticePoint::new(x + 1, y + 1),
+                    ),
+                    Vec2::new(0.0, 1.0),
+                ) {
+                    out.push(sample);
+                }
+            }
+        }
+    }
+
+    fn generate_internal_bonds_from_edge_groups(
+        &self,
+        grouped: BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>>,
+        base_health: f32,
+        tension_limit: f32,
+        compression_limit: f32,
+        shear_limit: f32,
+    ) -> Result<Vec<Bond2D>, ValidationError> {
         let mut bonds = Vec::new();
         for ((node_a, node_b), mut samples) in grouped {
             samples.sort_by_key(|sample| sample.edge);
@@ -700,36 +794,67 @@ impl FxAsset {
         Ok(bonds)
     }
 
+    #[cfg(any(not(feature = "parallel"), test))]
     fn record_interface_edge(
-        &self,
         grouped: &mut BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>>,
         a: SupportNodeId,
         b: SupportNodeId,
         edge: InterfaceEdge,
         normal_a_to_b: Vec2,
     ) {
+        if let Some(grouped_sample) =
+            Self::canonical_interface_edge_sample(a, b, edge, normal_a_to_b)
+        {
+            Self::record_grouped_edge_sample(grouped, grouped_sample);
+        }
+    }
+
+    fn canonical_interface_edge_sample(
+        a: SupportNodeId,
+        b: SupportNodeId,
+        edge: InterfaceEdge,
+        normal_a_to_b: Vec2,
+    ) -> Option<impl_edge_sample::GroupedEdgeSample> {
         if a == b {
-            return;
+            return None;
         }
         let (node_a, node_b, normal) = if a < b {
             (a, b, normal_a_to_b)
         } else {
             (b, a, normal_a_to_b * -1.0)
         };
+        Some(impl_edge_sample::GroupedEdgeSample {
+            node_a,
+            node_b,
+            sample: impl_edge_sample::EdgeSample { edge, normal },
+        })
+    }
+
+    fn record_grouped_edge_sample(
+        grouped: &mut BTreeMap<(SupportNodeId, SupportNodeId), Vec<impl_edge_sample::EdgeSample>>,
+        grouped_sample: impl_edge_sample::GroupedEdgeSample,
+    ) {
         grouped
-            .entry((node_a, node_b))
+            .entry((grouped_sample.node_a, grouped_sample.node_b))
             .or_default()
-            .push(impl_edge_sample::EdgeSample { edge, normal });
+            .push(grouped_sample.sample);
     }
 }
 
 mod impl_edge_sample {
-    use super::{InterfaceEdge, Vec2};
+    use super::{InterfaceEdge, SupportNodeId, Vec2};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub(super) struct EdgeSample {
         pub(super) edge: InterfaceEdge,
         pub(super) normal: Vec2,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct GroupedEdgeSample {
+        pub(super) node_a: SupportNodeId,
+        pub(super) node_b: SupportNodeId,
+        pub(super) sample: EdgeSample,
     }
 }
 
@@ -4238,6 +4363,109 @@ mod tests {
         assert_eq!(bond.interface_edges.len(), 2);
         assert_eq!(bond.length, 2.0);
         assert_eq!(bond.compression_limit, bond.tension_limit);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_internal_bond_generation_matches_serial_reference() {
+        let rows = ["#######", "##...##", "#######", "#.....#", "#######"];
+        let node_ids = [
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+            None,
+            None,
+            None,
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(0),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(2),
+            Some(0),
+            Some(0),
+            Some(0),
+        ];
+        let occupancy = DenseOccupancy::from_rows(&rows).unwrap();
+        let support_node_map = map(occupancy.width(), &node_ids);
+        let material_map = support_node_map
+            .iter()
+            .map(|node| match node {
+                Some(SupportNodeId(0)) => 3,
+                Some(SupportNodeId(1)) => 5,
+                Some(SupportNodeId(2)) => 7,
+                Some(_) | None => 0,
+            })
+            .collect();
+        let mut desc = FxAssetDesc::new(FxAssetId(11), 1.0, occupancy, support_node_map);
+        desc.material_map = Some(material_map);
+        desc.default_bond_health = 13.0;
+        desc.default_tension_limit = 17.0;
+        desc.default_compression_limit = 19.0;
+        desc.default_shear_limit = 23.0;
+        let asset = FxAsset::from_desc(desc).unwrap();
+
+        let serial_bonds = asset
+            .generate_internal_bonds_from_edge_groups(
+                asset.collect_internal_bond_edges_serial(),
+                13.0,
+                17.0,
+                19.0,
+                23.0,
+            )
+            .unwrap();
+        let parallel_bonds = asset
+            .generate_internal_bonds(13.0, 17.0, 19.0, 23.0)
+            .unwrap();
+
+        let mut pair_counts = BTreeMap::new();
+        for bond in &parallel_bonds {
+            *pair_counts
+                .entry((bond.node_a, bond.node_b))
+                .or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            pair_counts.get(&(SupportNodeId(0), SupportNodeId(1))),
+            Some(&2)
+        );
+        assert_eq!(
+            pair_counts.get(&(SupportNodeId(0), SupportNodeId(2))),
+            Some(&2)
+        );
+
+        assert_eq!(parallel_bonds.len(), serial_bonds.len());
+        for (parallel, serial) in parallel_bonds.iter().zip(&serial_bonds) {
+            assert_eq!(parallel.id, serial.id);
+            assert_eq!(parallel.node_a, serial.node_a);
+            assert_eq!(parallel.node_b, serial.node_b);
+            assert_eq!(parallel.interface_edges, serial.interface_edges);
+            assert_eq!(parallel.length, serial.length);
+            assert_eq!(parallel.normal, serial.normal);
+            assert_eq!(parallel.tangent, serial.tangent);
+            assert_eq!(parallel.material_pair, serial.material_pair);
+        }
+        assert_eq!(parallel_bonds, serial_bonds);
+        assert_eq!(asset.internal_bonds(), parallel_bonds.as_slice());
     }
 
     #[test]
