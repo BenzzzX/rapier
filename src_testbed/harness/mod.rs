@@ -101,6 +101,7 @@ pub struct Harness {
     pub physics: PhysicsState,
     max_steps: usize,
     callbacks: Callbacks,
+    snapshot_hooks: Vec<Box<dyn SnapshotHook>>,
     plugins: Vec<Box<dyn HarnessPlugin>>,
     events: PhysicsEvents,
     event_handler: ChannelEventCollector,
@@ -109,6 +110,16 @@ pub struct Harness {
 
 type Callbacks =
     Vec<Box<dyn FnMut(Option<&mut TestbedGraphics>, &mut PhysicsState, &PhysicsEvents, &RunState)>>;
+
+pub trait SnapshotHook {
+    fn snapshot_id(&self) -> &'static str;
+    fn save_snapshot(&mut self) -> Result<Vec<u8>, String>;
+    fn restore_snapshot(
+        &mut self,
+        snapshot: &[u8],
+        physics: &mut PhysicsState,
+    ) -> Result<(), String>;
+}
 
 #[allow(dead_code)]
 impl Harness {
@@ -128,6 +139,7 @@ impl Harness {
             physics,
             max_steps: 1000,
             callbacks: Vec::new(),
+            snapshot_hooks: Vec::new(),
             plugins: Vec::new(),
             events,
             event_handler,
@@ -163,6 +175,7 @@ impl Harness {
 
     pub fn clear_callbacks(&mut self) {
         self.callbacks.clear();
+        self.snapshot_hooks.clear();
     }
 
     pub fn physics_state_mut(&mut self) -> &mut PhysicsState {
@@ -226,6 +239,38 @@ impl Harness {
         callback: F,
     ) {
         self.callbacks.push(Box::new(callback));
+    }
+
+    pub fn add_snapshot_hook(&mut self, hook: impl SnapshotHook + 'static) {
+        self.snapshot_hooks.push(Box::new(hook));
+    }
+
+    pub fn snapshot(&mut self) -> crate::physics::PhysicsSnapshot {
+        let mut snapshot = self.physics.snapshot();
+        for hook in &mut self.snapshot_hooks {
+            match hook.save_snapshot() {
+                Ok(data) => snapshot.set_extension(hook.snapshot_id(), data),
+                Err(err) => eprintln!(
+                    "Failed to save {} testbed snapshot extension: {err}",
+                    hook.snapshot_id()
+                ),
+            }
+        }
+        snapshot
+    }
+
+    pub fn restore_snapshot(&mut self, snapshot: crate::physics::PhysicsSnapshot) {
+        self.physics.restore_snapshot(snapshot.clone());
+        for hook in &mut self.snapshot_hooks {
+            if let Some(data) = snapshot.extension(hook.snapshot_id()) {
+                if let Err(err) = hook.restore_snapshot(data, &mut self.physics) {
+                    eprintln!(
+                        "Failed to restore {} testbed snapshot extension: {err}",
+                        hook.snapshot_id()
+                    );
+                }
+            }
+        }
     }
 
     pub fn step(&mut self) {

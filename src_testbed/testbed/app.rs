@@ -597,7 +597,7 @@ impl TestbedApp {
             self.state
                 .action_flags
                 .set(TestbedActionFlags::TAKE_SNAPSHOT, false);
-            self.state.snapshot = Some(self.harness.physics.snapshot());
+            self.state.snapshot = Some(self.harness.snapshot());
         }
 
         if self
@@ -609,7 +609,7 @@ impl TestbedApp {
                 .action_flags
                 .set(TestbedActionFlags::RESTORE_SNAPSHOT, false);
             if let Some(snapshot) = &self.state.snapshot {
-                self.harness.physics.restore_snapshot(snapshot.clone());
+                self.harness.restore_snapshot(snapshot.clone());
                 self.state
                     .action_flags
                     .set(TestbedActionFlags::RESET_WORLD_GRAPHICS, true);

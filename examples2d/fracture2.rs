@@ -13,8 +13,9 @@ use fracture_voxel::{
     VoxelHierarchyPolicy, author_voxel_asset_with_options,
 };
 use kiss3d::color::Color;
-use rapier_testbed2d::{PhysicsState, Testbed, TestbedGraphics};
+use rapier_testbed2d::{PhysicsState, SnapshotHook, Testbed, TestbedGraphics};
 use rapier2d::prelude::*;
+use std::{cell::RefCell, rc::Rc};
 
 const IMPACT_FAMILY: FxFamilyId = FxFamilyId(1);
 const BRIDGE_FAMILY: FxFamilyId = FxFamilyId(2);
@@ -52,7 +53,10 @@ const JOINT_SCENE_CENTER: Vector = Vector::new(0.0, 3.0);
 const COLLISION_SCENE_CENTER: Vector = Vector::new(0.0, 0.0);
 const GRAVITY: Vector = Vector::new(0.0, -9.81);
 
-#[derive(Clone, Copy, Debug)]
+const FRACTURE_DEMO_SNAPSHOT_ID: &str = "fracture2";
+const FRACTURE_DEMO_SNAPSHOT_MAGIC: &[u8; 8] = b"FX2DEMO1";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DemoDriver {
     PhysicsOnly,
     BridgeGravity {
@@ -65,6 +69,40 @@ enum DemoDriver {
         apply_after_tick: u64,
         applied: bool,
     },
+}
+
+struct FractureDemoRuntime {
+    world: FxRapierWorld2D,
+    driver: DemoDriver,
+}
+
+struct FractureDemoSnapshotHook {
+    runtime: Rc<RefCell<FractureDemoRuntime>>,
+}
+
+impl SnapshotHook for FractureDemoSnapshotHook {
+    fn snapshot_id(&self) -> &'static str {
+        FRACTURE_DEMO_SNAPSHOT_ID
+    }
+
+    fn save_snapshot(&mut self) -> Result<Vec<u8>, String> {
+        let runtime = self.runtime.borrow();
+        encode_demo_snapshot(&runtime.world, runtime.driver)
+            .map_err(|err| format!("fracture world snapshot failed: {err}"))
+    }
+
+    fn restore_snapshot(
+        &mut self,
+        snapshot: &[u8],
+        physics: &mut PhysicsState,
+    ) -> Result<(), String> {
+        let (world, driver) = decode_demo_snapshot(snapshot)?;
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.world = world;
+        runtime.driver = driver;
+        mirror_fracture_world(&runtime.world, physics);
+        Ok(())
+    }
 }
 
 pub fn init_world(testbed: &mut Testbed) {
@@ -121,10 +159,10 @@ pub fn init_voxel_collision(testbed: &mut Testbed) {
 
 fn install_fracture_world(
     testbed: &mut Testbed,
-    mut fracture_world: FxRapierWorld2D,
+    fracture_world: FxRapierWorld2D,
     destructible_families: &'static [FxFamilyId],
     camera_center: Vector,
-    mut driver: DemoDriver,
+    driver: DemoDriver,
 ) {
     let bodies = fracture_world.rigid_bodies().clone();
     let colliders = fracture_world.colliders().clone();
@@ -138,7 +176,20 @@ fn install_fracture_world(
     );
     color_initial_bodies(testbed, &fracture_world, destructible_families);
 
+    let runtime = Rc::new(RefCell::new(FractureDemoRuntime {
+        world: fracture_world,
+        driver,
+    }));
+    testbed.add_snapshot_hook(FractureDemoSnapshotHook {
+        runtime: Rc::clone(&runtime),
+    });
+
     testbed.add_callback(move |graphics, physics, _, _| {
+        let mut runtime = runtime.borrow_mut();
+        let FractureDemoRuntime {
+            world: fracture_world,
+            driver,
+        } = &mut *runtime;
         let mut rebuild_graphics = false;
         let step = match fracture_world.step() {
             Ok(step) => step,
@@ -149,7 +200,7 @@ fn install_fracture_world(
         };
         rebuild_graphics |= !step.split_events.is_empty();
 
-        match &mut driver {
+        match driver {
             DemoDriver::PhysicsOnly => {}
             DemoDriver::BridgeGravity {
                 apply_after_tick,
@@ -158,7 +209,7 @@ fn install_fracture_world(
                 fractured,
             } => {
                 if !*fractured && fracture_world.tick() >= *apply_after_tick {
-                    match apply_bridge_gravity_load(&mut fracture_world, *load_scale) {
+                    match apply_bridge_gravity_load(fracture_world, *load_scale) {
                         Ok(step) => {
                             rebuild_graphics |= !step.report.split_events.is_empty();
                             *fractured |= !step.report.split_events.is_empty();
@@ -173,7 +224,7 @@ fn install_fracture_world(
                 applied,
             } => {
                 if !*applied && fracture_world.tick() >= *apply_after_tick {
-                    queue_voxel_collision_fracture_field(&mut fracture_world);
+                    queue_voxel_collision_fracture_field(fracture_world);
                     *applied = true;
                 }
             }
@@ -190,6 +241,152 @@ fn install_fracture_world(
 
     testbed.set_number_of_steps_per_frame(1);
     testbed.look_at(camera_center, CAMERA_PIXELS_PER_WORLD_UNIT);
+}
+
+fn encode_demo_snapshot(
+    world: &FxRapierWorld2D,
+    driver: DemoDriver,
+) -> Result<Vec<u8>, fracture_rapier::FxRapierError> {
+    let world_snapshot = world.snapshot()?;
+    let mut bytes =
+        Vec::with_capacity(FRACTURE_DEMO_SNAPSHOT_MAGIC.len() + world_snapshot.len() + 32);
+    bytes.extend_from_slice(FRACTURE_DEMO_SNAPSHOT_MAGIC);
+    write_u64(&mut bytes, world_snapshot.len() as u64);
+    bytes.extend_from_slice(&world_snapshot);
+    write_demo_driver(&mut bytes, driver);
+    Ok(bytes)
+}
+
+fn decode_demo_snapshot(bytes: &[u8]) -> Result<(FxRapierWorld2D, DemoDriver), String> {
+    let mut reader = DemoSnapshotReader::new(bytes);
+    reader.magic()?;
+    let world_len = usize::try_from(reader.u64("world length")?)
+        .map_err(|_| "fracture demo world snapshot length is too large".to_string())?;
+    let world_bytes = reader.bytes(world_len, "world snapshot")?;
+    let world = FxRapierWorld2D::restore_snapshot(world_bytes)
+        .map_err(|err| format!("fracture world restore failed: {err}"))?;
+    let driver = read_demo_driver(&mut reader)?;
+    reader.finish()?;
+    Ok((world, driver))
+}
+
+fn write_demo_driver(bytes: &mut Vec<u8>, driver: DemoDriver) {
+    match driver {
+        DemoDriver::PhysicsOnly => bytes.push(0),
+        DemoDriver::BridgeGravity {
+            apply_after_tick,
+            load_scale,
+            load_step,
+            fractured,
+        } => {
+            bytes.push(1);
+            write_u64(bytes, apply_after_tick);
+            write_f32(bytes, load_scale);
+            write_f32(bytes, load_step);
+            bytes.push(u8::from(fractured));
+        }
+        DemoDriver::VoxelCollisionFractureField {
+            apply_after_tick,
+            applied,
+        } => {
+            bytes.push(2);
+            write_u64(bytes, apply_after_tick);
+            bytes.push(u8::from(applied));
+        }
+    }
+}
+
+fn read_demo_driver(reader: &mut DemoSnapshotReader<'_>) -> Result<DemoDriver, String> {
+    match reader.u8("driver tag")? {
+        0 => Ok(DemoDriver::PhysicsOnly),
+        1 => Ok(DemoDriver::BridgeGravity {
+            apply_after_tick: reader.u64("bridge apply tick")?,
+            load_scale: reader.f32("bridge load scale")?,
+            load_step: reader.f32("bridge load step")?,
+            fractured: reader.bool("bridge fractured")?,
+        }),
+        2 => Ok(DemoDriver::VoxelCollisionFractureField {
+            apply_after_tick: reader.u64("voxel field apply tick")?,
+            applied: reader.bool("voxel field applied")?,
+        }),
+        tag => Err(format!("unsupported fracture demo driver tag {tag}")),
+    }
+}
+
+fn write_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_f32(bytes: &mut Vec<u8>, value: f32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+struct DemoSnapshotReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DemoSnapshotReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn magic(&mut self) -> Result<(), String> {
+        let magic = self.bytes(FRACTURE_DEMO_SNAPSHOT_MAGIC.len(), "magic")?;
+        if magic == FRACTURE_DEMO_SNAPSHOT_MAGIC {
+            Ok(())
+        } else {
+            Err("invalid fracture demo snapshot magic".to_string())
+        }
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("fracture demo snapshot has trailing bytes".to_string())
+        }
+    }
+
+    fn bool(&mut self, field: &'static str) -> Result<bool, String> {
+        match self.u8(field)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("invalid boolean in {field}")),
+        }
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, String> {
+        Ok(self.bytes(1, field)?[0])
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, String> {
+        let bytes = self.bytes(8, field)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("u64 length")))
+    }
+
+    fn f32(&mut self, field: &'static str) -> Result<f32, String> {
+        let bytes = self.bytes(4, field)?;
+        let value = f32::from_le_bytes(bytes.try_into().expect("f32 length"));
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(format!("non-finite value in {field}"))
+        }
+    }
+
+    fn bytes(&mut self, len: usize, field: &'static str) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| format!("overflow while reading {field}"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| format!("fracture demo snapshot ended while reading {field}"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
 }
 
 fn build_high_speed_wall_world() -> FxRapierWorld2D {
@@ -980,6 +1177,64 @@ mod tests {
         assert!(!step.fracture_events.is_empty());
         assert!(!step.split_events.is_empty());
         assert!(world.family(COLLISION_LEFT_FAMILY).unwrap().actor_count() > 1);
+    }
+
+    #[test]
+    fn fracture2_demo_snapshot_restores_fracture_runtime_state() {
+        let mut world = build_high_speed_wall_world();
+        for _ in 0..8 {
+            world
+                .step()
+                .expect("fracture demo should step before snapshot");
+        }
+        let saved_tick = world.tick();
+        let snapshot = encode_demo_snapshot(&world, DemoDriver::PhysicsOnly)
+            .expect("fracture demo snapshot should encode");
+
+        for _ in 0..120 {
+            let step = world
+                .step()
+                .expect("fracture demo should keep stepping after snapshot");
+            if !step.split_events.is_empty() {
+                break;
+            }
+        }
+        assert!(world.family(IMPACT_FAMILY).unwrap().actor_count() > 1);
+
+        let (mut restored, driver) =
+            decode_demo_snapshot(&snapshot).expect("fracture demo snapshot should restore");
+        assert_eq!(driver, DemoDriver::PhysicsOnly);
+        assert_eq!(restored.tick(), saved_tick);
+        assert_eq!(restored.family(IMPACT_FAMILY).unwrap().actor_count(), 1);
+
+        let mut restored_split = false;
+        for _ in 0..120 {
+            let step = restored
+                .step()
+                .expect("restored fracture demo should keep stepping");
+            restored_split |= !step.split_events.is_empty();
+            if restored_split {
+                break;
+            }
+        }
+        assert!(restored_split);
+    }
+
+    #[test]
+    fn fracture2_demo_snapshot_preserves_script_driver_state() {
+        let world = build_bridge_collapse_world();
+        let driver = DemoDriver::BridgeGravity {
+            apply_after_tick: 45,
+            load_scale: 0.65,
+            load_step: 0.20,
+            fractured: true,
+        };
+        let snapshot =
+            encode_demo_snapshot(&world, driver).expect("fracture demo snapshot should encode");
+        let (_, restored_driver) =
+            decode_demo_snapshot(&snapshot).expect("fracture demo snapshot should restore");
+
+        assert_eq!(restored_driver, driver);
     }
 
     fn assert_wall_anchors_are_on_bottom_edge(world: &FxRapierWorld2D) {

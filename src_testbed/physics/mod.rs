@@ -9,6 +9,12 @@ use rapier::pipeline::{PhysicsHooks, PhysicsPipeline};
 use std::sync::mpsc::Receiver;
 
 #[derive(Clone)]
+pub struct PhysicsSnapshotExtension {
+    id: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub struct PhysicsSnapshot {
     timestep_id: usize,
     broad_phase: Vec<u8>,
@@ -18,6 +24,7 @@ pub struct PhysicsSnapshot {
     impulse_joints: Vec<u8>,
     multibody_joints: Vec<u8>,
     island_manager: Vec<u8>,
+    extensions: Vec<PhysicsSnapshotExtension>,
 }
 
 pub struct DeserializedPhysicsSnapshot {
@@ -51,7 +58,28 @@ impl PhysicsSnapshot {
             colliders: bincode::serialize(colliders)?,
             impulse_joints: bincode::serialize(impulse_joints)?,
             multibody_joints: bincode::serialize(multibody_joints)?,
+            extensions: Vec::new(),
         })
+    }
+
+    pub fn set_extension(&mut self, id: impl Into<String>, data: Vec<u8>) {
+        let id = id.into();
+        if let Some(extension) = self
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.id == id)
+        {
+            extension.data = data;
+        } else {
+            self.extensions.push(PhysicsSnapshotExtension { id, data });
+        }
+    }
+
+    pub fn extension(&self, id: &str) -> Option<&[u8]> {
+        self.extensions
+            .iter()
+            .find(|extension| extension.id == id)
+            .map(|extension| extension.data.as_slice())
     }
 
     #[profiling::function]
@@ -75,7 +103,12 @@ impl PhysicsSnapshot {
             + self.bodies.len()
             + self.colliders.len()
             + self.impulse_joints.len()
-            + self.multibody_joints.len();
+            + self.multibody_joints.len()
+            + self
+                .extensions
+                .iter()
+                .map(|extension| extension.data.len())
+                .sum::<usize>();
         println!("Snapshot length: {total}B");
         println!("|_ broad_phase: {}B", self.broad_phase.len());
         println!("|_ narrow_phase: {}B", self.narrow_phase.len());
@@ -84,6 +117,9 @@ impl PhysicsSnapshot {
         println!("|_ colliders: {}B", self.colliders.len());
         println!("|_ impulse_joints: {}B", self.impulse_joints.len());
         println!("|_ multibody_joints: {}B", self.multibody_joints.len());
+        for extension in &self.extensions {
+            println!("|_ {}: {}B", extension.id, extension.data.len());
+        }
     }
 }
 

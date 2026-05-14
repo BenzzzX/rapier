@@ -236,6 +236,10 @@ impl Testbed<'_> {
         self.harness.add_callback(callback);
     }
 
+    pub fn add_snapshot_hook(&mut self, hook: impl crate::SnapshotHook + 'static) {
+        self.harness.add_snapshot_hook(hook);
+    }
+
     pub fn add_plugin(&mut self, mut plugin: impl crate::plugin::TestbedPlugin + 'static) {
         plugin.init_plugin();
         self.plugins.0.push(Box::new(plugin));
