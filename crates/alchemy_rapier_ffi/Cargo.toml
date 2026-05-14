@@ -13,6 +13,7 @@ edition.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
+fracture_core = { path = "../fracture_core", default-features = false }
 fracture_rapier = { path = "../fracture_rapier", default-features = false }
 fracture_voxel = { path = "../fracture_voxel", default-features = false }
 rapier2d = { path = "../rapier2d", default-features = false, features = ["dim2", "f32", "std"] }

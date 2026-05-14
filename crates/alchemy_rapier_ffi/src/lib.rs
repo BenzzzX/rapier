@@ -1,4 +1,7 @@
-use fracture_voxel::{AuthoredVoxelAsset, VoxelAuthoringInput, author_voxel_asset};
+use fracture_core::{FxActorId, FxFamilyId, GridCoord, SplitEvent};
+use fracture_voxel::{
+    AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
+};
 use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -82,6 +85,7 @@ pub struct AlchemyRapierPixelRigidbodyDesc {
     pub local_origin: AlchemyRapierVec2,
     pub topology_revision: u64,
     pub topology_version: u32,
+    pub update_kind: i32,
     pub occupancy_words: *const u64,
     pub occupancy_word_count: usize,
     pub material_ids: *const u16,
@@ -265,6 +269,53 @@ pub struct AlchemyRapierContactReadResult {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierBlastTransitionAdoptionReadResult {
+    pub status: AlchemyRapierStatus,
+    pub row_count: usize,
+    pub written_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierBlastTransitionAdoptionRow {
+    pub transition_id: u32,
+    pub source_body_handle: AlchemyRapierRigidBodyHandle,
+    pub source_body_packed_id: u64,
+    pub source_collider_handle: AlchemyRapierColliderHandle,
+    pub source_collider_packed_id: u64,
+    pub child_body_handle: AlchemyRapierRigidBodyHandle,
+    pub child_body_packed_id: u64,
+    pub child_collider_handle: AlchemyRapierColliderHandle,
+    pub child_collider_packed_id: u64,
+    pub source_width: i32,
+    pub source_height: i32,
+    pub source_min_x: i32,
+    pub source_min_y: i32,
+    pub source_max_x: i32,
+    pub source_max_y: i32,
+    pub source_cell_count: usize,
+    pub child_width: i32,
+    pub child_height: i32,
+    pub child_pixel_size: f32,
+    pub child_local_origin: AlchemyRapierVec2,
+    pub child_occupancy_word_count: usize,
+    pub child_material_id_count: usize,
+    pub child_solid_count: usize,
+    pub source_local_origin: AlchemyRapierVec2,
+    pub source_solid_count: usize,
+    pub position: AlchemyRapierVec2,
+    pub rotation: f32,
+    pub linear_velocity: AlchemyRapierVec2,
+    pub angular_velocity: f32,
+    pub source_topology_revision: u64,
+    pub source_topology_version: u32,
+    pub child_topology_revision: u64,
+    pub child_topology_version: u32,
+    pub material_hash: u64,
+}
+
+#[repr(C)]
 pub struct AlchemyRapierWorld {
     _private: [u8; 0],
 }
@@ -300,6 +351,8 @@ struct TerrainChunkState {
 #[allow(dead_code)]
 struct PixelRigidbodyState {
     asset: AuthoredVoxelAsset,
+    runtime: VoxelRuntime,
+    actor: FxActorId,
     collider: ColliderHandle,
     width: u32,
     height: u32,
@@ -310,6 +363,13 @@ struct PixelRigidbodyState {
     material_ids: Vec<u16>,
     support_mask: Vec<u8>,
     solid_count: usize,
+}
+
+struct PendingBlastTransitionAdoption {
+    row: AlchemyRapierBlastTransitionAdoptionRow,
+    source_cell_indices: Vec<i32>,
+    child_occupancy_words: Vec<u64>,
+    child_material_ids: Vec<u16>,
 }
 
 struct AlchemyRapierWorldInner {
@@ -327,6 +387,7 @@ struct AlchemyRapierWorldInner {
     terrain_chunks: HashMap<TerrainKey, TerrainChunkState>,
     terrain_by_collider: HashMap<ColliderHandle, TerrainKey>,
     pixel_rigidbodies: HashMap<RigidBodyHandle, PixelRigidbodyState>,
+    pending_blast_transition_adoptions: Vec<PendingBlastTransitionAdoption>,
     previous_active_contact_pairs: HashSet<(u64, u64)>,
     last_contact_rows: Vec<AlchemyRapierContactRow>,
 }
@@ -348,6 +409,7 @@ impl AlchemyRapierWorldInner {
             terrain_chunks: HashMap::new(),
             terrain_by_collider: HashMap::new(),
             pixel_rigidbodies: HashMap::new(),
+            pending_blast_transition_adoptions: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
             last_contact_rows: Vec::new(),
         }
@@ -865,7 +927,7 @@ fn remove_terrain_chunk(world: &mut AlchemyRapierWorldInner, key: TerrainKey) {
     }
 }
 
-fn remove_pixel_rigidbody(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
+fn remove_pixel_rigidbody_state(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
     if let Some(existing) = world.pixel_rigidbodies.remove(&body_handle) {
         let _ = world.colliders.remove(
             existing.collider,
@@ -876,7 +938,45 @@ fn remove_pixel_rigidbody(world: &mut AlchemyRapierWorldInner, body_handle: Rigi
     }
 }
 
+fn discard_pending_adoptions_for_body(
+    world: &mut AlchemyRapierWorldInner,
+    body_handle: RigidBodyHandle,
+) {
+    let mut stale_child_bodies = Vec::new();
+    let mut kept = Vec::with_capacity(world.pending_blast_transition_adoptions.len());
+    for adoption in world.pending_blast_transition_adoptions.drain(..) {
+        let source = handle_from_ffi(adoption.row.source_body_handle);
+        let child = handle_from_ffi(adoption.row.child_body_handle);
+        if source == body_handle || child == body_handle {
+            if source == body_handle && child != body_handle {
+                stale_child_bodies.push(child);
+            }
+        } else {
+            kept.push(adoption);
+        }
+    }
+    world.pending_blast_transition_adoptions = kept;
+
+    for child in stale_child_bodies {
+        remove_pixel_rigidbody_state(world, child);
+        let _ = world.bodies.remove(
+            child,
+            &mut world.islands,
+            &mut world.colliders,
+            &mut world.impulse_joints,
+            &mut world.multibody_joints,
+            true,
+        );
+    }
+}
+
+fn remove_pixel_rigidbody(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
+    discard_pending_adoptions_for_body(world, body_handle);
+    remove_pixel_rigidbody_state(world, body_handle);
+}
+
 fn clear_body_colliders(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
+    discard_pending_adoptions_for_body(world, body_handle);
     world.pixel_rigidbodies.remove(&body_handle);
     let Some(body) = world.bodies.get(body_handle) else {
         return;
@@ -992,6 +1092,525 @@ fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Opt
         return None;
     }
     Some(ColliderBuilder::compound(shapes).density(1.0).build())
+}
+
+fn actor_cells(
+    runtime: &VoxelRuntime,
+    actor_id: FxActorId,
+) -> Option<Vec<(GridCoord, usize, u16)>> {
+    let actor = runtime.family().actor(actor_id)?;
+    let asset = runtime.asset();
+    let width = asset.core().occupancy().width();
+    let mut cells = Vec::new();
+    for node_id in &actor.owned_nodes {
+        let Some(node) = asset.core().node(*node_id) else {
+            continue;
+        };
+        for coord in &node.voxels {
+            let metadata = asset.voxel_metadata(*coord).ok()?;
+            if !metadata.occupied {
+                continue;
+            }
+            let index = coord.y as usize * width as usize + coord.x as usize;
+            cells.push((*coord, index, metadata.fracture_material));
+        }
+    }
+    cells.sort_by_key(|(_, index, _)| *index);
+    Some(cells)
+}
+
+fn actor_bounds(cells: &[(GridCoord, usize, u16)]) -> Option<(u32, u32, u32, u32)> {
+    let first = cells.first()?.0;
+    let mut min_x = first.x;
+    let mut max_x = first.x;
+    let mut min_y = first.y;
+    let mut max_y = first.y;
+    for (coord, _, _) in cells {
+        min_x = min_x.min(coord.x);
+        max_x = max_x.max(coord.x);
+        min_y = min_y.min(coord.y);
+        max_y = max_y.max(coord.y);
+    }
+    Some((min_x, max_x, min_y, max_y))
+}
+
+fn build_actor_collider(
+    runtime: &VoxelRuntime,
+    actor_id: FxActorId,
+    local_origin: Vector,
+) -> Option<Collider> {
+    let voxel_size = runtime.asset().core().voxel_size();
+    let cells = actor_cells(runtime, actor_id)?;
+    if cells.is_empty() {
+        return None;
+    }
+    let mut shapes = Vec::with_capacity(cells.len());
+    for (coord, _, _) in cells {
+        let center = Vector::new(
+            (coord.x as f32 + 0.5) * voxel_size,
+            (coord.y as f32 + 0.5) * voxel_size,
+        );
+        shapes.push((
+            Pose::from_translation(center - local_origin),
+            SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
+        ));
+    }
+    Some(ColliderBuilder::compound(shapes).density(1.0).build())
+}
+
+fn build_cropped_actor_payload(
+    runtime: &VoxelRuntime,
+    actor_id: FxActorId,
+    material_ids: &[u16],
+    topology_revision: u64,
+    topology_version: u32,
+) -> Option<(
+    AlchemyRapierBlastTransitionAdoptionRow,
+    Vec<i32>,
+    Vec<u64>,
+    Vec<u16>,
+)> {
+    let cells = actor_cells(runtime, actor_id)?;
+    let (min_x, max_x, min_y, max_y) = actor_bounds(&cells)?;
+    let width = (max_x - min_x + 1) as usize;
+    let height = (max_y - min_y + 1) as usize;
+    let child_cell_count = width.checked_mul(height)?;
+    let mut words = vec![0u64; child_cell_count.div_ceil(64)];
+    let mut materials = vec![0u16; child_cell_count];
+    let mut source_indices = Vec::with_capacity(cells.len());
+    for (coord, source_index, fallback_material) in cells {
+        source_indices.push(source_index.min(i32::MAX as usize) as i32);
+        let child_x = (coord.x - min_x) as usize;
+        let child_y = (coord.y - min_y) as usize;
+        let child_index = child_y * width + child_x;
+        words[child_index >> 6] |= 1u64 << (child_index & 63);
+        let material = material_ids
+            .get(source_index)
+            .copied()
+            .unwrap_or(fallback_material);
+        materials[child_index] = material;
+    }
+    let actor = runtime.family().actor(actor_id)?;
+    let cropped_com = Vector::new(
+        actor.local_com.x - min_x as f32,
+        actor.local_com.y - min_y as f32,
+    );
+    let local_origin = Vector::new(
+        width as f32 * 0.5 - cropped_com.x,
+        height as f32 * 0.5 - cropped_com.y,
+    );
+    let row = AlchemyRapierBlastTransitionAdoptionRow {
+        source_min_x: min_x.min(i32::MAX as u32) as i32,
+        source_min_y: min_y.min(i32::MAX as u32) as i32,
+        source_max_x: max_x.min(i32::MAX as u32) as i32,
+        source_max_y: max_y.min(i32::MAX as u32) as i32,
+        source_cell_count: source_indices.len(),
+        child_width: width.min(i32::MAX as usize) as i32,
+        child_height: height.min(i32::MAX as usize) as i32,
+        child_pixel_size: runtime.asset().core().voxel_size(),
+        child_local_origin: ffi_vec(local_origin),
+        child_occupancy_word_count: words.len(),
+        child_material_id_count: materials.len(),
+        child_solid_count: source_indices.len(),
+        child_topology_revision: topology_revision,
+        child_topology_version: topology_version,
+        ..AlchemyRapierBlastTransitionAdoptionRow::default()
+    };
+    Some((row, source_indices, words, materials))
+}
+
+fn cropped_pixel_asset_from_words(
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    occupancy_words: &[u64],
+    material_ids: &[u16],
+) -> Option<AuthoredVoxelAsset> {
+    let cell_count = (width as usize).checked_mul(height as usize)?;
+    if material_ids.len() != cell_count {
+        return None;
+    }
+    let mut occupancy = vec![false; cell_count];
+    let mut fracture_material = vec![0u16; cell_count];
+    let mut contact_material = vec![0u16; cell_count];
+    let external_id = vec![0u32; cell_count];
+    for cell_index in 0..cell_count {
+        let word_index = cell_index >> 6;
+        let bit_index = cell_index & 63;
+        let occupied = occupancy_words
+            .get(word_index)
+            .map_or(false, |word| ((word >> bit_index) & 1) != 0);
+        if occupied {
+            let material = material_ids[cell_index];
+            occupancy[cell_index] = true;
+            fracture_material[cell_index] = material;
+            contact_material[cell_index] = material;
+        }
+    }
+    author_voxel_asset(VoxelAuthoringInput::new(
+        width,
+        height,
+        pixel_size,
+        occupancy,
+        fracture_material,
+        contact_material,
+        external_id,
+    ))
+    .ok()
+}
+
+fn material_hash(material_ids: &[u16]) -> u64 {
+    let mut hash = 14695981039346656037u64;
+    for material in material_ids {
+        hash ^= u64::from(*material);
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    hash
+}
+
+fn actor_host_local_origin(runtime: &VoxelRuntime, actor_id: FxActorId) -> AlchemyRapierVec2 {
+    let width = runtime.asset().core().occupancy().width() as f32;
+    let height = runtime.asset().core().occupancy().height() as f32;
+    if let Some(actor) = runtime.family().actor(actor_id) {
+        ffi_vec(Vector::new(
+            width * 0.5 - actor.local_com.x,
+            height * 0.5 - actor.local_com.y,
+        ))
+    } else {
+        AlchemyRapierVec2::default()
+    }
+}
+
+fn actor_solid_count(runtime: &VoxelRuntime, actor_id: FxActorId) -> usize {
+    actor_cells(runtime, actor_id).map_or(0, |cells| cells.len())
+}
+
+fn actor_scoped_asset(
+    runtime: &VoxelRuntime,
+    actor_id: FxActorId,
+    material_ids: &[u16],
+) -> Option<AuthoredVoxelAsset> {
+    let width = runtime.asset().core().occupancy().width();
+    let height = runtime.asset().core().occupancy().height();
+    let cell_count = (width as usize).checked_mul(height as usize)?;
+    let mut occupancy = vec![false; cell_count];
+    let mut fracture_material = vec![0u16; cell_count];
+    let mut contact_material = vec![0u16; cell_count];
+    let external_id = vec![0u32; cell_count];
+    for (_, index, fallback_material) in actor_cells(runtime, actor_id)? {
+        if index >= cell_count {
+            return None;
+        }
+        let material = material_ids
+            .get(index)
+            .copied()
+            .unwrap_or(fallback_material);
+        occupancy[index] = true;
+        fracture_material[index] = material;
+        contact_material[index] = material;
+    }
+    author_voxel_asset(VoxelAuthoringInput::new(
+        width,
+        height,
+        runtime.asset().core().voxel_size(),
+        occupancy,
+        fracture_material,
+        contact_material,
+        external_id,
+    ))
+    .ok()
+}
+
+fn first_actor_id(runtime: &VoxelRuntime) -> FxActorId {
+    runtime
+        .family()
+        .actors()
+        .next()
+        .map(|(actor_id, _)| *actor_id)
+        .unwrap_or(FxActorId(0))
+}
+
+fn actor_com(runtime: &VoxelRuntime, actor_id: FxActorId) -> Option<Vector> {
+    runtime
+        .family()
+        .actor(actor_id)
+        .map(|actor| Vector::new(actor.local_com.x, actor.local_com.y))
+}
+
+fn asset_point_to_world(body_pose: &Pose, old_local_origin: Vector, asset_point: Vector) -> Vector {
+    body_pose.translation + body_pose.rotation * (asset_point - old_local_origin)
+}
+
+fn try_apply_dirty_pixel_split(
+    world: &mut AlchemyRapierWorldInner,
+    body_handle: RigidBodyHandle,
+    desc: AlchemyRapierPixelRigidbodyDesc,
+    new_occupancy: &[bool],
+    new_material_ids: &[u16],
+    mut state: PixelRigidbodyState,
+) -> Option<AlchemyRapierPixelRigidbodyResult> {
+    if desc.update_kind != 2
+        || state.width != desc.width as u32
+        || state.height != desc.height as u32
+        || (state.pixel_size - desc.pixel_size).abs() > 0.000001
+    {
+        world.pixel_rigidbodies.insert(body_handle, state);
+        return None;
+    }
+
+    let old_occupancy = state.asset.occupancy();
+    if old_occupancy.len() != new_occupancy.len() {
+        world.pixel_rigidbodies.insert(body_handle, state);
+        return None;
+    }
+
+    let width = state.width;
+    let mut removed = Vec::new();
+    for (index, (old_solid, new_solid)) in
+        old_occupancy.iter().zip(new_occupancy.iter()).enumerate()
+    {
+        if *old_solid && !*new_solid {
+            removed.push(GridCoord {
+                x: (index % width as usize) as u32,
+                y: (index / width as usize) as u32,
+            });
+        }
+        if !*old_solid && *new_solid {
+            world.pixel_rigidbodies.insert(body_handle, state);
+            return None;
+        }
+    }
+    if removed.is_empty() {
+        world.pixel_rigidbodies.insert(body_handle, state);
+        return None;
+    }
+
+    if state
+        .runtime
+        .apply_edit(RuntimeEdit::RemoveVoxels { voxels: removed })
+        .is_err()
+    {
+        world.pixel_rigidbodies.insert(body_handle, state);
+        return None;
+    }
+    let split_events = state.runtime.split_dirty_actors();
+    let source_actor = state.actor;
+    let source_com = actor_com(&state.runtime, source_actor)?;
+    let source_collider = build_actor_collider(&state.runtime, source_actor, source_com)?;
+
+    let source_pose = {
+        let body = world.bodies.get(body_handle)?;
+        *body.position()
+    };
+    let source_linvel = world.bodies.get(body_handle)?.linvel();
+    let source_angvel = world.bodies.get(body_handle)?.angvel();
+    let source_can_sleep = body_can_sleep(world.bodies.get(body_handle)?);
+    let source_gravity_scale = world.bodies.get(body_handle)?.gravity_scale();
+    let source_rotation = source_pose.rotation.angle();
+    let source_position = asset_point_to_world(&source_pose, state.local_origin, source_com);
+    state.topology_revision = desc.topology_revision;
+    state.topology_version = desc.topology_version;
+    state.material_ids = new_material_ids.to_vec();
+
+    let _ = world
+        .colliders
+        .remove(state.collider, &mut world.islands, &mut world.bodies, true);
+    if let Some(body) = world.bodies.get_mut(body_handle) {
+        body.set_position(
+            Pose::from_parts(source_position, source_pose.rotation),
+            true,
+        );
+    }
+    let source_collider_handle =
+        world
+            .colliders
+            .insert_with_parent(source_collider, body_handle, &mut world.bodies);
+    if let Some(body) = world.bodies.get_mut(body_handle) {
+        body.set_additional_mass(0.0, true);
+        body.recompute_mass_properties_from_colliders(&world.colliders);
+    }
+
+    let mut created_any = false;
+    for event in split_events
+        .iter()
+        .filter(|event| event.parent_actor == source_actor)
+    {
+        created_any |= create_pending_split_adoptions(
+            world,
+            body_handle,
+            source_collider_handle,
+            &state,
+            event,
+            source_linvel,
+            source_angvel,
+            source_can_sleep,
+            source_gravity_scale,
+            source_rotation,
+            new_material_ids,
+        );
+    }
+
+    let Some(source_asset) = actor_scoped_asset(&state.runtime, source_actor, new_material_ids)
+    else {
+        world.pixel_rigidbodies.insert(body_handle, state);
+        return None;
+    };
+    let source_runtime = VoxelRuntime::instantiate(
+        FxFamilyId(pack_body_handle(body_handle) as u32),
+        source_asset.clone(),
+    );
+    let source_actor = first_actor_id(&source_runtime);
+    state.asset = source_asset;
+    state.runtime = source_runtime;
+    state.actor = source_actor;
+    state.collider = source_collider_handle;
+    state.local_origin = source_com;
+    state.solid_count = actor_solid_count(&state.runtime, source_actor);
+    let result = {
+        let body = world.bodies.get(body_handle)?;
+        pixel_result(
+            AlchemyRapierStatus::Ok,
+            source_collider_handle,
+            state.solid_count,
+            body,
+        )
+    };
+    world.pixel_rigidbodies.insert(body_handle, state);
+    if created_any {
+        Some(result)
+    } else {
+        Some(result)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pending_split_adoptions(
+    world: &mut AlchemyRapierWorldInner,
+    source_body_handle: RigidBodyHandle,
+    source_collider_handle: ColliderHandle,
+    source_state: &PixelRigidbodyState,
+    event: &SplitEvent,
+    source_linvel: Vector,
+    source_angvel: f32,
+    source_can_sleep: bool,
+    source_gravity_scale: f32,
+    source_rotation: f32,
+    material_ids: &[u16],
+) -> bool {
+    let Some(source_body) = world.bodies.get(source_body_handle) else {
+        return false;
+    };
+    let source_pose = *source_body.position();
+    let mut created_any = false;
+    for child_actor in &event.created_children {
+        let Some((mut row, source_cells, child_words, child_materials)) =
+            build_cropped_actor_payload(
+                &source_state.runtime,
+                *child_actor,
+                material_ids,
+                source_state.topology_revision,
+                source_state.topology_version,
+            )
+        else {
+            continue;
+        };
+        let child_local_origin = vector(row.child_local_origin);
+        let Some(child_asset) = cropped_pixel_asset_from_words(
+            row.child_width as u32,
+            row.child_height as u32,
+            row.child_pixel_size,
+            &child_words,
+            &child_materials,
+        ) else {
+            continue;
+        };
+        let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin) else {
+            continue;
+        };
+        let child_source_local_origin = Vector::new(
+            row.source_min_x as f32 + child_local_origin.x,
+            row.source_min_y as f32 + child_local_origin.y,
+        );
+        let child_position = asset_point_to_world(
+            &source_pose,
+            source_state.local_origin,
+            child_source_local_origin,
+        );
+        let child_body = world.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(child_position)
+                .rotation(source_rotation)
+                .linvel(source_linvel)
+                .angvel(source_angvel)
+                .gravity_scale(source_gravity_scale)
+                .can_sleep(source_can_sleep),
+        );
+        let child_collider_handle =
+            world
+                .colliders
+                .insert_with_parent(child_collider, child_body, &mut world.bodies);
+        if let Some(body) = world.bodies.get_mut(child_body) {
+            body.set_additional_mass(0.0, true);
+            body.recompute_mass_properties_from_colliders(&world.colliders);
+        }
+        let Some(body) = world.bodies.get(child_body) else {
+            continue;
+        };
+        let child_runtime = VoxelRuntime::instantiate(
+            FxFamilyId(pack_body_handle(child_body) as u32),
+            child_asset.clone(),
+        );
+        let child_actor_state = first_actor_id(&child_runtime);
+        let child_state = PixelRigidbodyState {
+            asset: child_asset,
+            runtime: child_runtime,
+            actor: child_actor_state,
+            collider: child_collider_handle,
+            width: row.child_width.max(0) as u32,
+            height: row.child_height.max(0) as u32,
+            pixel_size: source_state.pixel_size,
+            local_origin: child_local_origin,
+            topology_revision: source_state.topology_revision,
+            topology_version: source_state.topology_version,
+            material_ids: child_materials.clone(),
+            support_mask: vec![0u8; child_materials.len()],
+            solid_count: source_cells.len(),
+        };
+        row.transition_id = event.event_id.0;
+        row.source_body_handle = handle_to_ffi(source_body_handle);
+        row.source_body_packed_id = pack_body_handle(source_body_handle);
+        row.source_collider_handle = collider_handle_to_ffi(source_collider_handle);
+        row.source_collider_packed_id = pack_collider_handle(source_collider_handle);
+        row.child_body_handle = handle_to_ffi(child_body);
+        row.child_body_packed_id = pack_body_handle(child_body);
+        row.child_collider_handle = collider_handle_to_ffi(child_collider_handle);
+        row.child_collider_packed_id = pack_collider_handle(child_collider_handle);
+        row.source_width = source_state.width.min(i32::MAX as u32) as i32;
+        row.source_height = source_state.height.min(i32::MAX as u32) as i32;
+        row.source_local_origin =
+            actor_host_local_origin(&source_state.runtime, source_state.actor);
+        row.source_solid_count = actor_solid_count(&source_state.runtime, source_state.actor);
+        row.position = ffi_vec(body.translation());
+        row.rotation = body.rotation().angle();
+        row.linear_velocity = ffi_vec(body.linvel());
+        row.angular_velocity = body.angvel();
+        row.source_topology_revision = source_state.topology_revision;
+        row.source_topology_version = source_state.topology_version;
+        row.child_topology_revision = source_state.topology_revision;
+        row.child_topology_version = source_state.topology_version;
+        row.material_hash = material_hash(material_ids);
+        world.pixel_rigidbodies.insert(child_body, child_state);
+        world
+            .pending_blast_transition_adoptions
+            .push(PendingBlastTransitionAdoption {
+                row,
+                source_cell_indices: source_cells,
+                child_occupancy_words: child_words,
+                child_material_ids: child_materials,
+            });
+        created_any = true;
+    }
+    created_any
 }
 
 fn pixel_result(
@@ -1656,6 +2275,19 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody(
             Ok(value) => value,
             Err(status) => return empty_pixel_rigidbody_result(status),
         };
+        let occupancy = asset.occupancy();
+        if let Some(existing) = world.pixel_rigidbodies.remove(&body_handle) {
+            if let Some(result) = try_apply_dirty_pixel_split(
+                world,
+                body_handle,
+                desc,
+                &occupancy,
+                &material_ids,
+                existing,
+            ) {
+                return result;
+            }
+        }
         let local_origin = vector(desc.local_origin);
         let Some(collider) = build_pixel_collider(&asset, local_origin) else {
             return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
@@ -1676,10 +2308,17 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody(
             };
             pixel_result(AlchemyRapierStatus::Ok, collider_handle, solid_count, body)
         };
+        let runtime = VoxelRuntime::instantiate(
+            FxFamilyId(pack_body_handle(body_handle) as u32),
+            asset.clone(),
+        );
+        let actor = first_actor_id(&runtime);
         world.pixel_rigidbodies.insert(
             body_handle,
             PixelRigidbodyState {
                 asset,
+                runtime,
+                actor,
                 collider: collider_handle,
                 width: desc.width as u32,
                 height: desc.height as u32,
@@ -1721,7 +2360,8 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
             return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
         }
         let new_local_origin = vector(local_origin);
-        let Some(collider) = build_pixel_collider(&state.asset, new_local_origin) else {
+        let Some(collider) = build_actor_collider(&state.runtime, state.actor, new_local_origin)
+        else {
             world.pixel_rigidbodies.insert(body_handle, state);
             return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidArgument);
         };
@@ -1737,6 +2377,7 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
             body.set_additional_mass(0.0, true);
             body.recompute_mass_properties_from_colliders(&world.colliders);
         }
+        state.solid_count = actor_solid_count(&state.runtime, state.actor);
         let result = {
             let Some(body) = world.bodies.get(body_handle) else {
                 return empty_pixel_rigidbody_result(AlchemyRapierStatus::InvalidHandle);
@@ -2118,6 +2759,160 @@ where
             status: AlchemyRapierStatus::Panic,
             value: AlchemyRapierVec2::default(),
         },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_read_blast_transition_adoption_rows(
+    world: *mut AlchemyRapierWorld,
+    rows: *mut AlchemyRapierBlastTransitionAdoptionRow,
+    row_capacity: usize,
+) -> AlchemyRapierBlastTransitionAdoptionReadResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if rows.is_null() && row_capacity > 0 {
+            return AlchemyRapierBlastTransitionAdoptionReadResult {
+                status: AlchemyRapierStatus::NullPointer,
+                row_count: 0,
+                written_count: 0,
+            };
+        }
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierBlastTransitionAdoptionReadResult {
+                status: AlchemyRapierStatus::NullPointer,
+                row_count: 0,
+                written_count: 0,
+            };
+        };
+        let row_count = world.pending_blast_transition_adoptions.len();
+        let written_count = row_count.min(row_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(rows, written_count) };
+            for (slot, adoption) in out
+                .iter_mut()
+                .zip(world.pending_blast_transition_adoptions.iter())
+            {
+                *slot = adoption.row;
+            }
+        }
+        AlchemyRapierBlastTransitionAdoptionReadResult {
+            status: AlchemyRapierStatus::Ok,
+            row_count,
+            written_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => AlchemyRapierBlastTransitionAdoptionReadResult {
+            status: AlchemyRapierStatus::Panic,
+            row_count: 0,
+            written_count: 0,
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_cells(
+    world: *mut AlchemyRapierWorld,
+    row_index: usize,
+    cells: *mut i32,
+    cell_capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if cells.is_null() && cell_capacity > 0 {
+            return 0;
+        }
+        let Ok(world) = to_inner(world) else {
+            return 0;
+        };
+        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
+            return 0;
+        };
+        let written_count = adoption.source_cell_indices.len().min(cell_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
+            out.copy_from_slice(&adoption.source_cell_indices[..written_count]);
+        }
+        written_count
+    })) {
+        Ok(result) => result,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_occupancy_words(
+    world: *mut AlchemyRapierWorld,
+    row_index: usize,
+    words: *mut u64,
+    word_capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if words.is_null() && word_capacity > 0 {
+            return 0;
+        }
+        let Ok(world) = to_inner(world) else {
+            return 0;
+        };
+        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
+            return 0;
+        };
+        let written_count = adoption.child_occupancy_words.len().min(word_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(words, written_count) };
+            out.copy_from_slice(&adoption.child_occupancy_words[..written_count]);
+        }
+        written_count
+    })) {
+        Ok(result) => result,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_material_ids(
+    world: *mut AlchemyRapierWorld,
+    row_index: usize,
+    material_ids: *mut u16,
+    material_id_capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if material_ids.is_null() && material_id_capacity > 0 {
+            return 0;
+        }
+        let Ok(world) = to_inner(world) else {
+            return 0;
+        };
+        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
+            return 0;
+        };
+        let written_count = adoption.child_material_ids.len().min(material_id_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(material_ids, written_count) };
+            out.copy_from_slice(&adoption.child_material_ids[..written_count]);
+        }
+        written_count
+    })) {
+        Ok(result) => result,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_acknowledge_blast_transition_adoptions(
+    world: *mut AlchemyRapierWorld,
+    acknowledged_count: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let count = acknowledged_count.min(world.pending_blast_transition_adoptions.len());
+        if count > 0 {
+            world.pending_blast_transition_adoptions.drain(0..count);
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
     }
 }
 
