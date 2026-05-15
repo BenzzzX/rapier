@@ -62,6 +62,7 @@ pub struct AlchemyRapierTerrainDesc {
     pub source_world_origin_y: i32,
     pub local_origin_x: i32,
     pub local_origin_y: i32,
+    pub pixel_shape_local_origin: AlchemyRapierVec2,
     pub revision: i64,
     pub width: i32,
     pub height: i32,
@@ -336,6 +337,7 @@ struct TerrainChunkState {
     source_world_origin_y: i32,
     local_origin_x: i32,
     local_origin_y: i32,
+    pixel_shape_local_origin: Vector,
     revision: i64,
     width: u32,
     height: u32,
@@ -1069,8 +1071,21 @@ fn author_pixel_asset(
     Ok((asset, material_ids, support_mask, solid_count))
 }
 
-fn asset_point_to_body_local(local_origin: Vector, asset_point: Vector) -> Vector {
-    asset_point - local_origin
+fn pixel_shape_half_extents(width: u32, height: u32, pixel_size: f32) -> Vector {
+    Vector::new(
+        0.5 * width as f32 * pixel_size,
+        0.5 * height as f32 * pixel_size,
+    )
+}
+
+fn asset_point_to_body_local(
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    local_origin: Vector,
+    asset_point: Vector,
+) -> Vector {
+    asset_point - pixel_shape_half_extents(width, height, pixel_size) + local_origin
 }
 
 fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Option<Collider> {
@@ -1087,7 +1102,13 @@ fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Opt
             }
             let center = Vector::new((x as f32 + 0.5) * voxel_size, (y as f32 + 0.5) * voxel_size);
             shapes.push((
-                Pose::from_translation(asset_point_to_body_local(local_origin, center)),
+                Pose::from_translation(asset_point_to_body_local(
+                    width,
+                    height,
+                    voxel_size,
+                    local_origin,
+                    center,
+                )),
                 SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
             ));
         }
@@ -1144,6 +1165,8 @@ fn build_actor_collider(
     local_origin: Vector,
 ) -> Option<Collider> {
     let voxel_size = runtime.asset().core().voxel_size();
+    let width = runtime.asset().core().occupancy().width();
+    let height = runtime.asset().core().occupancy().height();
     let cells = actor_cells(runtime, actor_id)?;
     if cells.is_empty() {
         return None;
@@ -1155,11 +1178,26 @@ fn build_actor_collider(
             (coord.y as f32 + 0.5) * voxel_size,
         );
         shapes.push((
-            Pose::from_translation(asset_point_to_body_local(local_origin, center)),
+            Pose::from_translation(asset_point_to_body_local(
+                width,
+                height,
+                voxel_size,
+                local_origin,
+                center,
+            )),
             SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
         ));
     }
     Some(ColliderBuilder::compound(shapes).density(1.0).build())
+}
+
+fn pixel_shape_local_origin_for_com(
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    asset_com: Vector,
+) -> Vector {
+    pixel_shape_half_extents(width, height, pixel_size) - asset_com
 }
 
 fn build_cropped_actor_payload(
@@ -1199,7 +1237,12 @@ fn build_cropped_actor_payload(
         actor.local_com.x - min_x as f32,
         actor.local_com.y - min_y as f32,
     );
-    let local_origin = cropped_com;
+    let local_origin = pixel_shape_local_origin_for_com(
+        width as u32,
+        height as u32,
+        runtime.asset().core().voxel_size(),
+        cropped_com,
+    );
     let row = AlchemyRapierBlastTransitionAdoptionRow {
         source_min_x: min_x.min(i32::MAX as u32) as i32,
         source_min_y: min_y.min(i32::MAX as u32) as i32,
@@ -1271,7 +1314,14 @@ fn material_hash(material_ids: &[u16]) -> u64 {
 
 fn actor_host_local_origin(runtime: &VoxelRuntime, actor_id: FxActorId) -> AlchemyRapierVec2 {
     actor_com(runtime, actor_id)
-        .map(ffi_vec)
+        .map(|com| {
+            ffi_vec(pixel_shape_local_origin_for_com(
+                runtime.asset().core().occupancy().width(),
+                runtime.asset().core().occupancy().height(),
+                runtime.asset().core().voxel_size(),
+                com,
+            ))
+        })
         .unwrap_or_default()
 }
 
@@ -1331,9 +1381,17 @@ fn actor_com(runtime: &VoxelRuntime, actor_id: FxActorId) -> Option<Vector> {
         .map(|actor| Vector::new(actor.local_com.x, actor.local_com.y))
 }
 
-fn asset_point_to_world(body_pose: &Pose, old_local_origin: Vector, asset_point: Vector) -> Vector {
+fn asset_point_to_world(
+    body_pose: &Pose,
+    width: u32,
+    height: u32,
+    pixel_size: f32,
+    old_local_origin: Vector,
+    asset_point: Vector,
+) -> Vector {
     body_pose.translation
-        + body_pose.rotation * asset_point_to_body_local(old_local_origin, asset_point)
+        + body_pose.rotation
+            * asset_point_to_body_local(width, height, pixel_size, old_local_origin, asset_point)
 }
 
 fn try_apply_dirty_pixel_split(
@@ -1391,7 +1449,9 @@ fn try_apply_dirty_pixel_split(
     let split_events = state.runtime.split_dirty_actors();
     let source_actor = state.actor;
     let source_com = actor_com(&state.runtime, source_actor)?;
-    let source_collider = build_actor_collider(&state.runtime, source_actor, source_com)?;
+    let source_local_origin =
+        pixel_shape_local_origin_for_com(state.width, state.height, state.pixel_size, source_com);
+    let source_collider = build_actor_collider(&state.runtime, source_actor, source_local_origin)?;
 
     let source_pose = {
         let body = world.bodies.get(body_handle)?;
@@ -1402,7 +1462,14 @@ fn try_apply_dirty_pixel_split(
     let source_can_sleep = body_can_sleep(world.bodies.get(body_handle)?);
     let source_gravity_scale = world.bodies.get(body_handle)?.gravity_scale();
     let source_rotation = source_pose.rotation.angle();
-    let source_position = asset_point_to_world(&source_pose, state.local_origin, source_com);
+    let source_position = asset_point_to_world(
+        &source_pose,
+        state.width,
+        state.height,
+        state.pixel_size,
+        state.local_origin,
+        source_com,
+    );
     state.topology_revision = desc.topology_revision;
     state.topology_version = desc.topology_version;
     state.material_ids = new_material_ids.to_vec();
@@ -1460,7 +1527,7 @@ fn try_apply_dirty_pixel_split(
     state.runtime = source_runtime;
     state.actor = source_actor;
     state.collider = source_collider_handle;
-    state.local_origin = source_com;
+    state.local_origin = source_local_origin;
     state.solid_count = actor_solid_count(&state.runtime, source_actor);
     let result = {
         let body = world.bodies.get(body_handle)?;
@@ -1523,12 +1590,24 @@ fn create_pending_split_adoptions(
         let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin) else {
             continue;
         };
-        let child_source_com = Vector::new(
-            row.source_min_x as f32 + child_local_origin.x,
-            row.source_min_y as f32 + child_local_origin.y,
+        let child_half_extents = pixel_shape_half_extents(
+            row.child_width.max(0) as u32,
+            row.child_height.max(0) as u32,
+            row.child_pixel_size,
         );
-        let child_position =
-            asset_point_to_world(&source_pose, source_state.local_origin, child_source_com);
+        let child_cropped_com = child_half_extents - child_local_origin;
+        let child_source_com = Vector::new(
+            row.source_min_x as f32 + child_cropped_com.x,
+            row.source_min_y as f32 + child_cropped_com.y,
+        );
+        let child_position = asset_point_to_world(
+            &source_pose,
+            source_state.width,
+            source_state.height,
+            source_state.pixel_size,
+            source_state.local_origin,
+            child_source_com,
+        );
         let child_body = world.bodies.insert(
             RigidBodyBuilder::dynamic()
                 .translation(child_position)
@@ -1635,11 +1714,30 @@ fn terrain_cell_occupied(state: &TerrainChunkState, x: i32, y: i32) -> bool {
     state.occupancy[terrain_cell_index(state, x as u32, y as u32)]
 }
 
+fn terrain_body_origin(state: &TerrainChunkState) -> Vector {
+    Vector::new(state.local_origin_x as f32, state.local_origin_y as f32)
+}
+
+fn terrain_asset_point_to_world(state: &TerrainChunkState, asset_point: Vector) -> Vector {
+    terrain_body_origin(state)
+        + asset_point_to_body_local(
+            state.width,
+            state.height,
+            state.pixel_size,
+            state.pixel_shape_local_origin,
+            asset_point,
+        )
+}
+
+fn terrain_point_to_asset_point(state: &TerrainChunkState, point: Vector) -> Vector {
+    point - terrain_body_origin(state) - state.pixel_shape_local_origin
+        + pixel_shape_half_extents(state.width, state.height, state.pixel_size)
+}
+
 fn terrain_world_cell(state: &TerrainChunkState, point: Vector) -> (i32, i32) {
-    let local_x =
-        ((point.x - state.source_world_origin_x as f32) / state.pixel_size).floor() as i32;
-    let local_y =
-        ((point.y - state.source_world_origin_y as f32) / state.pixel_size).floor() as i32;
+    let asset_point = terrain_point_to_asset_point(state, point);
+    let local_x = (asset_point.x / state.pixel_size).floor() as i32;
+    let local_y = (asset_point.y / state.pixel_size).floor() as i32;
     if terrain_cell_occupied(state, local_x, local_y) {
         return (
             state.source_world_origin_x + local_x,
@@ -1653,8 +1751,12 @@ fn terrain_world_cell(state: &TerrainChunkState, point: Vector) -> (i32, i32) {
             if !terrain_cell_occupied(state, x, y) {
                 continue;
             }
-            let min_x = state.source_world_origin_x as f32 + x as f32 * state.pixel_size;
-            let min_y = state.source_world_origin_y as f32 + y as f32 * state.pixel_size;
+            let min = terrain_asset_point_to_world(
+                state,
+                Vector::new(x as f32 * state.pixel_size, y as f32 * state.pixel_size),
+            );
+            let min_x = min.x;
+            let min_y = min.y;
             let max_x = min_x + state.pixel_size;
             let max_y = min_y + state.pixel_size;
             if point.x >= min_x - epsilon
@@ -1678,9 +1780,12 @@ fn terrain_world_cell(state: &TerrainChunkState, point: Vector) -> (i32, i32) {
             if !state.occupancy[terrain_cell_index(state, x, y)] {
                 continue;
             }
-            let center = Vector::new(
-                state.source_world_origin_x as f32 + (x as f32 + 0.5) * state.pixel_size,
-                state.source_world_origin_y as f32 + (y as f32 + 0.5) * state.pixel_size,
+            let center = terrain_asset_point_to_world(
+                state,
+                Vector::new(
+                    (x as f32 + 0.5) * state.pixel_size,
+                    (y as f32 + 0.5) * state.pixel_size,
+                ),
             );
             let distance_sq = (point - center).length_squared();
             if distance_sq < best_distance_sq {
@@ -1697,11 +1802,7 @@ fn terrain_world_cell(state: &TerrainChunkState, point: Vector) -> (i32, i32) {
 }
 
 fn terrain_local_point(state: &TerrainChunkState, point: Vector) -> Vector {
-    point
-        - Vector::new(
-            state.source_world_origin_x as f32,
-            state.source_world_origin_y as f32,
-        )
+    point - terrain_body_origin(state)
 }
 
 fn is_alchemy_rigidbody_query_body_type(body_type: RigidBodyType) -> bool {
@@ -2465,6 +2566,11 @@ pub extern "C" fn alchemy_rapier_apply_terrain(
         if !desc.pixel_size.is_finite() || desc.pixel_size <= 0.0 {
             return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
         }
+        if !desc.pixel_shape_local_origin.x.is_finite()
+            || !desc.pixel_shape_local_origin.y.is_finite()
+        {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        }
 
         let width = desc.width as u32;
         let height = desc.height as u32;
@@ -2518,6 +2624,8 @@ pub extern "C" fn alchemy_rapier_apply_terrain(
             return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
         };
 
+        let body_origin = Vector::new(desc.local_origin_x as f32, desc.local_origin_y as f32);
+        let pixel_shape_local_origin = vector(desc.pixel_shape_local_origin);
         let mut shapes = Vec::with_capacity(solid_count);
         for y in 0..height {
             for x in 0..width {
@@ -2525,10 +2633,18 @@ pub extern "C" fn alchemy_rapier_apply_terrain(
                 if !occupancy[idx] {
                     continue;
                 }
-                let center = Vector::new(
-                    desc.source_world_origin_x as f32 + (x as f32 + 0.5) * desc.pixel_size,
-                    desc.source_world_origin_y as f32 + (y as f32 + 0.5) * desc.pixel_size,
+                let asset_center = Vector::new(
+                    (x as f32 + 0.5) * desc.pixel_size,
+                    (y as f32 + 0.5) * desc.pixel_size,
                 );
+                let center = body_origin
+                    + asset_point_to_body_local(
+                        width,
+                        height,
+                        desc.pixel_size,
+                        pixel_shape_local_origin,
+                        asset_center,
+                    );
                 shapes.push((
                     Pose::from_translation(center),
                     SharedShape::cuboid(desc.pixel_size * 0.5, desc.pixel_size * 0.5),
@@ -2555,6 +2671,7 @@ pub extern "C" fn alchemy_rapier_apply_terrain(
             source_world_origin_y: desc.source_world_origin_y,
             local_origin_x: desc.local_origin_x,
             local_origin_y: desc.local_origin_y,
+            pixel_shape_local_origin,
             revision: desc.revision,
             width,
             height,
