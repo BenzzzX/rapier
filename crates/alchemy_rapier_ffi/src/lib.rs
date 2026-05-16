@@ -1,4 +1,7 @@
-use fracture_core::{FxActorId, FxFamilyId, GridCoord, SplitEvent};
+use fracture_core::{
+    CommandId, DamageInput, DamageSource, DeterministicOrderKey, FractureCommand, FractureTarget,
+    FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId, Vec2, generate_damage_commands,
+};
 use fracture_voxel::{
     AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
 };
@@ -12,6 +15,11 @@ use std::slice;
 
 const QUERY_SOURCE_TERRAIN: u32 = 1;
 const QUERY_SOURCE_DYNAMIC_RIGIDBODY: u32 = 1 << 1;
+const TERRAIN_EXTERNAL_ACTION_STRICT_FORCE: i32 = 1;
+const TERRAIN_EXTERNAL_ACTION_STRICT_IMPULSE: i32 = 2;
+const TERRAIN_EXTERNAL_ACTION_SANDBOX_LOAD: i32 = 3;
+const TERRAIN_EXTERNAL_ACTION_SANDBOX_IMPACT: i32 = 4;
+const TERRAIN_EXTERNAL_ACTION_MAX_NODE_DISTANCE_PIXELS: f32 = 2.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +239,7 @@ pub struct AlchemyRapierTerrainExternalActionResult {
     pub affected_cell_count: usize,
     pub adoption_count: usize,
     pub retained_solid_count: usize,
+    pub actor_key: i64,
 }
 
 #[repr(C)]
@@ -1903,6 +1912,7 @@ fn empty_terrain_external_action_result(
         affected_cell_count: 0,
         adoption_count: 0,
         retained_solid_count: 0,
+        actor_key: 0,
     }
 }
 
@@ -1923,43 +1933,116 @@ fn terrain_actor_key_for_external_action(
         .copied()
 }
 
-fn terrain_actor_external_affected_voxels(
+fn terrain_actor_nearest_owned_support_node(
     state: &TerrainFractureActorState,
     world_point: Vector,
-    radius: f32,
-) -> Vec<GridCoord> {
+) -> Option<(SupportNodeId, Vec<i32>)> {
     let asset_point = terrain_actor_point_to_asset_point(state, world_point);
-    let radius = radius.max(state.pixel_size * 0.51);
-    let radius_sq = radius * radius;
-    let mut affected = Vec::new();
-    let mut nearest: Option<(GridCoord, f32)> = None;
-    let Some(cells) = actor_cells(&state.runtime, state.actor) else {
-        return affected;
-    };
-    for (coord, _, _) in cells {
-        let center = Vector::new(
-            (coord.x as f32 + 0.5) * state.pixel_size,
-            (coord.y as f32 + 0.5) * state.pixel_size,
-        );
-        let distance_sq = (asset_point - center).length_squared();
-        if distance_sq <= radius_sq {
-            affected.push(coord);
+    let family = state.runtime.family();
+    let actor = family.actor(state.actor)?;
+    let asset = family.asset();
+    let width = asset.occupancy().width() as usize;
+    let mut nearest: Option<(SupportNodeId, f32, Vec<i32>)> = None;
+    for node_id in &actor.owned_nodes {
+        let Some(node) = asset.node(*node_id) else {
+            continue;
+        };
+        let mut node_indices = Vec::new();
+        let mut node_center = Vector::ZERO;
+        let mut node_weight = 0.0f32;
+        for coord in &node.voxels {
+            let index = (coord.y as usize)
+                .checked_mul(width)?
+                .checked_add(coord.x as usize)?;
+            let Some(occupied) = state.asset.occupancy().get(index).copied() else {
+                continue;
+            };
+            if !occupied {
+                continue;
+            }
+            node_indices.push(index.min(i32::MAX as usize) as i32);
+            node_center += Vector::new(
+                (coord.x as f32 + 0.5) * state.pixel_size,
+                (coord.y as f32 + 0.5) * state.pixel_size,
+            );
+            node_weight += 1.0;
         }
-        if nearest
-            .as_ref()
-            .map_or(true, |(_, best)| distance_sq < *best)
-        {
-            nearest = Some((coord, distance_sq));
+        if node_indices.is_empty() || node_weight <= 0.0 {
+            continue;
+        }
+        node_center *= 1.0 / node_weight;
+        let distance_sq = (asset_point - node_center).length_squared();
+        if nearest.as_ref().map_or(true, |(_, best_distance_sq, _)| {
+            distance_sq < *best_distance_sq
+        }) {
+            nearest = Some((*node_id, distance_sq, node_indices));
         }
     }
-    if affected.is_empty() {
-        if let Some((coord, _)) = nearest {
-            affected.push(coord);
+    let max_distance = state.pixel_size * TERRAIN_EXTERNAL_ACTION_MAX_NODE_DISTANCE_PIXELS;
+    nearest.and_then(|(node, distance_sq, mut indices)| {
+        if distance_sq > max_distance * max_distance {
+            return None;
         }
+        indices.sort_unstable();
+        indices.dedup();
+        Some((node, indices))
+    })
+}
+
+fn terrain_external_action_source(action_kind: i32) -> Option<(DamageSource, u16)> {
+    match action_kind {
+        TERRAIN_EXTERNAL_ACTION_STRICT_FORCE => Some((DamageSource::Stress, 10)),
+        TERRAIN_EXTERNAL_ACTION_STRICT_IMPULSE => Some((DamageSource::ContactImpulse, 20)),
+        TERRAIN_EXTERNAL_ACTION_SANDBOX_LOAD => Some((DamageSource::JointFeedback, 30)),
+        TERRAIN_EXTERNAL_ACTION_SANDBOX_IMPACT => Some((DamageSource::ContactImpulse, 40)),
+        _ => None,
     }
-    affected.sort_by_key(|coord| (coord.y, coord.x));
-    affected.dedup();
-    affected
+}
+
+fn terrain_actor_fracture_commands_for_external_action(
+    state: &TerrainFractureActorState,
+    world_point: Vector,
+    force: Vector,
+    demand: f32,
+    action_kind: i32,
+) -> Option<(Vec<FractureCommand>, Vec<i32>)> {
+    let (source, source_priority) = terrain_external_action_source(action_kind)?;
+    let (node, touched_source_cell_indices) =
+        terrain_actor_nearest_owned_support_node(state, world_point)?;
+    if touched_source_cell_indices.is_empty() {
+        return None;
+    }
+    let order_key = DeterministicOrderKey::new(
+        0,
+        source_priority,
+        state.runtime.family().id,
+        state.actor,
+        CommandId(
+            ((state.actor_key as u64 as u32) ^ ((action_kind.max(0) as u32) << 24) ^ node.0).max(1),
+        ),
+    );
+    let loss = demand.max(force.length()).max(0.0);
+    let inputs = [DamageInput {
+        order_key,
+        actor: state.actor,
+        target: FractureTarget::Node(node),
+        health_loss: loss,
+        effective_length_loss: loss,
+        source,
+        position: Vec2 {
+            x: world_point.x,
+            y: world_point.y,
+        },
+        radius: 0.0,
+    }];
+    let commands = generate_damage_commands(state.runtime.family(), &inputs)
+        .into_iter()
+        .map(|mut command| {
+            command.source = source;
+            command
+        })
+        .collect::<Vec<_>>();
+    (!commands.is_empty()).then_some((commands, touched_source_cell_indices))
 }
 
 fn create_pending_terrain_actor_split_adoptions(
@@ -2105,57 +2188,6 @@ fn create_pending_terrain_actor_split_adoptions(
         }
     }
     adoption_count
-}
-
-fn push_pending_terrain_external_action_edit(
-    world: &mut AlchemyRapierWorldInner,
-    state: &TerrainFractureActorState,
-    removed_source_cell_indices: &[i32],
-) -> usize {
-    if removed_source_cell_indices.is_empty() {
-        return 0;
-    }
-    let mut row = AlchemyRapierBlastTransitionAdoptionRow::default();
-    row.transition_id =
-        ((state.actor_key as u64).wrapping_add(0xEA7u64) & u64::from(u32::MAX)) as u32;
-    row.source_kind = AlchemyRapierQuerySourceKind::StaticTerrain;
-    row.source_terrain_actor_key = state.actor_key;
-    row.source_terrain_chunk_x = state.chunk_x;
-    row.source_terrain_chunk_y = state.chunk_y;
-    row.source_terrain_world_origin_x = state.source_world_origin_x;
-    row.source_terrain_world_origin_y = state.source_world_origin_y;
-    row.source_terrain_revision = state.revision;
-    if state.solid_count > 0
-        && world.bodies.get(state.body).is_some()
-        && world.colliders.get(state.collider).is_some()
-    {
-        row.source_body_handle = handle_to_ffi(state.body);
-        row.source_body_packed_id = pack_body_handle(state.body);
-        row.source_collider_handle = collider_handle_to_ffi(state.collider);
-        row.source_collider_packed_id = pack_collider_handle(state.collider);
-    }
-    row.source_width = state.width.min(i32::MAX as u32) as i32;
-    row.source_height = state.height.min(i32::MAX as u32) as i32;
-    row.source_local_origin = ffi_vec(state.pixel_shape_local_origin);
-    row.source_solid_count = state.solid_count;
-    row.source_touched_cell_count = removed_source_cell_indices.len();
-    row.source_removed_cell_count = removed_source_cell_indices.len();
-    row.source_topology_revision = state.topology_revision;
-    row.source_topology_version = state.topology_version;
-    row.child_topology_revision = state.topology_revision;
-    row.child_topology_version = state.topology_version;
-    row.material_hash = material_hash(&state.material_ids);
-    world
-        .pending_blast_transition_adoptions
-        .push(PendingBlastTransitionAdoption {
-            row,
-            source_cell_indices: Vec::new(),
-            touched_source_cell_indices: removed_source_cell_indices.to_vec(),
-            removed_source_cell_indices: removed_source_cell_indices.to_vec(),
-            child_occupancy_words: Vec::new(),
-            child_material_ids: Vec::new(),
-        });
-    1
 }
 
 fn pixel_result(
@@ -3675,6 +3707,9 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
         {
             return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
         }
+        if terrain_external_action_source(desc.action_kind).is_none() {
+            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
+        }
         let Some(actor_key) = terrain_actor_key_for_external_action(world, desc) else {
             return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidHandle);
         };
@@ -3689,6 +3724,7 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
                 affected_cell_count: 0,
                 adoption_count: 0,
                 retained_solid_count,
+                actor_key,
             };
         }
         let Some(mut state) = world.terrain_fracture_actors.remove(&actor_key) else {
@@ -3703,18 +3739,21 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
                 affected_cell_count: 0,
                 adoption_count: 0,
                 retained_solid_count,
+                actor_key,
             };
         }
 
         let force = vector(desc.force);
-        let action_world_point = if desc.action_kind == 4 && force.length() > 0.000001 {
-            vector(desc.world_point) + force.normalize() * (state.pixel_size * 2.5)
-        } else {
-            vector(desc.world_point)
-        };
-        let affected_voxels =
-            terrain_actor_external_affected_voxels(&state, action_world_point, desc.radius);
-        if affected_voxels.is_empty() {
+        let action_world_point = vector(desc.world_point);
+        let Some((commands, touched_source_cell_indices)) =
+            terrain_actor_fracture_commands_for_external_action(
+                &state,
+                action_world_point,
+                force,
+                demand,
+                desc.action_kind,
+            )
+        else {
             let retained_solid_count = state.solid_count;
             world.terrain_fracture_actors.insert(actor_key, state);
             return AlchemyRapierTerrainExternalActionResult {
@@ -3723,71 +3762,74 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
                 affected_cell_count: 0,
                 adoption_count: 0,
                 retained_solid_count,
+                actor_key,
             };
-        }
-        let touched_source_cell_indices = affected_voxels
-            .iter()
-            .filter_map(|coord| {
-                let index = (coord.y as usize)
-                    .checked_mul(state.width as usize)?
-                    .checked_add(coord.x as usize)?;
-                Some(index.min(i32::MAX as usize) as i32)
-            })
-            .collect::<Vec<_>>();
-        if state
-            .runtime
-            .apply_edit(RuntimeEdit::RemoveVoxels {
-                voxels: affected_voxels.clone(),
-            })
-            .is_err()
-        {
+        };
+        let fracture_events = state.runtime.apply_fracture_commands(&commands);
+        if fracture_events.is_empty() {
             world.terrain_fracture_actors.insert(actor_key, state);
-            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
+            return AlchemyRapierTerrainExternalActionResult {
+                status: AlchemyRapierStatus::Ok,
+                demand,
+                affected_cell_count: 0,
+                adoption_count: 0,
+                retained_solid_count: world
+                    .terrain_fracture_actors
+                    .get(&actor_key)
+                    .map_or(0, |state| state.solid_count),
+                actor_key,
+            };
         }
         let split_events = state.runtime.split_dirty_actors();
-
-        world
-            .terrain_fracture_actor_by_collider
-            .remove(&state.collider);
-        let _ = world
-            .colliders
-            .remove(state.collider, &mut world.islands, &mut world.bodies, true);
-
-        state.asset = state.runtime.asset().clone();
-        state.solid_count = actor_solid_count(&state.runtime, state.actor);
-        if state.solid_count > 0 {
-            let Some(source_collider) =
-                build_actor_collider(&state.runtime, state.actor, state.pixel_shape_local_origin)
-            else {
-                let _ = world.bodies.remove(
-                    state.body,
-                    &mut world.islands,
-                    &mut world.colliders,
-                    &mut world.impulse_joints,
-                    &mut world.multibody_joints,
-                    true,
-                );
-                return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let source_collider_handle =
-                world
-                    .colliders
-                    .insert_with_parent(source_collider, state.body, &mut world.bodies);
-            state.collider = source_collider_handle;
+        let child_adoption_count = if split_events.is_empty() {
+            0
+        } else {
             world
                 .terrain_fracture_actor_by_collider
-                .insert(source_collider_handle, actor_key);
-        }
+                .remove(&state.collider);
+            let _ =
+                world
+                    .colliders
+                    .remove(state.collider, &mut world.islands, &mut world.bodies, true);
 
-        let edit_adoption_count =
-            push_pending_terrain_external_action_edit(world, &state, &touched_source_cell_indices);
-        let child_adoption_count = create_pending_terrain_actor_split_adoptions(
-            world,
-            &state,
-            &split_events,
-            &touched_source_cell_indices,
-        );
-        let adoption_count = edit_adoption_count + child_adoption_count;
+            state.asset = state.runtime.asset().clone();
+            state.solid_count = actor_solid_count(&state.runtime, state.actor);
+            if state.solid_count > 0 {
+                let Some(source_collider) = build_actor_collider(
+                    &state.runtime,
+                    state.actor,
+                    state.pixel_shape_local_origin,
+                ) else {
+                    let _ = world.bodies.remove(
+                        state.body,
+                        &mut world.islands,
+                        &mut world.colliders,
+                        &mut world.impulse_joints,
+                        &mut world.multibody_joints,
+                        true,
+                    );
+                    return empty_terrain_external_action_result(
+                        AlchemyRapierStatus::InvalidArgument,
+                    );
+                };
+                let source_collider_handle = world.colliders.insert_with_parent(
+                    source_collider,
+                    state.body,
+                    &mut world.bodies,
+                );
+                state.collider = source_collider_handle;
+                world
+                    .terrain_fracture_actor_by_collider
+                    .insert(source_collider_handle, actor_key);
+            }
+            create_pending_terrain_actor_split_adoptions(
+                world,
+                &state,
+                &split_events,
+                &touched_source_cell_indices,
+            )
+        };
+        let adoption_count = child_adoption_count;
         let retained_solid_count = state.solid_count;
         if retained_solid_count > 0 {
             world.terrain_fracture_actors.insert(actor_key, state);
@@ -3804,9 +3846,10 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
         AlchemyRapierTerrainExternalActionResult {
             status: AlchemyRapierStatus::Ok,
             demand,
-            affected_cell_count: affected_voxels.len(),
+            affected_cell_count: fracture_events.len(),
             adoption_count,
             retained_solid_count,
+            actor_key,
         }
     })) {
         Ok(result) => result,
