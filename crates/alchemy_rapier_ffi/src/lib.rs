@@ -213,6 +213,28 @@ pub struct AlchemyRapierTerrainApplyResult {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierTerrainExternalActionDesc {
+    pub actor_key: i64,
+    pub collider_packed_id: u64,
+    pub world_point: AlchemyRapierVec2,
+    pub force: AlchemyRapierVec2,
+    pub radius: f32,
+    pub demand: f32,
+    pub action_kind: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierTerrainExternalActionResult {
+    pub status: AlchemyRapierStatus,
+    pub demand: f32,
+    pub affected_cell_count: usize,
+    pub adoption_count: usize,
+    pub retained_solid_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AlchemyRapierQueryHit {
     pub source_kind: AlchemyRapierQuerySourceKind,
     pub body_packed_id: u64,
@@ -220,6 +242,7 @@ pub struct AlchemyRapierQueryHit {
     pub terrain_chunk_x: i32,
     pub terrain_chunk_y: i32,
     pub terrain_revision: i64,
+    pub terrain_actor_key: i64,
     pub world_cell_x: i32,
     pub world_cell_y: i32,
     pub point: AlchemyRapierVec2,
@@ -324,6 +347,7 @@ pub struct AlchemyRapierBlastTransitionAdoptionRow {
     pub source_terrain_world_origin_y: i32,
     pub source_terrain_revision: i64,
     pub source_touched_cell_count: usize,
+    pub source_removed_cell_count: usize,
 }
 
 #[repr(C)]
@@ -407,6 +431,7 @@ struct PendingBlastTransitionAdoption {
     row: AlchemyRapierBlastTransitionAdoptionRow,
     source_cell_indices: Vec<i32>,
     touched_source_cell_indices: Vec<i32>,
+    removed_source_cell_indices: Vec<i32>,
     child_occupancy_words: Vec<u64>,
     child_material_ids: Vec<u16>,
 }
@@ -726,6 +751,10 @@ fn handle_from_ffi(handle: AlchemyRapierRigidBodyHandle) -> RigidBodyHandle {
 
 fn collider_handle_from_ffi(handle: AlchemyRapierColliderHandle) -> ColliderHandle {
     ColliderHandle::from_raw_parts(handle.index, handle.generation)
+}
+
+fn collider_handle_from_packed(packed_id: u64) -> ColliderHandle {
+    ColliderHandle::from_raw_parts(packed_id as u32, (packed_id >> 32) as u32)
 }
 
 fn handle_to_ffi(handle: RigidBodyHandle) -> AlchemyRapierRigidBodyHandle {
@@ -1855,6 +1884,7 @@ fn create_pending_split_adoptions(
             .push(PendingBlastTransitionAdoption {
                 row,
                 touched_source_cell_indices: source_cells.clone(),
+                removed_source_cell_indices: Vec::new(),
                 source_cell_indices: source_cells,
                 child_occupancy_words: child_words,
                 child_material_ids: child_materials,
@@ -1862,6 +1892,270 @@ fn create_pending_split_adoptions(
         created_any = true;
     }
     created_any
+}
+
+fn empty_terrain_external_action_result(
+    status: AlchemyRapierStatus,
+) -> AlchemyRapierTerrainExternalActionResult {
+    AlchemyRapierTerrainExternalActionResult {
+        status,
+        demand: 0.0,
+        affected_cell_count: 0,
+        adoption_count: 0,
+        retained_solid_count: 0,
+    }
+}
+
+fn terrain_actor_key_for_external_action(
+    world: &AlchemyRapierWorldInner,
+    desc: AlchemyRapierTerrainExternalActionDesc,
+) -> Option<i64> {
+    if desc.actor_key != 0 {
+        return Some(desc.actor_key);
+    }
+    if desc.collider_packed_id == 0 {
+        return None;
+    }
+    let collider = collider_handle_from_packed(desc.collider_packed_id);
+    world
+        .terrain_fracture_actor_by_collider
+        .get(&collider)
+        .copied()
+}
+
+fn terrain_actor_external_affected_voxels(
+    state: &TerrainFractureActorState,
+    world_point: Vector,
+    radius: f32,
+) -> Vec<GridCoord> {
+    let asset_point = terrain_actor_point_to_asset_point(state, world_point);
+    let radius = radius.max(state.pixel_size * 0.51);
+    let radius_sq = radius * radius;
+    let mut affected = Vec::new();
+    let mut nearest: Option<(GridCoord, f32)> = None;
+    let Some(cells) = actor_cells(&state.runtime, state.actor) else {
+        return affected;
+    };
+    for (coord, _, _) in cells {
+        let center = Vector::new(
+            (coord.x as f32 + 0.5) * state.pixel_size,
+            (coord.y as f32 + 0.5) * state.pixel_size,
+        );
+        let distance_sq = (asset_point - center).length_squared();
+        if distance_sq <= radius_sq {
+            affected.push(coord);
+        }
+        if nearest
+            .as_ref()
+            .map_or(true, |(_, best)| distance_sq < *best)
+        {
+            nearest = Some((coord, distance_sq));
+        }
+    }
+    if affected.is_empty() {
+        if let Some((coord, _)) = nearest {
+            affected.push(coord);
+        }
+    }
+    affected.sort_by_key(|coord| (coord.y, coord.x));
+    affected.dedup();
+    affected
+}
+
+fn create_pending_terrain_actor_split_adoptions(
+    world: &mut AlchemyRapierWorldInner,
+    state: &TerrainFractureActorState,
+    split_events: &[SplitEvent],
+    touched_source_cell_indices: &[i32],
+) -> usize {
+    let source_pose = Pose::from_translation(terrain_actor_body_origin(state));
+    let mut adoption_count = 0usize;
+    for event in split_events
+        .iter()
+        .filter(|event| event.parent_actor == state.actor)
+    {
+        for child_actor in &event.created_children {
+            let Some((mut row, source_cells, child_words, child_materials)) =
+                build_cropped_actor_payload(
+                    &state.runtime,
+                    *child_actor,
+                    &state.material_ids,
+                    state.topology_revision,
+                    state.topology_version,
+                )
+            else {
+                continue;
+            };
+            let child_local_origin = vector(row.child_local_origin);
+            let Some(child_asset) = cropped_pixel_asset_from_words(
+                row.child_width as u32,
+                row.child_height as u32,
+                row.child_pixel_size,
+                &child_words,
+                &child_materials,
+            ) else {
+                continue;
+            };
+            let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin)
+            else {
+                continue;
+            };
+            let child_half_extents = pixel_shape_half_extents(
+                row.child_width.max(0) as u32,
+                row.child_height.max(0) as u32,
+                row.child_pixel_size,
+            );
+            let child_cropped_com = child_half_extents - child_local_origin;
+            let child_source_com = Vector::new(
+                row.source_min_x as f32 + child_cropped_com.x,
+                row.source_min_y as f32 + child_cropped_com.y,
+            );
+            let child_position = asset_point_to_world(
+                &source_pose,
+                state.width,
+                state.height,
+                state.pixel_size,
+                state.pixel_shape_local_origin,
+                child_source_com,
+            );
+            let child_body = world
+                .bodies
+                .insert(RigidBodyBuilder::dynamic().translation(child_position));
+            let child_collider_handle =
+                world
+                    .colliders
+                    .insert_with_parent(child_collider, child_body, &mut world.bodies);
+            if let Some(body) = world.bodies.get_mut(child_body) {
+                body.set_additional_mass(0.0, true);
+                body.recompute_mass_properties_from_colliders(&world.colliders);
+            }
+            let Some(body) = world.bodies.get(child_body) else {
+                continue;
+            };
+            let child_runtime = VoxelRuntime::instantiate(
+                FxFamilyId(pack_body_handle(child_body) as u32),
+                child_asset.clone(),
+            );
+            let child_actor_state = first_actor_id(&child_runtime);
+            world.pixel_rigidbodies.insert(
+                child_body,
+                PixelRigidbodyState {
+                    asset: child_asset,
+                    runtime: child_runtime,
+                    actor: child_actor_state,
+                    collider: child_collider_handle,
+                    width: row.child_width.max(0) as u32,
+                    height: row.child_height.max(0) as u32,
+                    pixel_size: state.pixel_size,
+                    local_origin: child_local_origin,
+                    topology_revision: state.topology_revision,
+                    topology_version: state.topology_version,
+                    material_ids: child_materials.clone(),
+                    support_mask: vec![0u8; child_materials.len()],
+                    solid_count: source_cells.len(),
+                },
+            );
+            row.transition_id = ((state.actor_key as u64).wrapping_add(adoption_count as u64)
+                & u64::from(u32::MAX)) as u32;
+            row.source_kind = AlchemyRapierQuerySourceKind::StaticTerrain;
+            row.source_terrain_actor_key = state.actor_key;
+            row.source_terrain_chunk_x = state.chunk_x;
+            row.source_terrain_chunk_y = state.chunk_y;
+            row.source_terrain_world_origin_x = state.source_world_origin_x;
+            row.source_terrain_world_origin_y = state.source_world_origin_y;
+            row.source_terrain_revision = state.revision;
+            if state.solid_count > 0
+                && world.bodies.get(state.body).is_some()
+                && world.colliders.get(state.collider).is_some()
+            {
+                row.source_body_handle = handle_to_ffi(state.body);
+                row.source_body_packed_id = pack_body_handle(state.body);
+                row.source_collider_handle = collider_handle_to_ffi(state.collider);
+                row.source_collider_packed_id = pack_collider_handle(state.collider);
+            }
+            row.child_body_handle = handle_to_ffi(child_body);
+            row.child_body_packed_id = pack_body_handle(child_body);
+            row.child_collider_handle = collider_handle_to_ffi(child_collider_handle);
+            row.child_collider_packed_id = pack_collider_handle(child_collider_handle);
+            row.source_width = state.width.min(i32::MAX as u32) as i32;
+            row.source_height = state.height.min(i32::MAX as u32) as i32;
+            row.source_local_origin = ffi_vec(state.pixel_shape_local_origin);
+            row.source_solid_count = state.solid_count;
+            row.source_touched_cell_count = touched_source_cell_indices.len();
+            row.position = ffi_vec(body.translation());
+            row.rotation = body.rotation().angle();
+            row.linear_velocity = ffi_vec(body.linvel());
+            row.angular_velocity = body.angvel();
+            row.source_topology_revision = state.topology_revision;
+            row.source_topology_version = state.topology_version;
+            row.child_topology_revision = state.topology_revision;
+            row.child_topology_version = state.topology_version;
+            row.material_hash = material_hash(&state.material_ids);
+            world
+                .pending_blast_transition_adoptions
+                .push(PendingBlastTransitionAdoption {
+                    row,
+                    touched_source_cell_indices: touched_source_cell_indices.to_vec(),
+                    removed_source_cell_indices: Vec::new(),
+                    source_cell_indices: source_cells,
+                    child_occupancy_words: child_words,
+                    child_material_ids: child_materials,
+                });
+            adoption_count += 1;
+        }
+    }
+    adoption_count
+}
+
+fn push_pending_terrain_external_action_edit(
+    world: &mut AlchemyRapierWorldInner,
+    state: &TerrainFractureActorState,
+    removed_source_cell_indices: &[i32],
+) -> usize {
+    if removed_source_cell_indices.is_empty() {
+        return 0;
+    }
+    let mut row = AlchemyRapierBlastTransitionAdoptionRow::default();
+    row.transition_id =
+        ((state.actor_key as u64).wrapping_add(0xEA7u64) & u64::from(u32::MAX)) as u32;
+    row.source_kind = AlchemyRapierQuerySourceKind::StaticTerrain;
+    row.source_terrain_actor_key = state.actor_key;
+    row.source_terrain_chunk_x = state.chunk_x;
+    row.source_terrain_chunk_y = state.chunk_y;
+    row.source_terrain_world_origin_x = state.source_world_origin_x;
+    row.source_terrain_world_origin_y = state.source_world_origin_y;
+    row.source_terrain_revision = state.revision;
+    if state.solid_count > 0
+        && world.bodies.get(state.body).is_some()
+        && world.colliders.get(state.collider).is_some()
+    {
+        row.source_body_handle = handle_to_ffi(state.body);
+        row.source_body_packed_id = pack_body_handle(state.body);
+        row.source_collider_handle = collider_handle_to_ffi(state.collider);
+        row.source_collider_packed_id = pack_collider_handle(state.collider);
+    }
+    row.source_width = state.width.min(i32::MAX as u32) as i32;
+    row.source_height = state.height.min(i32::MAX as u32) as i32;
+    row.source_local_origin = ffi_vec(state.pixel_shape_local_origin);
+    row.source_solid_count = state.solid_count;
+    row.source_touched_cell_count = removed_source_cell_indices.len();
+    row.source_removed_cell_count = removed_source_cell_indices.len();
+    row.source_topology_revision = state.topology_revision;
+    row.source_topology_version = state.topology_version;
+    row.child_topology_revision = state.topology_revision;
+    row.child_topology_version = state.topology_version;
+    row.material_hash = material_hash(&state.material_ids);
+    world
+        .pending_blast_transition_adoptions
+        .push(PendingBlastTransitionAdoption {
+            row,
+            source_cell_indices: Vec::new(),
+            touched_source_cell_indices: removed_source_cell_indices.to_vec(),
+            removed_source_cell_indices: removed_source_cell_indices.to_vec(),
+            child_occupancy_words: Vec::new(),
+            child_material_ids: Vec::new(),
+        });
+    1
 }
 
 fn pixel_result(
@@ -2141,6 +2435,7 @@ fn make_dynamic_query_hit(
         terrain_chunk_x: 0,
         terrain_chunk_y: 0,
         terrain_revision: -1,
+        terrain_actor_key: 0,
         world_cell_x: point.x.floor() as i32,
         world_cell_y: point.y.floor() as i32,
         point: ffi_vec(point),
@@ -2170,6 +2465,7 @@ fn make_terrain_query_hit(
         terrain_chunk_x: state.chunk_x,
         terrain_chunk_y: state.chunk_y,
         terrain_revision: state.revision,
+        terrain_actor_key: 0,
         world_cell_x,
         world_cell_y,
         point: ffi_vec(point),
@@ -2199,6 +2495,7 @@ fn make_terrain_actor_query_hit(
         terrain_chunk_x: state.chunk_x,
         terrain_chunk_y: state.chunk_y,
         terrain_revision: state.revision,
+        terrain_actor_key: actor_key,
         world_cell_x,
         world_cell_y,
         point: ffi_vec(point),
@@ -3301,6 +3598,7 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
             pending_adoption = Some(PendingBlastTransitionAdoption {
                 row,
                 touched_source_cell_indices: touched_source_indices,
+                removed_source_cell_indices: Vec::new(),
                 source_cell_indices: source_cells,
                 child_occupancy_words: child_words,
                 child_material_ids: child_materials,
@@ -3354,6 +3652,165 @@ pub extern "C" fn alchemy_rapier_destroy_terrain_fracture_actor(
     })) {
         Ok(status) => status,
         Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
+    world: *mut AlchemyRapierWorld,
+    desc: AlchemyRapierTerrainExternalActionDesc,
+) -> AlchemyRapierTerrainExternalActionResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_terrain_external_action_result(AlchemyRapierStatus::NullPointer);
+        };
+        let demand = desc.demand.max(vector(desc.force).length());
+        if !desc.world_point.x.is_finite()
+            || !desc.world_point.y.is_finite()
+            || !desc.force.x.is_finite()
+            || !desc.force.y.is_finite()
+            || !desc.radius.is_finite()
+            || !desc.demand.is_finite()
+            || demand < 0.0
+        {
+            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let Some(actor_key) = terrain_actor_key_for_external_action(world, desc) else {
+            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidHandle);
+        };
+        if has_pending_static_adoption_for_actor(world, actor_key) {
+            let retained_solid_count = world
+                .terrain_fracture_actors
+                .get(&actor_key)
+                .map_or(0, |state| state.solid_count);
+            return AlchemyRapierTerrainExternalActionResult {
+                status: AlchemyRapierStatus::Ok,
+                demand,
+                affected_cell_count: 0,
+                adoption_count: 0,
+                retained_solid_count,
+            };
+        }
+        let Some(mut state) = world.terrain_fracture_actors.remove(&actor_key) else {
+            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidHandle);
+        };
+        if demand < 1.0 {
+            let retained_solid_count = state.solid_count;
+            world.terrain_fracture_actors.insert(actor_key, state);
+            return AlchemyRapierTerrainExternalActionResult {
+                status: AlchemyRapierStatus::Ok,
+                demand,
+                affected_cell_count: 0,
+                adoption_count: 0,
+                retained_solid_count,
+            };
+        }
+
+        let force = vector(desc.force);
+        let action_world_point = if desc.action_kind == 4 && force.length() > 0.000001 {
+            vector(desc.world_point) + force.normalize() * (state.pixel_size * 2.5)
+        } else {
+            vector(desc.world_point)
+        };
+        let affected_voxels =
+            terrain_actor_external_affected_voxels(&state, action_world_point, desc.radius);
+        if affected_voxels.is_empty() {
+            let retained_solid_count = state.solid_count;
+            world.terrain_fracture_actors.insert(actor_key, state);
+            return AlchemyRapierTerrainExternalActionResult {
+                status: AlchemyRapierStatus::Ok,
+                demand,
+                affected_cell_count: 0,
+                adoption_count: 0,
+                retained_solid_count,
+            };
+        }
+        let touched_source_cell_indices = affected_voxels
+            .iter()
+            .filter_map(|coord| {
+                let index = (coord.y as usize)
+                    .checked_mul(state.width as usize)?
+                    .checked_add(coord.x as usize)?;
+                Some(index.min(i32::MAX as usize) as i32)
+            })
+            .collect::<Vec<_>>();
+        if state
+            .runtime
+            .apply_edit(RuntimeEdit::RemoveVoxels {
+                voxels: affected_voxels.clone(),
+            })
+            .is_err()
+        {
+            world.terrain_fracture_actors.insert(actor_key, state);
+            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let split_events = state.runtime.split_dirty_actors();
+
+        world
+            .terrain_fracture_actor_by_collider
+            .remove(&state.collider);
+        let _ = world
+            .colliders
+            .remove(state.collider, &mut world.islands, &mut world.bodies, true);
+
+        state.asset = state.runtime.asset().clone();
+        state.solid_count = actor_solid_count(&state.runtime, state.actor);
+        if state.solid_count > 0 {
+            let Some(source_collider) =
+                build_actor_collider(&state.runtime, state.actor, state.pixel_shape_local_origin)
+            else {
+                let _ = world.bodies.remove(
+                    state.body,
+                    &mut world.islands,
+                    &mut world.colliders,
+                    &mut world.impulse_joints,
+                    &mut world.multibody_joints,
+                    true,
+                );
+                return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
+            };
+            let source_collider_handle =
+                world
+                    .colliders
+                    .insert_with_parent(source_collider, state.body, &mut world.bodies);
+            state.collider = source_collider_handle;
+            world
+                .terrain_fracture_actor_by_collider
+                .insert(source_collider_handle, actor_key);
+        }
+
+        let edit_adoption_count =
+            push_pending_terrain_external_action_edit(world, &state, &touched_source_cell_indices);
+        let child_adoption_count = create_pending_terrain_actor_split_adoptions(
+            world,
+            &state,
+            &split_events,
+            &touched_source_cell_indices,
+        );
+        let adoption_count = edit_adoption_count + child_adoption_count;
+        let retained_solid_count = state.solid_count;
+        if retained_solid_count > 0 {
+            world.terrain_fracture_actors.insert(actor_key, state);
+        } else {
+            let _ = world.bodies.remove(
+                state.body,
+                &mut world.islands,
+                &mut world.colliders,
+                &mut world.impulse_joints,
+                &mut world.multibody_joints,
+                true,
+            );
+        }
+        AlchemyRapierTerrainExternalActionResult {
+            status: AlchemyRapierStatus::Ok,
+            demand,
+            affected_cell_count: affected_voxels.len(),
+            adoption_count,
+            retained_solid_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_terrain_external_action_result(AlchemyRapierStatus::Panic),
     }
 }
 
@@ -3650,6 +4107,38 @@ pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_touched_cells(
         if written_count > 0 {
             let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
             out.copy_from_slice(&adoption.touched_source_cell_indices[..written_count]);
+        }
+        written_count
+    })) {
+        Ok(result) => result,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_removed_cells(
+    world: *mut AlchemyRapierWorld,
+    row_index: usize,
+    cells: *mut i32,
+    cell_capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if cells.is_null() && cell_capacity > 0 {
+            return 0;
+        }
+        let Ok(world) = to_inner(world) else {
+            return 0;
+        };
+        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
+            return 0;
+        };
+        let written_count = adoption
+            .removed_source_cell_indices
+            .len()
+            .min(cell_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
+            out.copy_from_slice(&adoption.removed_source_cell_indices[..written_count]);
         }
         written_count
     })) {
