@@ -76,6 +76,7 @@ pub struct AlchemyRapierTerrainDesc {
     pub support_mask: *const u8,
     pub support_mask_count: usize,
     pub actor_key: i64,
+    pub replace_existing: u8,
 }
 
 #[repr(C)]
@@ -322,6 +323,7 @@ pub struct AlchemyRapierBlastTransitionAdoptionRow {
     pub source_terrain_world_origin_x: i32,
     pub source_terrain_world_origin_y: i32,
     pub source_terrain_revision: i64,
+    pub source_touched_cell_count: usize,
 }
 
 #[repr(C)]
@@ -404,6 +406,7 @@ struct PixelRigidbodyState {
 struct PendingBlastTransitionAdoption {
     row: AlchemyRapierBlastTransitionAdoptionRow,
     source_cell_indices: Vec<i32>,
+    touched_source_cell_indices: Vec<i32>,
     child_occupancy_words: Vec<u64>,
     child_material_ids: Vec<u16>,
 }
@@ -955,6 +958,26 @@ fn terrain_key(desc: AlchemyRapierTerrainDesc) -> TerrainKey {
     }
 }
 
+fn pack_i32_halves_to_i64(high: i32, low: i32) -> i64 {
+    let packed = ((high as u32 as u64) << 32) | (low as u32 as u64);
+    packed as i64
+}
+
+fn terrain_actor_key_from_desc(desc: AlchemyRapierTerrainDesc) -> i64 {
+    let key = pack_i32_halves_to_i64(desc.source_world_origin_x, desc.source_world_origin_y);
+    if key == 0 { 1 } else { key }
+}
+
+fn has_pending_static_adoption_for_actor(world: &AlchemyRapierWorldInner, actor_key: i64) -> bool {
+    world
+        .pending_blast_transition_adoptions
+        .iter()
+        .any(|adoption| {
+            adoption.row.source_kind == AlchemyRapierQuerySourceKind::StaticTerrain
+                && adoption.row.source_terrain_actor_key == actor_key
+        })
+}
+
 fn remove_terrain_chunk(world: &mut AlchemyRapierWorldInner, key: TerrainKey) {
     if let Some(existing) = world.terrain_chunks.remove(&key) {
         world.terrain_by_collider.remove(&existing.collider);
@@ -987,10 +1010,6 @@ fn remove_terrain_fracture_actor(world: &mut AlchemyRapierWorldInner, actor_key:
             true,
         );
     }
-    world.pending_blast_transition_adoptions.retain(|adoption| {
-        adoption.row.source_kind != AlchemyRapierQuerySourceKind::StaticTerrain
-            || adoption.row.source_terrain_actor_key != actor_key
-    });
 }
 
 fn remove_pixel_rigidbody_state(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
@@ -1820,6 +1839,7 @@ fn create_pending_split_adoptions(
         row.source_local_origin =
             actor_host_local_origin(&source_state.runtime, source_state.actor);
         row.source_solid_count = actor_solid_count(&source_state.runtime, source_state.actor);
+        row.source_touched_cell_count = source_cells.len();
         row.position = ffi_vec(body.translation());
         row.rotation = body.rotation().angle();
         row.linear_velocity = ffi_vec(body.linvel());
@@ -1834,6 +1854,7 @@ fn create_pending_split_adoptions(
             .pending_blast_transition_adoptions
             .push(PendingBlastTransitionAdoption {
                 row,
+                touched_source_cell_indices: source_cells.clone(),
                 source_cell_indices: source_cells,
                 child_occupancy_words: child_words,
                 child_material_ids: child_materials,
@@ -3006,13 +3027,20 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
         let actor_key = if desc.actor_key != 0 {
             desc.actor_key
         } else {
-            (i64::from(desc.source_world_origin_x) << 32)
-                ^ i64::from(desc.source_world_origin_y as u32)
+            terrain_actor_key_from_desc(desc)
         };
         if actor_key == 0 {
             return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
         }
-        remove_terrain_fracture_actor(world, actor_key);
+        if has_pending_static_adoption_for_actor(world, actor_key) {
+            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if world.terrain_fracture_actors.contains_key(&actor_key) {
+            if desc.replace_existing == 0 {
+                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
+            }
+            remove_terrain_fracture_actor(world, actor_key);
+        }
 
         let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
         let occupancy = occupancy_from_words(width, height, words);
@@ -3054,6 +3082,13 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
         };
 
         let pixel_shape_local_origin = vector(desc.pixel_shape_local_origin);
+        let touched_source_indices = occupancy
+            .iter()
+            .enumerate()
+            .filter_map(|(index, occupied)| {
+                (*occupied).then_some(index.min(i32::MAX as usize) as i32)
+            })
+            .collect::<Vec<_>>();
         let unsupported_source_indices = occupancy
             .iter()
             .enumerate()
@@ -3253,6 +3288,7 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
             row.source_height = height.min(i32::MAX as u32) as i32;
             row.source_local_origin = ffi_vec(pixel_shape_local_origin);
             row.source_solid_count = retained_source_solid_count;
+            row.source_touched_cell_count = touched_source_indices.len();
             row.position = ffi_vec(body.translation());
             row.rotation = body.rotation().angle();
             row.linear_velocity = ffi_vec(body.linvel());
@@ -3264,6 +3300,7 @@ pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
             row.material_hash = material_hash(&material_ids);
             pending_adoption = Some(PendingBlastTransitionAdoption {
                 row,
+                touched_source_cell_indices: touched_source_indices,
                 source_cell_indices: source_cells,
                 child_occupancy_words: child_words,
                 child_material_ids: child_materials,
@@ -3307,6 +3344,9 @@ pub extern "C" fn alchemy_rapier_destroy_terrain_fracture_actor(
             return AlchemyRapierStatus::NullPointer;
         };
         if actor_key == 0 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        if has_pending_static_adoption_for_actor(world, actor_key) {
             return AlchemyRapierStatus::InvalidArgument;
         }
         remove_terrain_fracture_actor(world, actor_key);
@@ -3587,6 +3627,38 @@ pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_cells(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_touched_cells(
+    world: *mut AlchemyRapierWorld,
+    row_index: usize,
+    cells: *mut i32,
+    cell_capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if cells.is_null() && cell_capacity > 0 {
+            return 0;
+        }
+        let Ok(world) = to_inner(world) else {
+            return 0;
+        };
+        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
+            return 0;
+        };
+        let written_count = adoption
+            .touched_source_cell_indices
+            .len()
+            .min(cell_capacity);
+        if written_count > 0 {
+            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
+            out.copy_from_slice(&adoption.touched_source_cell_indices[..written_count]);
+        }
+        written_count
+    })) {
+        Ok(result) => result,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_occupancy_words(
     world: *mut AlchemyRapierWorld,
     row_index: usize,
@@ -3650,13 +3722,47 @@ pub extern "C" fn alchemy_rapier_acknowledge_blast_transition_adoptions(
     acknowledged_count: usize,
 ) -> AlchemyRapierStatus {
     match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(_world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if acknowledged_count != 0 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_acknowledge_blast_transition_adoption(
+    world: *mut AlchemyRapierWorld,
+    transition_id: u32,
+    child_body_packed_id: u64,
+    source_kind: AlchemyRapierQuerySourceKind,
+    source_terrain_actor_key: i64,
+    source_body_packed_id: u64,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
         let Ok(world) = to_inner(world) else {
             return AlchemyRapierStatus::NullPointer;
         };
-        let count = acknowledged_count.min(world.pending_blast_transition_adoptions.len());
-        if count > 0 {
-            world.pending_blast_transition_adoptions.drain(0..count);
-        }
+        let Some(index) = world
+            .pending_blast_transition_adoptions
+            .iter()
+            .position(|adoption| {
+                let row = adoption.row;
+                row.transition_id == transition_id
+                    && row.child_body_packed_id == child_body_packed_id
+                    && row.source_kind == source_kind
+                    && row.source_terrain_actor_key == source_terrain_actor_key
+                    && row.source_body_packed_id == source_body_packed_id
+            })
+        else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        world.pending_blast_transition_adoptions.remove(index);
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
