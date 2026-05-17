@@ -38,6 +38,7 @@ pub enum AlchemyRapierBodyType {
     Dynamic = 0,
     Kinematic = 1,
     Fixed = 2,
+    KinematicPosition = 3,
 }
 
 #[repr(C)]
@@ -120,6 +121,13 @@ pub struct AlchemyRapierColliderHandle {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlchemyRapierJointHandle {
+    pub index: u32,
+    pub generation: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlchemyRapierBodyDesc {
     pub body_type: AlchemyRapierBodyType,
@@ -162,6 +170,14 @@ pub struct AlchemyRapierCreateBodyResult {
 pub struct AlchemyRapierCreateColliderResult {
     pub status: AlchemyRapierStatus,
     pub handle: AlchemyRapierColliderHandle,
+    pub packed_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierCreateJointResult {
+    pub status: AlchemyRapierStatus,
+    pub handle: AlchemyRapierJointHandle,
     pub packed_id: u64,
 }
 
@@ -301,6 +317,19 @@ pub struct AlchemyRapierContactReadResult {
     pub status: AlchemyRapierStatus,
     pub row_count: usize,
     pub written_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierRevoluteJointDesc {
+    pub body1: AlchemyRapierRigidBodyHandle,
+    pub body2: AlchemyRapierRigidBodyHandle,
+    pub local_anchor1: AlchemyRapierVec2,
+    pub local_anchor2: AlchemyRapierVec2,
+    pub natural_frequency: f32,
+    pub damping_ratio: f32,
+    pub contacts_enabled: u8,
+    pub wake_up: u8,
 }
 
 #[repr(C)]
@@ -762,6 +791,10 @@ fn collider_handle_from_ffi(handle: AlchemyRapierColliderHandle) -> ColliderHand
     ColliderHandle::from_raw_parts(handle.index, handle.generation)
 }
 
+fn joint_handle_from_ffi(handle: AlchemyRapierJointHandle) -> ImpulseJointHandle {
+    ImpulseJointHandle::from_raw_parts(handle.index, handle.generation)
+}
+
 fn collider_handle_from_packed(packed_id: u64) -> ColliderHandle {
     ColliderHandle::from_raw_parts(packed_id as u32, (packed_id >> 32) as u32)
 }
@@ -776,6 +809,11 @@ fn collider_handle_to_ffi(handle: ColliderHandle) -> AlchemyRapierColliderHandle
     AlchemyRapierColliderHandle { index, generation }
 }
 
+fn joint_handle_to_ffi(handle: ImpulseJointHandle) -> AlchemyRapierJointHandle {
+    let (index, generation) = handle.into_raw_parts();
+    AlchemyRapierJointHandle { index, generation }
+}
+
 fn pack_parts(index: u32, generation: u32) -> u64 {
     u64::from(index) | (u64::from(generation) << 32)
 }
@@ -786,6 +824,11 @@ fn pack_body_handle(handle: RigidBodyHandle) -> u64 {
 }
 
 fn pack_collider_handle(handle: ColliderHandle) -> u64 {
+    let (index, generation) = handle.into_raw_parts();
+    pack_parts(index, generation)
+}
+
+fn pack_joint_handle(handle: ImpulseJointHandle) -> u64 {
     let (index, generation) = handle.into_raw_parts();
     pack_parts(index, generation)
 }
@@ -825,6 +868,7 @@ fn sanitize_positive(value: f32, fallback: f32) -> f32 {
 fn body_type_to_rapier(value: AlchemyRapierBodyType) -> RigidBodyType {
     match value {
         AlchemyRapierBodyType::Kinematic => RigidBodyType::KinematicVelocityBased,
+        AlchemyRapierBodyType::KinematicPosition => RigidBodyType::KinematicPositionBased,
         AlchemyRapierBodyType::Fixed => RigidBodyType::Fixed,
         AlchemyRapierBodyType::Dynamic => RigidBodyType::Dynamic,
     }
@@ -833,9 +877,8 @@ fn body_type_to_rapier(value: AlchemyRapierBodyType) -> RigidBodyType {
 fn body_type_from_rapier(value: RigidBodyType) -> AlchemyRapierBodyType {
     match value {
         RigidBodyType::Fixed => AlchemyRapierBodyType::Fixed,
-        RigidBodyType::KinematicPositionBased | RigidBodyType::KinematicVelocityBased => {
-            AlchemyRapierBodyType::Kinematic
-        }
+        RigidBodyType::KinematicPositionBased => AlchemyRapierBodyType::KinematicPosition,
+        RigidBodyType::KinematicVelocityBased => AlchemyRapierBodyType::Kinematic,
         RigidBodyType::Dynamic => AlchemyRapierBodyType::Dynamic,
     }
 }
@@ -977,6 +1020,14 @@ fn empty_pixel_rigidbody_result(status: AlchemyRapierStatus) -> AlchemyRapierPix
         local_center_of_mass: AlchemyRapierVec2::default(),
         mass: 0.0,
         inertia: 0.0,
+    }
+}
+
+fn empty_create_joint_result(status: AlchemyRapierStatus) -> AlchemyRapierCreateJointResult {
+    AlchemyRapierCreateJointResult {
+        status,
+        handle: AlchemyRapierJointHandle::default(),
+        packed_id: 0,
     }
 }
 
@@ -2821,6 +2872,35 @@ pub extern "C" fn alchemy_rapier_update_body(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_next_kinematic_position(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    position: AlchemyRapierVec2,
+    rotation: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if !position.x.is_finite() || !position.y.is_finite() || !rotation.is_finite() {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let handle = handle_from_ffi(handle);
+        let Some(body) = world.bodies.get_mut(handle) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        body.set_next_kinematic_position(Pose::from_parts(
+            vector(position),
+            Rotation::new(rotation),
+        ));
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_destroy_body(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierRigidBodyHandle,
@@ -4324,6 +4404,110 @@ pub extern "C" fn alchemy_rapier_apply_body_impulse_at_point(
     body_mutation(world, handle, |body| {
         body.apply_impulse_at_point(vector(impulse), vector(world_point), true);
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_create_revolute_joint(
+    world: *mut AlchemyRapierWorld,
+    desc: AlchemyRapierRevoluteJointDesc,
+) -> AlchemyRapierCreateJointResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_create_joint_result(AlchemyRapierStatus::NullPointer);
+        };
+        if !desc.local_anchor1.x.is_finite()
+            || !desc.local_anchor1.y.is_finite()
+            || !desc.local_anchor2.x.is_finite()
+            || !desc.local_anchor2.y.is_finite()
+            || !desc.natural_frequency.is_finite()
+            || !desc.damping_ratio.is_finite()
+            || desc.natural_frequency < 0.0
+            || desc.damping_ratio < 0.0
+        {
+            return empty_create_joint_result(AlchemyRapierStatus::InvalidArgument);
+        }
+
+        let body1 = handle_from_ffi(desc.body1);
+        let body2 = handle_from_ffi(desc.body2);
+        if world.bodies.get(body1).is_none() || world.bodies.get(body2).is_none() {
+            return empty_create_joint_result(AlchemyRapierStatus::InvalidHandle);
+        }
+
+        let joint = RevoluteJointBuilder::new()
+            .local_anchor1(vector(desc.local_anchor1))
+            .local_anchor2(vector(desc.local_anchor2))
+            .contacts_enabled(desc.contacts_enabled != 0)
+            .softness(SpringCoefficients::new(
+                desc.natural_frequency,
+                desc.damping_ratio,
+            ));
+        let handle = world
+            .impulse_joints
+            .insert(body1, body2, joint, desc.wake_up != 0);
+        AlchemyRapierCreateJointResult {
+            status: AlchemyRapierStatus::Ok,
+            handle: joint_handle_to_ffi(handle),
+            packed_id: pack_joint_handle(handle),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_create_joint_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_revolute_joint_softness(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+    natural_frequency: f32,
+    damping_ratio: f32,
+    wake_up: u8,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if !natural_frequency.is_finite()
+            || !damping_ratio.is_finite()
+            || natural_frequency < 0.0
+            || damping_ratio < 0.0
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let handle = joint_handle_from_ffi(handle);
+        let Some(joint) = world.impulse_joints.get_mut(handle, wake_up != 0) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        let _ = joint
+            .data
+            .set_softness(SpringCoefficients::new(natural_frequency, damping_ratio));
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_destroy_joint(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+    wake_up: u8,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let handle = joint_handle_from_ffi(handle);
+        if world.impulse_joints.remove(handle, wake_up != 0).is_some() {
+            AlchemyRapierStatus::Ok
+        } else {
+            AlchemyRapierStatus::InvalidHandle
+        }
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
 }
 
 #[unsafe(no_mangle)]
