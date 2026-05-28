@@ -1,16 +1,15 @@
 use fracture_core::{
-    generate_damage_commands, CommandId, DamageInput, DamageSource, DeterministicOrderKey,
-    FractureCommand, FractureTarget, FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId,
-    Vec2,
+    CommandId, DamageInput, DamageSource, DeterministicOrderKey, FractureCommand, FractureTarget,
+    FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId, Vec2, generate_damage_commands,
 };
 use fracture_voxel::{
-    author_voxel_asset, AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime,
+    AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
 };
 use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_char, c_void};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
@@ -229,6 +228,14 @@ pub struct AlchemyRapierCreateJointResult {
     pub status: AlchemyRapierStatus,
     pub handle: AlchemyRapierJointHandle,
     pub packed_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierJointImpulseResult {
+    pub status: AlchemyRapierStatus,
+    pub linear_impulse: AlchemyRapierVec2,
+    pub angular_impulse: f32,
 }
 
 #[repr(C)]
@@ -1186,6 +1193,14 @@ fn empty_create_joint_result(status: AlchemyRapierStatus) -> AlchemyRapierCreate
     }
 }
 
+fn empty_joint_impulse_result(status: AlchemyRapierStatus) -> AlchemyRapierJointImpulseResult {
+    AlchemyRapierJointImpulseResult {
+        status,
+        linear_impulse: AlchemyRapierVec2::default(),
+        angular_impulse: 0.0,
+    }
+}
+
 fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
     AlchemyRapierQueryResult {
         status,
@@ -1209,11 +1224,7 @@ fn pack_i32_halves_to_i64(high: i32, low: i32) -> i64 {
 
 fn terrain_actor_key_from_desc(desc: AlchemyRapierTerrainDesc) -> i64 {
     let key = pack_i32_halves_to_i64(desc.source_world_origin_x, desc.source_world_origin_y);
-    if key == 0 {
-        1
-    } else {
-        key
-    }
+    if key == 0 { 1 } else { key }
 }
 
 fn has_pending_static_adoption_for_actor(world: &AlchemyRapierWorldInner, actor_key: i64) -> bool {
@@ -5147,6 +5158,68 @@ pub extern "C" fn alchemy_rapier_set_revolute_joint_softness(
     })) {
         Ok(status) => status,
         Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_revolute_joint_anchors(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+    local_anchor1: AlchemyRapierVec2,
+    local_anchor2: AlchemyRapierVec2,
+    wake_up: u8,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if !local_anchor1.x.is_finite()
+            || !local_anchor1.y.is_finite()
+            || !local_anchor2.x.is_finite()
+            || !local_anchor2.y.is_finite()
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+
+        let handle = joint_handle_from_ffi(handle);
+        let Some(joint) = world.impulse_joints.get_mut(handle, wake_up != 0) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        joint.data.set_local_anchor1(vector(local_anchor1));
+        joint.data.set_local_anchor2(vector(local_anchor2));
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_joint_impulse(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+) -> AlchemyRapierJointImpulseResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_joint_impulse_result(AlchemyRapierStatus::NullPointer);
+        };
+
+        let handle = joint_handle_from_ffi(handle);
+        let Some(joint) = world.impulse_joints.get(handle) else {
+            return empty_joint_impulse_result(AlchemyRapierStatus::InvalidHandle);
+        };
+
+        AlchemyRapierJointImpulseResult {
+            status: AlchemyRapierStatus::Ok,
+            linear_impulse: AlchemyRapierVec2 {
+                x: joint.impulses[0],
+                y: joint.impulses[1],
+            },
+            angular_impulse: joint.impulses[2],
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_joint_impulse_result(AlchemyRapierStatus::Panic),
     }
 }
 
