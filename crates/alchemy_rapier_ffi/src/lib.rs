@@ -1,15 +1,16 @@
 use fracture_core::{
-    CommandId, DamageInput, DamageSource, DeterministicOrderKey, FractureCommand, FractureTarget,
-    FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId, Vec2, generate_damage_commands,
+    generate_damage_commands, CommandId, DamageInput, DamageSource, DeterministicOrderKey,
+    FractureCommand, FractureTarget, FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId,
+    Vec2,
 };
 use fracture_voxel::{
-    AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
+    author_voxel_asset, AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime,
 };
 use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::os::raw::c_char;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::os::raw::{c_char, c_void};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
@@ -196,6 +197,7 @@ pub struct AlchemyRapierBodyDesc {
     pub wake_up: u8,
     pub sleep: u8,
     pub use_collider_mass: u8,
+    pub user_data: u64,
 }
 
 #[repr(C)]
@@ -345,16 +347,17 @@ pub struct AlchemyRapierStepResult {
     pub contact_begin_count: usize,
     pub contact_end_count: usize,
     pub contact_hit_count: usize,
-    pub contact_row_count: usize,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AlchemyRapierContactRow {
+pub struct AlchemyRapierContactSample {
     pub collider1_packed_id: u64,
     pub collider2_packed_id: u64,
     pub body1_packed_id: u64,
     pub body2_packed_id: u64,
+    pub body1_user_data: u64,
+    pub body2_user_data: u64,
     pub subshape1: u32,
     pub subshape2: u32,
     pub source_cell_id1: u32,
@@ -362,19 +365,13 @@ pub struct AlchemyRapierContactRow {
     pub material_id1: u16,
     pub material_id2: u16,
     pub point: AlchemyRapierVec2,
+    pub normal_from_2_to_1: AlchemyRapierVec2,
     pub impulse_on_body1: AlchemyRapierVec2,
-    pub force_on_body1: AlchemyRapierVec2,
-    pub collision_impulse_sum: f32,
-    pub active_contact_count: u32,
+    pub collision_impulse: f32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct AlchemyRapierContactReadResult {
-    pub status: AlchemyRapierStatus,
-    pub row_count: usize,
-    pub written_count: usize,
-}
+pub type AlchemyRapierContactCallback =
+    Option<unsafe extern "C" fn(user_data: *mut c_void, sample: *const AlchemyRapierContactSample)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -647,7 +644,6 @@ struct AlchemyRapierWorldInner {
     pending_blast_transition_adoptions: Vec<PendingBlastTransitionAdoption>,
     pending_split_events: Vec<PendingSplitEvent>,
     previous_active_contact_pairs: HashSet<(u64, u64)>,
-    last_contact_rows: Vec<AlchemyRapierContactRow>,
 }
 
 impl AlchemyRapierWorldInner {
@@ -674,7 +670,6 @@ impl AlchemyRapierWorldInner {
             pending_blast_transition_adoptions: Vec::new(),
             pending_split_events: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
-            last_contact_rows: Vec::new(),
         }
     }
 
@@ -707,15 +702,6 @@ fn empty_step_result(status: AlchemyRapierStatus) -> AlchemyRapierStepResult {
         contact_begin_count: 0,
         contact_end_count: 0,
         contact_hit_count: 0,
-        contact_row_count: 0,
-    }
-}
-
-fn empty_contact_read_result(status: AlchemyRapierStatus) -> AlchemyRapierContactReadResult {
-    AlchemyRapierContactReadResult {
-        status,
-        row_count: 0,
-        written_count: 0,
     }
 }
 
@@ -733,64 +719,36 @@ fn body_packed_id(body: Option<RigidBodyHandle>) -> u64 {
     body.map(pack_body_handle).unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ContactRowKey {
-    collider1_packed_id: u64,
-    collider2_packed_id: u64,
-    body1_packed_id: u64,
-    body2_packed_id: u64,
-    subshape1: u32,
-    subshape2: u32,
-    source_cell_id1: u32,
-    source_cell_id2: u32,
-    material_id1: u16,
-    material_id2: u16,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ContactRowAccumulator {
-    row: AlchemyRapierContactRow,
-    weighted_point_sum: Vector,
-}
-
-fn contact_row_key(row: &AlchemyRapierContactRow) -> ContactRowKey {
-    ContactRowKey {
-        collider1_packed_id: row.collider1_packed_id,
-        collider2_packed_id: row.collider2_packed_id,
-        body1_packed_id: row.body1_packed_id,
-        body2_packed_id: row.body2_packed_id,
-        subshape1: row.subshape1,
-        subshape2: row.subshape2,
-        source_cell_id1: row.source_cell_id1,
-        source_cell_id2: row.source_cell_id2,
-        material_id1: row.material_id1,
-        material_id2: row.material_id2,
-    }
-}
-
-fn collect_contact_rows(
-    world: &AlchemyRapierWorldInner,
-) -> (HashSet<(u64, u64)>, Vec<AlchemyRapierContactRow>) {
+fn collect_active_contact_pairs(world: &AlchemyRapierWorldInner) -> HashSet<(u64, u64)> {
     let mut active_pairs = HashSet::new();
-    let mut rows = Vec::new();
-
     for pair in world.narrow_phase.contact_pairs() {
         if !pair.has_any_active_contact() {
             continue;
         }
-
         active_pairs.insert(sorted_contact_pair_key(pair.collider1, pair.collider2));
+    }
+    active_pairs
+}
 
+fn emit_contact_samples(
+    world: &AlchemyRapierWorldInner,
+    callback: AlchemyRapierContactCallback,
+    user_data: *mut c_void,
+) -> usize {
+    let Some(callback) = callback else {
+        return 0;
+    };
+
+    let mut sample_count = 0usize;
+    for pair in world.narrow_phase.contact_pairs() {
+        if !pair.has_any_active_contact() {
+            continue;
+        }
         for manifold in &pair.manifolds {
             if manifold.data.solver_contacts.is_empty() {
                 continue;
             }
 
-            let mut impulse_on_body1 = Vector::ZERO;
-            let mut weighted_point_sum = Vector::ZERO;
-            let mut impulse_weight_sum = 0.0;
-            let mut active_contact_count = 0u32;
-            let mut collision_impulse_sum = 0.0;
             let force_dir1 = -manifold.data.normal;
             let tangent = Vector::new(-force_dir1.y, force_dir1.x);
             for (contact_index, contact) in manifold.points.iter().enumerate() {
@@ -801,164 +759,63 @@ fn collect_contact_rows(
                 }
 
                 let impulse = force_dir1 * normal_impulse + tangent * tangent_impulse;
-                let point_weight = impulse.length();
-                if !point_weight.is_finite() || point_weight <= 0.000001 {
+                let collision_impulse = impulse.length();
+                if !collision_impulse.is_finite() || collision_impulse <= 0.000001 {
                     continue;
                 }
 
-                impulse_on_body1 += impulse;
-                collision_impulse_sum += point_weight;
-                active_contact_count = active_contact_count.saturating_add(1);
-
                 if let Some(solver_contact) = manifold.data.solver_contacts.get(contact_index) {
-                    weighted_point_sum += solver_contact.point * point_weight;
-                    impulse_weight_sum += point_weight;
+                    if !solver_contact.point.x.is_finite()
+                        || !solver_contact.point.y.is_finite()
+                        || !impulse.x.is_finite()
+                        || !impulse.y.is_finite()
+                    {
+                        continue;
+                    }
+
+                    let voxel1 =
+                        voxel_metadata(&world.voxel_colliders, pair.collider1, manifold.subshape1);
+                    let voxel2 =
+                        voxel_metadata(&world.voxel_colliders, pair.collider2, manifold.subshape2);
+                    let sample = AlchemyRapierContactSample {
+                        collider1_packed_id: pack_collider_handle(pair.collider1),
+                        collider2_packed_id: pack_collider_handle(pair.collider2),
+                        body1_packed_id: body_packed_id(manifold.data.rigid_body1),
+                        body2_packed_id: body_packed_id(manifold.data.rigid_body2),
+                        body1_user_data: manifold
+                            .data
+                            .rigid_body1
+                            .and_then(|handle| world.bodies.get(handle))
+                            .map(|body| body.user_data as u64)
+                            .unwrap_or(0),
+                        body2_user_data: manifold
+                            .data
+                            .rigid_body2
+                            .and_then(|handle| world.bodies.get(handle))
+                            .map(|body| body.user_data as u64)
+                            .unwrap_or(0),
+                        subshape1: manifold.subshape1,
+                        subshape2: manifold.subshape2,
+                        source_cell_id1: voxel1
+                            .map(|metadata| metadata.source_cell_id)
+                            .unwrap_or(INVALID_SOURCE_CELL_ID),
+                        source_cell_id2: voxel2
+                            .map(|metadata| metadata.source_cell_id)
+                            .unwrap_or(INVALID_SOURCE_CELL_ID),
+                        material_id1: voxel1.map(|metadata| metadata.material_id).unwrap_or(0),
+                        material_id2: voxel2.map(|metadata| metadata.material_id).unwrap_or(0),
+                        point: ffi_vec(solver_contact.point),
+                        normal_from_2_to_1: ffi_vec(force_dir1),
+                        impulse_on_body1: ffi_vec(impulse),
+                        collision_impulse,
+                    };
+                    unsafe { callback(user_data, &sample) };
+                    sample_count = sample_count.saturating_add(1);
                 }
             }
-
-            if active_contact_count == 0 || collision_impulse_sum <= 0.000001 {
-                continue;
-            }
-
-            let point = if impulse_weight_sum > 0.000001 {
-                weighted_point_sum / impulse_weight_sum
-            } else {
-                Vector::ZERO
-            };
-            if !point.x.is_finite()
-                || !point.y.is_finite()
-                || !impulse_on_body1.x.is_finite()
-                || !impulse_on_body1.y.is_finite()
-                || !collision_impulse_sum.is_finite()
-            {
-                continue;
-            }
-
-            let collider1_packed_id = pack_collider_handle(pair.collider1);
-            let collider2_packed_id = pack_collider_handle(pair.collider2);
-            let body1_packed_id = body_packed_id(manifold.data.rigid_body1);
-            let body2_packed_id = body_packed_id(manifold.data.rigid_body2);
-            let voxel1 = voxel_metadata(&world.voxel_colliders, pair.collider1, manifold.subshape1);
-            let voxel2 = voxel_metadata(&world.voxel_colliders, pair.collider2, manifold.subshape2);
-            let material_id1 = voxel1.map(|metadata| metadata.material_id).unwrap_or(0);
-            let material_id2 = voxel2.map(|metadata| metadata.material_id).unwrap_or(0);
-            let source_cell_id1 = voxel1
-                .map(|metadata| metadata.source_cell_id)
-                .unwrap_or(INVALID_SOURCE_CELL_ID);
-            let source_cell_id2 = voxel2
-                .map(|metadata| metadata.source_cell_id)
-                .unwrap_or(INVALID_SOURCE_CELL_ID);
-
-            let row = if collider1_packed_id <= collider2_packed_id {
-                AlchemyRapierContactRow {
-                    collider1_packed_id,
-                    collider2_packed_id,
-                    body1_packed_id,
-                    body2_packed_id,
-                    subshape1: manifold.subshape1,
-                    subshape2: manifold.subshape2,
-                    source_cell_id1,
-                    source_cell_id2,
-                    material_id1,
-                    material_id2,
-                    point: ffi_vec(point),
-                    impulse_on_body1: ffi_vec(impulse_on_body1),
-                    force_on_body1: AlchemyRapierVec2::default(),
-                    collision_impulse_sum,
-                    active_contact_count,
-                }
-            } else {
-                AlchemyRapierContactRow {
-                    collider1_packed_id: collider2_packed_id,
-                    collider2_packed_id: collider1_packed_id,
-                    body1_packed_id: body2_packed_id,
-                    body2_packed_id: body1_packed_id,
-                    subshape1: manifold.subshape2,
-                    subshape2: manifold.subshape1,
-                    source_cell_id1: source_cell_id2,
-                    source_cell_id2: source_cell_id1,
-                    material_id1: material_id2,
-                    material_id2: material_id1,
-                    point: ffi_vec(point),
-                    impulse_on_body1: ffi_vec(-impulse_on_body1),
-                    force_on_body1: AlchemyRapierVec2::default(),
-                    collision_impulse_sum,
-                    active_contact_count,
-                }
-            };
-            rows.push(row);
         }
     }
-
-    (active_pairs, rows)
-}
-
-fn accumulate_contact_rows(
-    accumulated_rows: &mut HashMap<ContactRowKey, ContactRowAccumulator>,
-    rows: Vec<AlchemyRapierContactRow>,
-) {
-    for row in rows {
-        if row.active_contact_count == 0 || row.collision_impulse_sum <= 0.000001 {
-            continue;
-        }
-
-        let key = contact_row_key(&row);
-        let weighted_point = vector(row.point) * row.collision_impulse_sum;
-        accumulated_rows
-            .entry(key)
-            .and_modify(|entry| {
-                entry.row.impulse_on_body1 =
-                    ffi_vec(vector(entry.row.impulse_on_body1) + vector(row.impulse_on_body1));
-                entry.row.collision_impulse_sum += row.collision_impulse_sum;
-                entry.row.active_contact_count = entry
-                    .row
-                    .active_contact_count
-                    .saturating_add(row.active_contact_count);
-                entry.weighted_point_sum += weighted_point;
-            })
-            .or_insert(ContactRowAccumulator {
-                row,
-                weighted_point_sum: weighted_point,
-            });
-    }
-}
-
-fn finish_accumulated_contact_rows(
-    accumulated_rows: HashMap<ContactRowKey, ContactRowAccumulator>,
-    time_step: f32,
-) -> Vec<AlchemyRapierContactRow> {
-    let inv_time_step = if time_step.is_finite() && time_step > 0.0 {
-        1.0 / time_step
-    } else {
-        0.0
-    };
-    let mut rows = Vec::with_capacity(accumulated_rows.len());
-    for (_, mut accumulator) in accumulated_rows {
-        if accumulator.row.active_contact_count == 0
-            || accumulator.row.collision_impulse_sum <= 0.000001
-            || !accumulator.row.collision_impulse_sum.is_finite()
-        {
-            continue;
-        }
-
-        let impulse_on_body1 = vector(accumulator.row.impulse_on_body1);
-        let point = accumulator.weighted_point_sum / accumulator.row.collision_impulse_sum;
-        let force_on_body1 = impulse_on_body1 * inv_time_step;
-        if !point.x.is_finite()
-            || !point.y.is_finite()
-            || !impulse_on_body1.x.is_finite()
-            || !impulse_on_body1.y.is_finite()
-            || !force_on_body1.x.is_finite()
-            || !force_on_body1.y.is_finite()
-        {
-            continue;
-        }
-
-        accumulator.row.point = ffi_vec(point);
-        accumulator.row.force_on_body1 = ffi_vec(force_on_body1);
-        rows.push(accumulator.row);
-    }
-    rows
+    sample_count
 }
 
 fn to_inner<'a>(
@@ -1203,7 +1060,7 @@ fn body_builder(desc: AlchemyRapierBodyDesc) -> RigidBodyBuilder {
     if desc.sleep != 0 {
         builder = builder.sleeping(true);
     }
-    builder
+    builder.user_data(desc.user_data as u128)
 }
 
 fn body_can_sleep(body: &RigidBody) -> bool {
@@ -1266,6 +1123,7 @@ fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) {
     } else if wake_up {
         body.wake_up(true);
     }
+    body.user_data = desc.user_data as u128;
 }
 
 fn recompute_body_mass(world: &mut AlchemyRapierWorldInner, handle: RigidBodyHandle) {
@@ -1351,7 +1209,11 @@ fn pack_i32_halves_to_i64(high: i32, low: i32) -> i64 {
 
 fn terrain_actor_key_from_desc(desc: AlchemyRapierTerrainDesc) -> i64 {
     let key = pack_i32_halves_to_i64(desc.source_world_origin_x, desc.source_world_origin_y);
-    if key == 0 { 1 } else { key }
+    if key == 0 {
+        1
+    } else {
+        key
+    }
 }
 
 fn has_pending_static_adoption_for_actor(world: &AlchemyRapierWorldInner, actor_key: i64) -> bool {
@@ -3090,6 +2952,27 @@ pub extern "C" fn alchemy_rapier_step(
     time_step: f32,
     sub_step_count: i32,
 ) -> AlchemyRapierStepResult {
+    step_with_contact_callback(world, time_step, sub_step_count, None, ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_step_with_contact_callback(
+    world: *mut AlchemyRapierWorld,
+    time_step: f32,
+    sub_step_count: i32,
+    callback: AlchemyRapierContactCallback,
+    user_data: *mut c_void,
+) -> AlchemyRapierStepResult {
+    step_with_contact_callback(world, time_step, sub_step_count, callback, user_data)
+}
+
+fn step_with_contact_callback(
+    world: *mut AlchemyRapierWorld,
+    time_step: f32,
+    sub_step_count: i32,
+    callback: AlchemyRapierContactCallback,
+    user_data: *mut c_void,
+) -> AlchemyRapierStepResult {
     match catch_unwind(AssertUnwindSafe(|| {
         if !time_step.is_finite() || time_step <= 0.0 || sub_step_count <= 0 {
             return empty_step_result(AlchemyRapierStatus::InvalidArgument);
@@ -3099,17 +2982,17 @@ pub extern "C" fn alchemy_rapier_step(
         };
         let sub_steps = sub_step_count as usize;
         let dt = time_step / sub_steps as f32;
-        let mut accumulated_contact_rows: HashMap<ContactRowKey, ContactRowAccumulator> =
-            HashMap::new();
         let mut active_pairs = HashSet::new();
+        let mut contact_hit_count = 0usize;
         for _ in 0..sub_steps {
             world.step_once(dt);
-            let (substep_active_pairs, substep_contact_rows) = collect_contact_rows(world);
-            active_pairs = substep_active_pairs;
-            accumulate_contact_rows(&mut accumulated_contact_rows, substep_contact_rows);
+            if callback.is_some() {
+                contact_hit_count = contact_hit_count
+                    .saturating_add(emit_contact_samples(world, callback, user_data));
+            }
+            active_pairs = collect_active_contact_pairs(world);
         }
 
-        let contact_rows = finish_accumulated_contact_rows(accumulated_contact_rows, time_step);
         let contact_begin_count = active_pairs
             .difference(&world.previous_active_contact_pairs)
             .count();
@@ -3117,51 +3000,17 @@ pub extern "C" fn alchemy_rapier_step(
             .previous_active_contact_pairs
             .difference(&active_pairs)
             .count();
-        let contact_hit_count = contact_rows.len();
         world.previous_active_contact_pairs = active_pairs;
-        world.last_contact_rows = contact_rows;
 
         AlchemyRapierStepResult {
             status: AlchemyRapierStatus::Ok,
             contact_begin_count,
             contact_end_count,
             contact_hit_count,
-            contact_row_count: world.last_contact_rows.len(),
         }
     })) {
         Ok(result) => result,
         Err(_) => empty_step_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_read_contact_rows(
-    world: *mut AlchemyRapierWorld,
-    rows: *mut AlchemyRapierContactRow,
-    row_capacity: usize,
-) -> AlchemyRapierContactReadResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return empty_contact_read_result(AlchemyRapierStatus::NullPointer);
-        };
-        if row_capacity > 0 && rows.is_null() {
-            return empty_contact_read_result(AlchemyRapierStatus::NullPointer);
-        }
-
-        let row_count = world.last_contact_rows.len();
-        let written_count = row_count.min(row_capacity);
-        if written_count > 0 {
-            let output = unsafe { slice::from_raw_parts_mut(rows, written_count) };
-            output.copy_from_slice(&world.last_contact_rows[..written_count]);
-        }
-        AlchemyRapierContactReadResult {
-            status: AlchemyRapierStatus::Ok,
-            row_count,
-            written_count,
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_contact_read_result(AlchemyRapierStatus::Panic),
     }
 }
 
@@ -3256,6 +3105,28 @@ pub extern "C" fn alchemy_rapier_update_body(
         };
         apply_body_desc(body, desc);
         body.recompute_mass_properties_from_colliders(&world.colliders);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_user_data(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    user_data: u64,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let handle = handle_from_ffi(handle);
+        let Some(body) = world.bodies.get_mut(handle) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        body.user_data = user_data as u128;
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
