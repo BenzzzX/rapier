@@ -1,7 +1,7 @@
 use fracture_core::{
-    CommandId, DamageInput, DamageSource, DeterministicOrderKey, FractureCommand, FractureTarget,
-    FxActorId, FxFamilyId, GridCoord, SplitEvent, SupportNodeId, Vec2, generate_damage_commands,
+    DamageSource, FxActorId, FxFamilyId, GridCoord, SplitEvent, Vec2, snapshot::SnapshotMode,
 };
+use fracture_rapier::{FractureField2D, FxRapierError, FxRapierWorld2D, FxStepWithDiagnostics};
 use fracture_voxel::{
     AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
 };
@@ -15,11 +15,6 @@ use std::slice;
 
 const QUERY_SOURCE_TERRAIN: u32 = 1;
 const QUERY_SOURCE_DYNAMIC_RIGIDBODY: u32 = 1 << 1;
-const TERRAIN_EXTERNAL_ACTION_STRICT_FORCE: i32 = 1;
-const TERRAIN_EXTERNAL_ACTION_STRICT_IMPULSE: i32 = 2;
-const TERRAIN_EXTERNAL_ACTION_SANDBOX_LOAD: i32 = 3;
-const TERRAIN_EXTERNAL_ACTION_SANDBOX_IMPACT: i32 = 4;
-const TERRAIN_EXTERNAL_ACTION_MAX_NODE_DISTANCE_PIXELS: f32 = 2.0;
 const INVALID_SOURCE_CELL_ID: u32 = u32::MAX;
 
 #[repr(C)]
@@ -31,6 +26,12 @@ pub enum AlchemyRapierStatus {
     InvalidHandle = 3,
     InvalidArgument = 4,
     Unsupported = 5,
+}
+
+impl Default for AlchemyRapierStatus {
+    fn default() -> Self {
+        Self::Ok
+    }
 }
 
 #[repr(C)]
@@ -54,6 +55,127 @@ impl Default for AlchemyRapierQuerySourceKind {
     fn default() -> Self {
         Self::Unknown
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlchemyFxSnapshotMode {
+    Normal = 0,
+    Deterministic = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlchemyFxDamageSource {
+    Script = 0,
+    ContactImpulse = 1,
+    JointFeedback = 2,
+    Stress = 3,
+}
+
+impl Default for AlchemyFxDamageSource {
+    fn default() -> Self {
+        Self::Script
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlchemyFxFractureFieldMode {
+    Stress = 0,
+    DirectDamage = 1,
+}
+
+impl Default for AlchemyFxFractureFieldMode {
+    fn default() -> Self {
+        Self::Stress
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxVoxelDestructibleDesc {
+    pub family_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub voxel_size: f32,
+    pub occupancy_words: *const u64,
+    pub occupancy_word_count: usize,
+    pub fracture_material_ids: *const u16,
+    pub fracture_material_id_count: usize,
+    pub contact_material_ids: *const u16,
+    pub contact_material_id_count: usize,
+    pub external_ids: *const u32,
+    pub external_id_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxFractureFieldDesc {
+    pub mode: AlchemyFxFractureFieldMode,
+    pub has_family: u8,
+    pub family_id: u32,
+    pub center: AlchemyRapierVec2,
+    pub radius: f32,
+    pub force: AlchemyRapierVec2,
+    pub health_loss: f32,
+    pub effective_length_loss: f32,
+    pub source: AlchemyFxDamageSource,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxAsset2DCreateResult {
+    pub status: AlchemyRapierStatus,
+    pub asset: *mut AlchemyFxAsset2D,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxStepReport {
+    pub status: AlchemyRapierStatus,
+    pub tick: u64,
+    pub quick_impact_count: usize,
+    pub contact_impulse_count: usize,
+    pub joint_feedback_count: usize,
+    pub fracture_field_effect_count: usize,
+    pub stress_input_count: usize,
+    pub fracture_event_count: usize,
+    pub split_event_count: usize,
+    pub impulse_joint_handle_replacement_count: usize,
+    pub occupied_voxel_count: usize,
+    pub occupied_voxel_budget: usize,
+    pub support_node_count: usize,
+    pub support_node_budget: usize,
+    pub active_body_count: usize,
+    pub active_body_budget: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxSplitEventReadResult {
+    pub status: AlchemyRapierStatus,
+    pub row_count: usize,
+    pub written_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxSplitEventRow {
+    pub event_id: u32,
+    pub family_id: u32,
+    pub parent_actor_id: u32,
+    pub kept_actor_id: u32,
+    pub created_child_count: usize,
+    pub fragment_count: usize,
+    pub kept_node_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyFxByteSlice {
+    pub data: *const u8,
+    pub len: usize,
 }
 
 #[repr(C)]
@@ -107,33 +229,6 @@ pub struct AlchemyRapierVoxelColliderDesc {
     pub voxel_size: AlchemyRapierVec2,
     pub cells: *const AlchemyRapierVoxelCell,
     pub cell_count: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-/// Deprecated legacy terrain ABI. New callers should create raw voxel colliders instead.
-pub struct AlchemyRapierTerrainDesc {
-    pub chunk_x: i32,
-    pub chunk_y: i32,
-    pub source_world_origin_x: i32,
-    pub source_world_origin_y: i32,
-    pub local_origin_x: i32,
-    pub local_origin_y: i32,
-    pub pixel_shape_local_origin: AlchemyRapierVec2,
-    pub revision: i64,
-    pub width: i32,
-    pub height: i32,
-    pub pixel_size: f32,
-    pub topology_revision: u64,
-    pub topology_version: u32,
-    pub occupancy_words: *const u64,
-    pub occupancy_word_count: usize,
-    pub material_ids: *const u16,
-    pub material_id_count: usize,
-    pub support_mask: *const u8,
-    pub support_mask_count: usize,
-    pub actor_key: i64,
-    pub replace_existing: u8,
 }
 
 #[repr(C)]
@@ -284,41 +379,6 @@ pub struct AlchemyRapierVec2Result {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
-/// Deprecated legacy terrain ABI result.
-pub struct AlchemyRapierTerrainApplyResult {
-    pub status: AlchemyRapierStatus,
-    pub solid_count: usize,
-    pub terrain_chunk_count: usize,
-    pub terrain_collider_count: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-/// Deprecated legacy terrain fracture action ABI.
-pub struct AlchemyRapierTerrainExternalActionDesc {
-    pub actor_key: i64,
-    pub collider_packed_id: u64,
-    pub world_point: AlchemyRapierVec2,
-    pub force: AlchemyRapierVec2,
-    pub radius: f32,
-    pub demand: f32,
-    pub action_kind: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-/// Deprecated legacy terrain fracture action ABI result.
-pub struct AlchemyRapierTerrainExternalActionResult {
-    pub status: AlchemyRapierStatus,
-    pub demand: f32,
-    pub affected_cell_count: usize,
-    pub adoption_count: usize,
-    pub retained_solid_count: usize,
-    pub actor_key: i64,
-}
-
-#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AlchemyRapierQueryHit {
     pub source_kind: AlchemyRapierQuerySourceKind,
@@ -395,66 +455,57 @@ pub struct AlchemyRapierRevoluteJointDesc {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct AlchemyRapierBlastTransitionAdoptionReadResult {
-    pub status: AlchemyRapierStatus,
-    pub row_count: usize,
-    pub written_count: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
 pub struct AlchemyRapierSplitEventReadResult {
     pub status: AlchemyRapierStatus,
     pub row_count: usize,
     pub written_count: usize,
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AlchemyRapierBlastTransitionAdoptionRow {
-    pub transition_id: u32,
-    pub source_body_handle: AlchemyRapierRigidBodyHandle,
-    pub source_body_packed_id: u64,
-    pub source_collider_handle: AlchemyRapierColliderHandle,
-    pub source_collider_packed_id: u64,
-    pub child_body_handle: AlchemyRapierRigidBodyHandle,
-    pub child_body_packed_id: u64,
-    pub child_collider_handle: AlchemyRapierColliderHandle,
-    pub child_collider_packed_id: u64,
-    pub source_width: i32,
-    pub source_height: i32,
-    pub source_min_x: i32,
-    pub source_min_y: i32,
-    pub source_max_x: i32,
-    pub source_max_y: i32,
-    pub source_cell_count: usize,
-    pub child_width: i32,
-    pub child_height: i32,
-    pub child_pixel_size: f32,
-    pub child_local_origin: AlchemyRapierVec2,
-    pub child_occupancy_word_count: usize,
-    pub child_material_id_count: usize,
-    pub child_solid_count: usize,
-    pub source_local_origin: AlchemyRapierVec2,
-    pub source_solid_count: usize,
-    pub position: AlchemyRapierVec2,
-    pub rotation: f32,
-    pub linear_velocity: AlchemyRapierVec2,
-    pub angular_velocity: f32,
-    pub source_topology_revision: u64,
-    pub source_topology_version: u32,
-    pub child_topology_revision: u64,
-    pub child_topology_version: u32,
-    pub material_hash: u64,
-    pub source_kind: AlchemyRapierQuerySourceKind,
-    pub source_terrain_actor_key: i64,
-    pub source_terrain_chunk_x: i32,
-    pub source_terrain_chunk_y: i32,
-    pub source_terrain_world_origin_x: i32,
-    pub source_terrain_world_origin_y: i32,
-    pub source_terrain_revision: i64,
-    pub source_touched_cell_count: usize,
-    pub source_removed_cell_count: usize,
+struct CroppedSplitPayload {
+    transition_id: u32,
+    source_body_handle: AlchemyRapierRigidBodyHandle,
+    source_body_packed_id: u64,
+    source_collider_handle: AlchemyRapierColliderHandle,
+    source_collider_packed_id: u64,
+    child_body_handle: AlchemyRapierRigidBodyHandle,
+    child_body_packed_id: u64,
+    child_collider_handle: AlchemyRapierColliderHandle,
+    child_collider_packed_id: u64,
+    source_width: i32,
+    source_height: i32,
+    source_min_x: i32,
+    source_min_y: i32,
+    source_max_x: i32,
+    source_max_y: i32,
+    source_cell_count: usize,
+    child_width: i32,
+    child_height: i32,
+    child_pixel_size: f32,
+    child_local_origin: AlchemyRapierVec2,
+    child_occupancy_word_count: usize,
+    child_material_id_count: usize,
+    child_solid_count: usize,
+    source_local_origin: AlchemyRapierVec2,
+    source_solid_count: usize,
+    position: AlchemyRapierVec2,
+    rotation: f32,
+    linear_velocity: AlchemyRapierVec2,
+    angular_velocity: f32,
+    source_topology_revision: u64,
+    source_topology_version: u32,
+    child_topology_revision: u64,
+    child_topology_version: u32,
+    material_hash: u64,
+    source_kind: AlchemyRapierQuerySourceKind,
+    source_terrain_actor_key: i64,
+    source_terrain_chunk_x: i32,
+    source_terrain_chunk_y: i32,
+    source_terrain_world_origin_x: i32,
+    source_terrain_world_origin_y: i32,
+    source_terrain_revision: i64,
+    source_touched_cell_count: usize,
+    source_removed_cell_count: usize,
 }
 
 #[repr(C)]
@@ -508,6 +559,26 @@ pub struct AlchemyRapierSplitEventRow {
 #[repr(C)]
 pub struct AlchemyRapierWorld {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct AlchemyFxRapierWorld {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct AlchemyFxAsset2D {
+    _private: [u8; 0],
+}
+
+struct AlchemyFxRapierWorldInner {
+    world: FxRapierWorld2D,
+    last_step: Option<FxStepWithDiagnostics>,
+    snapshot_scratch: Vec<u8>,
+}
+
+struct AlchemyFxAsset2DInner {
+    asset: AuthoredVoxelAsset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -598,15 +669,6 @@ struct VoxelCellMetadata {
     source_cell_id: u32,
 }
 
-struct PendingBlastTransitionAdoption {
-    row: AlchemyRapierBlastTransitionAdoptionRow,
-    source_cell_indices: Vec<i32>,
-    touched_source_cell_indices: Vec<i32>,
-    removed_source_cell_indices: Vec<i32>,
-    child_occupancy_words: Vec<u64>,
-    child_material_ids: Vec<u16>,
-}
-
 struct PendingSplitEvent {
     row: AlchemyRapierSplitEventRow,
     source_cell_indices: Vec<i32>,
@@ -614,19 +676,6 @@ struct PendingSplitEvent {
     removed_source_cell_indices: Vec<i32>,
     child_occupancy_words: Vec<u64>,
     child_material_ids: Vec<u16>,
-}
-
-fn pending_split_event_from_adoption(
-    adoption: &PendingBlastTransitionAdoption,
-) -> PendingSplitEvent {
-    PendingSplitEvent {
-        row: split_row_from_cropped_payload(adoption.row),
-        source_cell_indices: adoption.source_cell_indices.clone(),
-        touched_source_cell_indices: adoption.touched_source_cell_indices.clone(),
-        removed_source_cell_indices: adoption.removed_source_cell_indices.clone(),
-        child_occupancy_words: adoption.child_occupancy_words.clone(),
-        child_material_ids: adoption.child_material_ids.clone(),
-    }
 }
 
 struct AlchemyRapierWorldInner {
@@ -648,7 +697,6 @@ struct AlchemyRapierWorldInner {
     pixel_rigidbodies: HashMap<RigidBodyHandle, PixelRigidbodyState>,
     contact_materials: HashMap<u16, ContactMaterial>,
     voxel_colliders: HashMap<(u32, u32), HashMap<u32, VoxelCellMetadata>>,
-    pending_blast_transition_adoptions: Vec<PendingBlastTransitionAdoption>,
     pending_split_events: Vec<PendingSplitEvent>,
     previous_active_contact_pairs: HashSet<(u64, u64)>,
 }
@@ -674,7 +722,6 @@ impl AlchemyRapierWorldInner {
             pixel_rigidbodies: HashMap::new(),
             contact_materials: HashMap::new(),
             voxel_colliders: HashMap::new(),
-            pending_blast_transition_adoptions: Vec::new(),
             pending_split_events: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
         }
@@ -832,6 +879,176 @@ fn to_inner<'a>(
         return Err(AlchemyRapierStatus::NullPointer);
     }
     Ok(unsafe { &mut *world.cast::<AlchemyRapierWorldInner>() })
+}
+
+fn to_fx_world<'a>(
+    world: *mut AlchemyFxRapierWorld,
+) -> Result<&'a mut AlchemyFxRapierWorldInner, AlchemyRapierStatus> {
+    if world.is_null() {
+        return Err(AlchemyRapierStatus::NullPointer);
+    }
+    Ok(unsafe { &mut *world.cast::<AlchemyFxRapierWorldInner>() })
+}
+
+fn to_fx_asset<'a>(
+    asset: *const AlchemyFxAsset2D,
+) -> Result<&'a AlchemyFxAsset2DInner, AlchemyRapierStatus> {
+    if asset.is_null() {
+        return Err(AlchemyRapierStatus::NullPointer);
+    }
+    Ok(unsafe { &*asset.cast::<AlchemyFxAsset2DInner>() })
+}
+
+fn fx_error_status(error: FxRapierError) -> AlchemyRapierStatus {
+    match error {
+        FxRapierError::UnknownFamily(_)
+        | FxRapierError::UnknownActor { .. }
+        | FxRapierError::MissingSplitParentSnapshot { .. }
+        | FxRapierError::UnknownReplayFamily(_) => AlchemyRapierStatus::InvalidHandle,
+        FxRapierError::UnsupportedConnectionPolicy(_)
+        | FxRapierError::ReplayRequiresDeterministicMode => AlchemyRapierStatus::Unsupported,
+        FxRapierError::DuplicateFamily(_)
+        | FxRapierError::DuplicateReplayKey { .. }
+        | FxRapierError::Connection(_)
+        | FxRapierError::Snapshot(_) => AlchemyRapierStatus::InvalidArgument,
+    }
+}
+
+fn snapshot_mode_from_ffi(mode: AlchemyFxSnapshotMode) -> SnapshotMode {
+    match mode {
+        AlchemyFxSnapshotMode::Normal => SnapshotMode::Normal,
+        AlchemyFxSnapshotMode::Deterministic => SnapshotMode::Deterministic,
+    }
+}
+
+fn damage_source_from_ffi(source: AlchemyFxDamageSource) -> DamageSource {
+    match source {
+        AlchemyFxDamageSource::Script => DamageSource::Script,
+        AlchemyFxDamageSource::ContactImpulse => DamageSource::ContactImpulse,
+        AlchemyFxDamageSource::JointFeedback => DamageSource::JointFeedback,
+        AlchemyFxDamageSource::Stress => DamageSource::Stress,
+    }
+}
+
+fn empty_fx_asset_result(status: AlchemyRapierStatus) -> AlchemyFxAsset2DCreateResult {
+    AlchemyFxAsset2DCreateResult {
+        status,
+        asset: ptr::null_mut(),
+    }
+}
+
+fn fx_cell_count(width: u32, height: u32) -> Result<usize, AlchemyRapierStatus> {
+    if width == 0 || height == 0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .filter(|count| *count > 0)
+        .ok_or(AlchemyRapierStatus::InvalidArgument)
+}
+
+fn dense_u16_from_ffi(
+    values: *const u16,
+    value_count: usize,
+    cell_count: usize,
+    fallback: u16,
+) -> Result<Vec<u16>, AlchemyRapierStatus> {
+    if values.is_null() || value_count == 0 {
+        return Ok(vec![fallback; cell_count]);
+    }
+    if value_count < cell_count {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    Ok(unsafe { slice::from_raw_parts(values, cell_count) }.to_vec())
+}
+
+fn dense_u32_from_ffi(
+    values: *const u32,
+    value_count: usize,
+    cell_count: usize,
+) -> Result<Vec<u32>, AlchemyRapierStatus> {
+    if values.is_null() || value_count == 0 {
+        return Ok((0..cell_count)
+            .map(|index| index.min(u32::MAX as usize) as u32)
+            .collect());
+    }
+    if value_count < cell_count {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    Ok(unsafe { slice::from_raw_parts(values, cell_count) }.to_vec())
+}
+
+fn authored_fx_asset_from_desc(
+    desc: AlchemyFxVoxelDestructibleDesc,
+) -> Result<AuthoredVoxelAsset, AlchemyRapierStatus> {
+    if !desc.voxel_size.is_finite() || desc.voxel_size <= 0.0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+    let cell_count = fx_cell_count(desc.width, desc.height)?;
+    let expected_word_count = cell_count.div_ceil(64);
+    if desc.occupancy_words.is_null() || desc.occupancy_word_count < expected_word_count {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
+    let occupancy = occupancy_from_words(desc.width, desc.height, words);
+    if !occupancy.iter().any(|occupied| *occupied) {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let fracture_material = dense_u16_from_ffi(
+        desc.fracture_material_ids,
+        desc.fracture_material_id_count,
+        cell_count,
+        0,
+    )?;
+    let contact_material =
+        if desc.contact_material_ids.is_null() || desc.contact_material_id_count == 0 {
+            fracture_material.clone()
+        } else {
+            dense_u16_from_ffi(
+                desc.contact_material_ids,
+                desc.contact_material_id_count,
+                cell_count,
+                0,
+            )?
+        };
+    let external_id = dense_u32_from_ffi(desc.external_ids, desc.external_id_count, cell_count)?;
+    let input = VoxelAuthoringInput::new(
+        desc.width,
+        desc.height,
+        desc.voxel_size,
+        occupancy,
+        fracture_material,
+        contact_material,
+        external_id,
+    );
+    author_voxel_asset(input).map_err(|_| AlchemyRapierStatus::InvalidArgument)
+}
+
+fn fx_split_events(world: &AlchemyFxRapierWorldInner) -> Option<&[SplitEvent]> {
+    world
+        .last_step
+        .as_ref()
+        .map(|step| step.report.split_events.as_slice())
+}
+
+fn copy_u32_slice_to_ffi(
+    values: impl Iterator<Item = u32>,
+    out: *mut u32,
+    capacity: usize,
+) -> usize {
+    if out.is_null() || capacity == 0 {
+        return 0;
+    }
+    let mut written = 0usize;
+    for value in values.take(capacity) {
+        unsafe {
+            *out.add(written) = value;
+        }
+        written += 1;
+    }
+    written
 }
 
 fn handle_from_ffi(handle: AlchemyRapierRigidBodyHandle) -> RigidBodyHandle {
@@ -1163,15 +1380,6 @@ fn status_result(status: AlchemyRapierStatus) -> AlchemyRapierStatus {
     status
 }
 
-fn empty_terrain_apply_result(status: AlchemyRapierStatus) -> AlchemyRapierTerrainApplyResult {
-    AlchemyRapierTerrainApplyResult {
-        status,
-        solid_count: 0,
-        terrain_chunk_count: 0,
-        terrain_collider_count: 0,
-    }
-}
-
 fn empty_pixel_rigidbody_result(status: AlchemyRapierStatus) -> AlchemyRapierPixelRigidbodyResult {
     AlchemyRapierPixelRigidbodyResult {
         status,
@@ -1210,67 +1418,6 @@ fn empty_query_result(status: AlchemyRapierStatus) -> AlchemyRapierQueryResult {
     }
 }
 
-fn terrain_key(desc: AlchemyRapierTerrainDesc) -> TerrainKey {
-    TerrainKey {
-        x: desc.chunk_x,
-        y: desc.chunk_y,
-    }
-}
-
-fn pack_i32_halves_to_i64(high: i32, low: i32) -> i64 {
-    let packed = ((high as u32 as u64) << 32) | (low as u32 as u64);
-    packed as i64
-}
-
-fn terrain_actor_key_from_desc(desc: AlchemyRapierTerrainDesc) -> i64 {
-    let key = pack_i32_halves_to_i64(desc.source_world_origin_x, desc.source_world_origin_y);
-    if key == 0 { 1 } else { key }
-}
-
-fn has_pending_static_adoption_for_actor(world: &AlchemyRapierWorldInner, actor_key: i64) -> bool {
-    world
-        .pending_blast_transition_adoptions
-        .iter()
-        .any(|adoption| {
-            adoption.row.source_kind == AlchemyRapierQuerySourceKind::StaticTerrain
-                && adoption.row.source_terrain_actor_key == actor_key
-        })
-}
-
-fn remove_terrain_chunk(world: &mut AlchemyRapierWorldInner, key: TerrainKey) {
-    if let Some(existing) = world.terrain_chunks.remove(&key) {
-        world.terrain_by_collider.remove(&existing.collider);
-        let _ = world.colliders.remove(
-            existing.collider,
-            &mut world.islands,
-            &mut world.bodies,
-            true,
-        );
-    }
-}
-
-fn remove_terrain_fracture_actor(world: &mut AlchemyRapierWorldInner, actor_key: i64) {
-    if let Some(existing) = world.terrain_fracture_actors.remove(&actor_key) {
-        world
-            .terrain_fracture_actor_by_collider
-            .remove(&existing.collider);
-        let _ = world.colliders.remove(
-            existing.collider,
-            &mut world.islands,
-            &mut world.bodies,
-            true,
-        );
-        let _ = world.bodies.remove(
-            existing.body,
-            &mut world.islands,
-            &mut world.colliders,
-            &mut world.impulse_joints,
-            &mut world.multibody_joints,
-            true,
-        );
-    }
-}
-
 fn remove_pixel_rigidbody_state(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
     if let Some(existing) = world.pixel_rigidbodies.remove(&body_handle) {
         let _ = world.colliders.remove(
@@ -1286,32 +1433,11 @@ fn discard_pending_adoptions_for_body(
     world: &mut AlchemyRapierWorldInner,
     body_handle: RigidBodyHandle,
 ) {
-    let mut stale_child_bodies = Vec::new();
-    let mut kept = Vec::with_capacity(world.pending_blast_transition_adoptions.len());
-    for adoption in world.pending_blast_transition_adoptions.drain(..) {
-        let source = handle_from_ffi(adoption.row.source_body_handle);
-        let child = handle_from_ffi(adoption.row.child_body_handle);
-        if source == body_handle || child == body_handle {
-            if source == body_handle && child != body_handle {
-                stale_child_bodies.push(child);
-            }
-        } else {
-            kept.push(adoption);
-        }
-    }
-    world.pending_blast_transition_adoptions = kept;
-
-    for child in stale_child_bodies {
-        remove_pixel_rigidbody_state(world, child);
-        let _ = world.bodies.remove(
-            child,
-            &mut world.islands,
-            &mut world.colliders,
-            &mut world.impulse_joints,
-            &mut world.multibody_joints,
-            true,
-        );
-    }
+    world.pending_split_events.retain(|event| {
+        let source = handle_from_ffi(event.row.source_body_handle);
+        let child = handle_from_ffi(event.row.child_body_handle);
+        source != body_handle && child != body_handle
+    });
 }
 
 fn remove_pixel_rigidbody(world: &mut AlchemyRapierWorldInner, body_handle: RigidBodyHandle) {
@@ -1548,12 +1674,7 @@ fn build_cropped_actor_payload(
     material_ids: &[u16],
     topology_revision: u64,
     topology_version: u32,
-) -> Option<(
-    AlchemyRapierBlastTransitionAdoptionRow,
-    Vec<i32>,
-    Vec<u64>,
-    Vec<u16>,
-)> {
+) -> Option<(CroppedSplitPayload, Vec<i32>, Vec<u64>, Vec<u16>)> {
     let cells = actor_cells(runtime, actor_id)?;
     let (min_x, max_x, min_y, max_y) = actor_bounds(&cells)?;
     let width = (max_x - min_x + 1) as usize;
@@ -1585,7 +1706,7 @@ fn build_cropped_actor_payload(
         runtime.asset().core().voxel_size(),
         cropped_com,
     );
-    let row = AlchemyRapierBlastTransitionAdoptionRow {
+    let row = CroppedSplitPayload {
         source_min_x: min_x.min(i32::MAX as u32) as i32,
         source_min_y: min_y.min(i32::MAX as u32) as i32,
         source_max_x: max_x.min(i32::MAX as u32) as i32,
@@ -1600,14 +1721,12 @@ fn build_cropped_actor_payload(
         child_solid_count: source_indices.len(),
         child_topology_revision: topology_revision,
         child_topology_version: topology_version,
-        ..AlchemyRapierBlastTransitionAdoptionRow::default()
+        ..CroppedSplitPayload::default()
     };
     Some((row, source_indices, words, materials))
 }
 
-fn split_row_from_cropped_payload(
-    row: AlchemyRapierBlastTransitionAdoptionRow,
-) -> AlchemyRapierSplitEventRow {
+fn split_event_row_from_cropped_payload(row: CroppedSplitPayload) -> AlchemyRapierSplitEventRow {
     AlchemyRapierSplitEventRow {
         transition_id: row.transition_id,
         source_kind: row.source_kind,
@@ -1653,99 +1772,6 @@ fn split_row_from_cropped_payload(
         child_topology_version: row.child_topology_version,
         material_hash: row.material_hash,
     }
-}
-
-fn build_cropped_source_indices_payload(
-    runtime: &VoxelRuntime,
-    source_indices: &[usize],
-    material_ids: &[u16],
-    topology_revision: u64,
-    topology_version: u32,
-) -> Option<(
-    AlchemyRapierBlastTransitionAdoptionRow,
-    Vec<i32>,
-    Vec<u64>,
-    Vec<u16>,
-    Vector,
-)> {
-    if source_indices.is_empty() {
-        return None;
-    }
-    let asset = runtime.asset();
-    let width = asset.core().occupancy().width();
-    let height = asset.core().occupancy().height();
-    let cell_count = (width as usize).checked_mul(height as usize)?;
-    let mut coords = Vec::with_capacity(source_indices.len());
-    for source_index in source_indices {
-        if *source_index >= cell_count {
-            return None;
-        }
-        let x = (*source_index % width as usize) as u32;
-        let y = (*source_index / width as usize) as u32;
-        let coord = GridCoord { x, y };
-        let metadata = asset.voxel_metadata(coord).ok()?;
-        if !metadata.occupied {
-            return None;
-        }
-        coords.push((coord, *source_index, metadata.fracture_material));
-    }
-    let first = coords.first()?.0;
-    let mut min_x = first.x;
-    let mut max_x = first.x;
-    let mut min_y = first.y;
-    let mut max_y = first.y;
-    for (coord, _, _) in &coords {
-        min_x = min_x.min(coord.x);
-        max_x = max_x.max(coord.x);
-        min_y = min_y.min(coord.y);
-        max_y = max_y.max(coord.y);
-    }
-    let child_width = (max_x - min_x + 1) as usize;
-    let child_height = (max_y - min_y + 1) as usize;
-    let child_cell_count = child_width.checked_mul(child_height)?;
-    let mut words = vec![0u64; child_cell_count.div_ceil(64)];
-    let mut materials = vec![0u16; child_cell_count];
-    let mut copied_source_indices = Vec::with_capacity(coords.len());
-    let mut com = Vector::ZERO;
-    for (coord, source_index, fallback_material) in coords {
-        copied_source_indices.push(source_index.min(i32::MAX as usize) as i32);
-        let child_x = (coord.x - min_x) as usize;
-        let child_y = (coord.y - min_y) as usize;
-        let child_index = child_y * child_width + child_x;
-        words[child_index >> 6] |= 1u64 << (child_index & 63);
-        let material = material_ids
-            .get(source_index)
-            .copied()
-            .unwrap_or(fallback_material);
-        materials[child_index] = material;
-        com += Vector::new(child_x as f32 + 0.5, child_y as f32 + 0.5);
-    }
-    com /= copied_source_indices.len() as f32;
-    let local_origin = pixel_shape_local_origin_for_com(
-        child_width as u32,
-        child_height as u32,
-        runtime.asset().core().voxel_size(),
-        com,
-    );
-    let row = AlchemyRapierBlastTransitionAdoptionRow {
-        source_min_x: min_x.min(i32::MAX as u32) as i32,
-        source_min_y: min_y.min(i32::MAX as u32) as i32,
-        source_max_x: max_x.min(i32::MAX as u32) as i32,
-        source_max_y: max_y.min(i32::MAX as u32) as i32,
-        source_cell_count: copied_source_indices.len(),
-        child_width: child_width.min(i32::MAX as usize) as i32,
-        child_height: child_height.min(i32::MAX as usize) as i32,
-        child_pixel_size: runtime.asset().core().voxel_size(),
-        child_local_origin: ffi_vec(local_origin),
-        child_occupancy_word_count: words.len(),
-        child_material_id_count: materials.len(),
-        child_solid_count: copied_source_indices.len(),
-        child_topology_revision: topology_revision,
-        child_topology_version: topology_version,
-        ..AlchemyRapierBlastTransitionAdoptionRow::default()
-    };
-    let source_com = Vector::new(min_x as f32 + com.x, min_y as f32 + com.y);
-    Some((row, copied_source_indices, words, materials, source_com))
 }
 
 fn cropped_pixel_asset_from_words(
@@ -2159,7 +2185,7 @@ fn create_pending_split_events(
         row.material_hash = material_hash(material_ids);
         world.pixel_rigidbodies.insert(child_body, child_state);
         world.pending_split_events.push(PendingSplitEvent {
-            row: split_row_from_cropped_payload(row),
+            row: split_event_row_from_cropped_payload(row),
             touched_source_cell_indices: source_cells.clone(),
             removed_source_cell_indices: Vec::new(),
             source_cell_indices: source_cells,
@@ -2169,295 +2195,6 @@ fn create_pending_split_events(
         created_any = true;
     }
     created_any
-}
-
-fn empty_terrain_external_action_result(
-    status: AlchemyRapierStatus,
-) -> AlchemyRapierTerrainExternalActionResult {
-    AlchemyRapierTerrainExternalActionResult {
-        status,
-        demand: 0.0,
-        affected_cell_count: 0,
-        adoption_count: 0,
-        retained_solid_count: 0,
-        actor_key: 0,
-    }
-}
-
-fn terrain_actor_key_for_external_action(
-    world: &AlchemyRapierWorldInner,
-    desc: AlchemyRapierTerrainExternalActionDesc,
-) -> Option<i64> {
-    if desc.actor_key != 0 {
-        return Some(desc.actor_key);
-    }
-    if desc.collider_packed_id == 0 {
-        return None;
-    }
-    let collider = collider_handle_from_packed(desc.collider_packed_id);
-    world
-        .terrain_fracture_actor_by_collider
-        .get(&collider)
-        .copied()
-}
-
-fn terrain_actor_nearest_owned_support_node(
-    state: &TerrainFractureActorState,
-    world_point: Vector,
-) -> Option<(SupportNodeId, Vec<i32>)> {
-    let asset_point = terrain_actor_point_to_asset_point(state, world_point);
-    let family = state.runtime.family();
-    let actor = family.actor(state.actor)?;
-    let asset = family.asset();
-    let width = asset.occupancy().width() as usize;
-    let mut nearest: Option<(SupportNodeId, f32, Vec<i32>)> = None;
-    for node_id in &actor.owned_nodes {
-        let Some(node) = asset.node(*node_id) else {
-            continue;
-        };
-        let mut node_indices = Vec::new();
-        let mut node_center = Vector::ZERO;
-        let mut node_weight = 0.0f32;
-        for coord in &node.voxels {
-            let index = (coord.y as usize)
-                .checked_mul(width)?
-                .checked_add(coord.x as usize)?;
-            let Some(occupied) = state.asset.occupancy().get(index).copied() else {
-                continue;
-            };
-            if !occupied {
-                continue;
-            }
-            node_indices.push(index.min(i32::MAX as usize) as i32);
-            node_center += Vector::new(
-                (coord.x as f32 + 0.5) * state.pixel_size,
-                (coord.y as f32 + 0.5) * state.pixel_size,
-            );
-            node_weight += 1.0;
-        }
-        if node_indices.is_empty() || node_weight <= 0.0 {
-            continue;
-        }
-        node_center *= 1.0 / node_weight;
-        let distance_sq = (asset_point - node_center).length_squared();
-        if nearest.as_ref().map_or(true, |(_, best_distance_sq, _)| {
-            distance_sq < *best_distance_sq
-        }) {
-            nearest = Some((*node_id, distance_sq, node_indices));
-        }
-    }
-    let max_distance = state.pixel_size * TERRAIN_EXTERNAL_ACTION_MAX_NODE_DISTANCE_PIXELS;
-    nearest.and_then(|(node, distance_sq, mut indices)| {
-        if distance_sq > max_distance * max_distance {
-            return None;
-        }
-        indices.sort_unstable();
-        indices.dedup();
-        Some((node, indices))
-    })
-}
-
-fn terrain_external_action_source(action_kind: i32) -> Option<(DamageSource, u16)> {
-    match action_kind {
-        TERRAIN_EXTERNAL_ACTION_STRICT_FORCE => Some((DamageSource::Stress, 10)),
-        TERRAIN_EXTERNAL_ACTION_STRICT_IMPULSE => Some((DamageSource::ContactImpulse, 20)),
-        TERRAIN_EXTERNAL_ACTION_SANDBOX_LOAD => Some((DamageSource::JointFeedback, 30)),
-        TERRAIN_EXTERNAL_ACTION_SANDBOX_IMPACT => Some((DamageSource::ContactImpulse, 40)),
-        _ => None,
-    }
-}
-
-fn terrain_actor_fracture_commands_for_external_action(
-    state: &TerrainFractureActorState,
-    world_point: Vector,
-    force: Vector,
-    demand: f32,
-    action_kind: i32,
-) -> Option<(Vec<FractureCommand>, Vec<i32>)> {
-    let (source, source_priority) = terrain_external_action_source(action_kind)?;
-    let (node, touched_source_cell_indices) =
-        terrain_actor_nearest_owned_support_node(state, world_point)?;
-    if touched_source_cell_indices.is_empty() {
-        return None;
-    }
-    let order_key = DeterministicOrderKey::new(
-        0,
-        source_priority,
-        state.runtime.family().id,
-        state.actor,
-        CommandId(
-            ((state.actor_key as u64 as u32) ^ ((action_kind.max(0) as u32) << 24) ^ node.0).max(1),
-        ),
-    );
-    let loss = demand.max(force.length()).max(0.0);
-    let inputs = [DamageInput {
-        order_key,
-        actor: state.actor,
-        target: FractureTarget::Node(node),
-        health_loss: loss,
-        effective_length_loss: loss,
-        source,
-        position: Vec2 {
-            x: world_point.x,
-            y: world_point.y,
-        },
-        radius: 0.0,
-    }];
-    let commands = generate_damage_commands(state.runtime.family(), &inputs)
-        .into_iter()
-        .map(|mut command| {
-            command.source = source;
-            command
-        })
-        .collect::<Vec<_>>();
-    (!commands.is_empty()).then_some((commands, touched_source_cell_indices))
-}
-
-fn create_pending_terrain_actor_split_adoptions(
-    world: &mut AlchemyRapierWorldInner,
-    state: &TerrainFractureActorState,
-    split_events: &[SplitEvent],
-    touched_source_cell_indices: &[i32],
-) -> usize {
-    let source_pose = Pose::from_translation(terrain_actor_body_origin(state));
-    let mut adoption_count = 0usize;
-    for event in split_events
-        .iter()
-        .filter(|event| event.parent_actor == state.actor)
-    {
-        for child_actor in &event.created_children {
-            let Some((mut row, source_cells, child_words, child_materials)) =
-                build_cropped_actor_payload(
-                    &state.runtime,
-                    *child_actor,
-                    &state.material_ids,
-                    state.topology_revision,
-                    state.topology_version,
-                )
-            else {
-                continue;
-            };
-            let child_local_origin = vector(row.child_local_origin);
-            let Some(child_asset) = cropped_pixel_asset_from_words(
-                row.child_width as u32,
-                row.child_height as u32,
-                row.child_pixel_size,
-                &child_words,
-                &child_materials,
-            ) else {
-                continue;
-            };
-            let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin)
-            else {
-                continue;
-            };
-            let child_half_extents = pixel_shape_half_extents(
-                row.child_width.max(0) as u32,
-                row.child_height.max(0) as u32,
-                row.child_pixel_size,
-            );
-            let child_cropped_com = child_half_extents - child_local_origin;
-            let child_source_com = Vector::new(
-                row.source_min_x as f32 + child_cropped_com.x,
-                row.source_min_y as f32 + child_cropped_com.y,
-            );
-            let child_position = asset_point_to_world(
-                &source_pose,
-                state.width,
-                state.height,
-                state.pixel_size,
-                state.pixel_shape_local_origin,
-                child_source_com,
-            );
-            let child_body = world
-                .bodies
-                .insert(RigidBodyBuilder::dynamic().translation(child_position));
-            let child_collider_handle =
-                world
-                    .colliders
-                    .insert_with_parent(child_collider, child_body, &mut world.bodies);
-            if let Some(body) = world.bodies.get_mut(child_body) {
-                body.set_additional_mass(0.0, true);
-                body.recompute_mass_properties_from_colliders(&world.colliders);
-            }
-            let Some(body) = world.bodies.get(child_body) else {
-                continue;
-            };
-            let child_runtime = VoxelRuntime::instantiate(
-                FxFamilyId(pack_body_handle(child_body) as u32),
-                child_asset.clone(),
-            );
-            let child_actor_state = first_actor_id(&child_runtime);
-            world.pixel_rigidbodies.insert(
-                child_body,
-                PixelRigidbodyState {
-                    asset: child_asset,
-                    runtime: child_runtime,
-                    actor: child_actor_state,
-                    collider: child_collider_handle,
-                    width: row.child_width.max(0) as u32,
-                    height: row.child_height.max(0) as u32,
-                    pixel_size: state.pixel_size,
-                    local_origin: child_local_origin,
-                    topology_revision: state.topology_revision,
-                    topology_version: state.topology_version,
-                    material_ids: child_materials.clone(),
-                    support_mask: vec![0u8; child_materials.len()],
-                    solid_count: source_cells.len(),
-                },
-            );
-            row.transition_id = ((state.actor_key as u64).wrapping_add(adoption_count as u64)
-                & u64::from(u32::MAX)) as u32;
-            row.source_kind = AlchemyRapierQuerySourceKind::StaticTerrain;
-            row.source_terrain_actor_key = state.actor_key;
-            row.source_terrain_chunk_x = state.chunk_x;
-            row.source_terrain_chunk_y = state.chunk_y;
-            row.source_terrain_world_origin_x = state.source_world_origin_x;
-            row.source_terrain_world_origin_y = state.source_world_origin_y;
-            row.source_terrain_revision = state.revision;
-            if state.solid_count > 0
-                && world.bodies.get(state.body).is_some()
-                && world.colliders.get(state.collider).is_some()
-            {
-                row.source_body_handle = handle_to_ffi(state.body);
-                row.source_body_packed_id = pack_body_handle(state.body);
-                row.source_collider_handle = collider_handle_to_ffi(state.collider);
-                row.source_collider_packed_id = pack_collider_handle(state.collider);
-            }
-            row.child_body_handle = handle_to_ffi(child_body);
-            row.child_body_packed_id = pack_body_handle(child_body);
-            row.child_collider_handle = collider_handle_to_ffi(child_collider_handle);
-            row.child_collider_packed_id = pack_collider_handle(child_collider_handle);
-            row.source_width = state.width.min(i32::MAX as u32) as i32;
-            row.source_height = state.height.min(i32::MAX as u32) as i32;
-            row.source_local_origin = ffi_vec(state.pixel_shape_local_origin);
-            row.source_solid_count = state.solid_count;
-            row.source_touched_cell_count = touched_source_cell_indices.len();
-            row.position = ffi_vec(body.center_of_mass());
-            row.rotation = body.rotation().angle();
-            row.linear_velocity = ffi_vec(body.linvel());
-            row.angular_velocity = body.angvel();
-            row.source_topology_revision = state.topology_revision;
-            row.source_topology_version = state.topology_version;
-            row.child_topology_revision = state.topology_revision;
-            row.child_topology_version = state.topology_version;
-            row.material_hash = material_hash(&state.material_ids);
-            let adoption = PendingBlastTransitionAdoption {
-                row,
-                touched_source_cell_indices: touched_source_cell_indices.to_vec(),
-                removed_source_cell_indices: Vec::new(),
-                source_cell_indices: source_cells,
-                child_occupancy_words: child_words,
-                child_material_ids: child_materials,
-            };
-            world
-                .pending_split_events
-                .push(pending_split_event_from_adoption(&adoption));
-            world.pending_blast_transition_adoptions.push(adoption);
-            adoption_count += 1;
-        }
-    }
-    adoption_count
 }
 
 fn pixel_result(
@@ -3679,733 +3416,6 @@ pub extern "C" fn alchemy_rapier_destroy_collider_by_id(
 }
 
 #[unsafe(no_mangle)]
-#[deprecated(note = "Legacy terrain ABI leaks project terrain logic; use raw voxel collider APIs.")]
-pub extern "C" fn alchemy_rapier_apply_terrain(
-    world: *mut AlchemyRapierWorld,
-    desc: AlchemyRapierTerrainDesc,
-) -> AlchemyRapierTerrainApplyResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return empty_terrain_apply_result(AlchemyRapierStatus::NullPointer);
-        };
-        if desc.width <= 0 || desc.height <= 0 {
-            let key = terrain_key(desc);
-            remove_terrain_chunk(world, key);
-            return AlchemyRapierTerrainApplyResult {
-                status: AlchemyRapierStatus::Ok,
-                solid_count: 0,
-                terrain_chunk_count: world.terrain_chunks.len(),
-                terrain_collider_count: world.terrain_by_collider.len(),
-            };
-        }
-        if !desc.pixel_size.is_finite() || desc.pixel_size <= 0.0 {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        if !desc.pixel_shape_local_origin.x.is_finite()
-            || !desc.pixel_shape_local_origin.y.is_finite()
-        {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-
-        let width = desc.width as u32;
-        let height = desc.height as u32;
-        let cell_count = (width as usize).saturating_mul(height as usize);
-        if cell_count == 0 {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        let expected_word_count = cell_count.div_ceil(64);
-        if desc.occupancy_words.is_null() || desc.occupancy_word_count < expected_word_count {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-
-        let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
-        let occupancy = occupancy_from_words(width, height, words);
-        let solid_count = occupancy.iter().filter(|occupied| **occupied).count();
-        let key = terrain_key(desc);
-        remove_terrain_chunk(world, key);
-        if solid_count == 0 {
-            return AlchemyRapierTerrainApplyResult {
-                status: AlchemyRapierStatus::Ok,
-                solid_count: 0,
-                terrain_chunk_count: world.terrain_chunks.len(),
-                terrain_collider_count: world.terrain_by_collider.len(),
-            };
-        }
-
-        let material_ids = if !desc.material_ids.is_null() && desc.material_id_count >= cell_count {
-            unsafe { slice::from_raw_parts(desc.material_ids, cell_count) }.to_vec()
-        } else {
-            vec![0; cell_count]
-        };
-        let support_mask = if !desc.support_mask.is_null() && desc.support_mask_count >= cell_count
-        {
-            unsafe { slice::from_raw_parts(desc.support_mask, cell_count) }.to_vec()
-        } else {
-            Vec::new()
-        };
-        let external_id = (0..cell_count)
-            .map(|index| index.min(u32::MAX as usize) as u32)
-            .collect::<Vec<_>>();
-        let input = VoxelAuthoringInput::new(
-            width,
-            height,
-            desc.pixel_size,
-            occupancy.clone(),
-            material_ids.clone(),
-            material_ids.clone(),
-            external_id,
-        );
-        let Ok(asset) = author_voxel_asset(input) else {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        };
-
-        let body_origin = Vector::new(desc.local_origin_x as f32, desc.local_origin_y as f32);
-        let pixel_shape_local_origin = vector(desc.pixel_shape_local_origin);
-        let mut shapes = Vec::with_capacity(solid_count);
-        for y in 0..height {
-            for x in 0..width {
-                let idx = (y as usize) * (width as usize) + (x as usize);
-                if !occupancy[idx] {
-                    continue;
-                }
-                let asset_center = Vector::new(
-                    (x as f32 + 0.5) * desc.pixel_size,
-                    (y as f32 + 0.5) * desc.pixel_size,
-                );
-                let center = body_origin
-                    + asset_point_to_body_local(
-                        width,
-                        height,
-                        desc.pixel_size,
-                        pixel_shape_local_origin,
-                        asset_center,
-                    );
-                shapes.push((
-                    Pose::from_translation(center),
-                    SharedShape::cuboid(desc.pixel_size * 0.5, desc.pixel_size * 0.5),
-                ));
-            }
-        }
-        if shapes.is_empty() {
-            return AlchemyRapierTerrainApplyResult {
-                status: AlchemyRapierStatus::Ok,
-                solid_count: 0,
-                terrain_chunk_count: world.terrain_chunks.len(),
-                terrain_collider_count: world.terrain_by_collider.len(),
-            };
-        }
-
-        let collider = ColliderBuilder::compound(shapes).build();
-        let collider_handle = world.colliders.insert(collider);
-        let state = TerrainChunkState {
-            asset,
-            collider: collider_handle,
-            chunk_x: desc.chunk_x,
-            chunk_y: desc.chunk_y,
-            source_world_origin_x: desc.source_world_origin_x,
-            source_world_origin_y: desc.source_world_origin_y,
-            local_origin_x: desc.local_origin_x,
-            local_origin_y: desc.local_origin_y,
-            pixel_shape_local_origin,
-            revision: desc.revision,
-            width,
-            height,
-            pixel_size: desc.pixel_size,
-            topology_revision: desc.topology_revision,
-            topology_version: desc.topology_version,
-            occupancy,
-            material_ids,
-            support_mask,
-            solid_count,
-        };
-        world.terrain_by_collider.insert(collider_handle, key);
-        world.terrain_chunks.insert(key, state);
-
-        AlchemyRapierTerrainApplyResult {
-            status: AlchemyRapierStatus::Ok,
-            solid_count,
-            terrain_chunk_count: world.terrain_chunks.len(),
-            terrain_collider_count: world.terrain_by_collider.len(),
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_terrain_apply_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
-#[deprecated(note = "Legacy terrain fracture ABI is project logic; do not use for new code.")]
-pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor(
-    world: *mut AlchemyRapierWorld,
-    desc: AlchemyRapierTerrainDesc,
-) -> AlchemyRapierTerrainApplyResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return empty_terrain_apply_result(AlchemyRapierStatus::NullPointer);
-        };
-        if desc.width <= 0 || desc.height <= 0 {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        if !desc.pixel_size.is_finite()
-            || desc.pixel_size <= 0.0
-            || !desc.pixel_shape_local_origin.x.is_finite()
-            || !desc.pixel_shape_local_origin.y.is_finite()
-        {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        let width = desc.width as u32;
-        let height = desc.height as u32;
-        let cell_count = (width as usize).saturating_mul(height as usize);
-        if cell_count == 0 {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        let expected_word_count = cell_count.div_ceil(64);
-        if desc.occupancy_words.is_null() || desc.occupancy_word_count < expected_word_count {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-
-        let actor_key = if desc.actor_key != 0 {
-            desc.actor_key
-        } else {
-            terrain_actor_key_from_desc(desc)
-        };
-        if actor_key == 0 {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        if has_pending_static_adoption_for_actor(world, actor_key) {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        if world.terrain_fracture_actors.contains_key(&actor_key) {
-            if desc.replace_existing == 0 {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            }
-            remove_terrain_fracture_actor(world, actor_key);
-        }
-
-        let words = unsafe { slice::from_raw_parts(desc.occupancy_words, expected_word_count) };
-        let occupancy = occupancy_from_words(width, height, words);
-        let solid_count = occupancy.iter().filter(|occupied| **occupied).count();
-        if solid_count == 0 {
-            return AlchemyRapierTerrainApplyResult {
-                status: AlchemyRapierStatus::Ok,
-                solid_count: 0,
-                terrain_chunk_count: world.terrain_chunks.len(),
-                terrain_collider_count: world.terrain_by_collider.len()
-                    + world.terrain_fracture_actor_by_collider.len(),
-            };
-        }
-        let material_ids = if !desc.material_ids.is_null() && desc.material_id_count >= cell_count {
-            unsafe { slice::from_raw_parts(desc.material_ids, cell_count) }.to_vec()
-        } else {
-            vec![0; cell_count]
-        };
-        let support_mask = if !desc.support_mask.is_null() && desc.support_mask_count >= cell_count
-        {
-            unsafe { slice::from_raw_parts(desc.support_mask, cell_count) }.to_vec()
-        } else {
-            vec![0; cell_count]
-        };
-        let external_id = (0..cell_count)
-            .map(|index| index.min(u32::MAX as usize) as u32)
-            .collect::<Vec<_>>();
-        let input = VoxelAuthoringInput::new(
-            width,
-            height,
-            desc.pixel_size,
-            occupancy.clone(),
-            material_ids.clone(),
-            material_ids.clone(),
-            external_id.clone(),
-        );
-        let Ok(asset) = author_voxel_asset(input) else {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        };
-
-        let pixel_shape_local_origin = vector(desc.pixel_shape_local_origin);
-        let touched_source_indices = occupancy
-            .iter()
-            .enumerate()
-            .filter_map(|(index, occupied)| {
-                (*occupied).then_some(index.min(i32::MAX as usize) as i32)
-            })
-            .collect::<Vec<_>>();
-        let unsupported_source_indices = occupancy
-            .iter()
-            .enumerate()
-            .filter_map(|(index, occupied)| {
-                (*occupied && support_mask.get(index).copied().unwrap_or(0) == 0).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let supported_occupancy = occupancy
-            .iter()
-            .enumerate()
-            .map(|(index, occupied)| {
-                *occupied && support_mask.get(index).copied().unwrap_or(0) != 0
-            })
-            .collect::<Vec<_>>();
-
-        let body_origin = Vector::new(desc.local_origin_x as f32, desc.local_origin_y as f32);
-        let retained_supported_count = supported_occupancy
-            .iter()
-            .filter(|occupied| **occupied)
-            .count();
-        let source_runtime_actor_collider = if retained_supported_count > 0 {
-            let source_input = VoxelAuthoringInput::new(
-                width,
-                height,
-                desc.pixel_size,
-                supported_occupancy,
-                material_ids.clone(),
-                material_ids.clone(),
-                external_id,
-            );
-            let Ok(source_asset) = author_voxel_asset(source_input) else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let source_runtime =
-                VoxelRuntime::instantiate(FxFamilyId(actor_key as u32), source_asset);
-            let source_actor = first_actor_id(&source_runtime);
-            let Some(source_collider) =
-                build_actor_collider(&source_runtime, source_actor, pixel_shape_local_origin)
-            else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            Some((source_runtime, source_actor, source_collider))
-        } else {
-            None
-        };
-        let retained_source_solid_count = retained_supported_count;
-        if retained_source_solid_count == 0 && unsupported_source_indices.len() != solid_count {
-            return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-        }
-
-        let mut source_body_for_row = None;
-        let mut source_collider_handle_for_row = None;
-        let mut reserved_empty_source_body = None;
-        if let Some((source_runtime, source_actor, source_collider)) = source_runtime_actor_collider
-        {
-            let source_body = world
-                .bodies
-                .insert(RigidBodyBuilder::fixed().translation(body_origin));
-            let source_collider_handle =
-                world
-                    .colliders
-                    .insert_with_parent(source_collider, source_body, &mut world.bodies);
-            let state = TerrainFractureActorState {
-                asset: source_runtime.asset().clone(),
-                runtime: source_runtime,
-                actor: source_actor,
-                body: source_body,
-                collider: source_collider_handle,
-                actor_key,
-                chunk_x: desc.chunk_x,
-                chunk_y: desc.chunk_y,
-                source_world_origin_x: desc.source_world_origin_x,
-                source_world_origin_y: desc.source_world_origin_y,
-                local_origin_x: desc.local_origin_x,
-                local_origin_y: desc.local_origin_y,
-                pixel_shape_local_origin,
-                revision: desc.revision,
-                width,
-                height,
-                pixel_size: desc.pixel_size,
-                topology_revision: desc.topology_revision,
-                topology_version: desc.topology_version,
-                material_ids: material_ids.clone(),
-                support_mask: support_mask.clone(),
-                solid_count: retained_source_solid_count,
-            };
-            world
-                .terrain_fracture_actor_by_collider
-                .insert(source_collider_handle, actor_key);
-            world.terrain_fracture_actors.insert(actor_key, state);
-            source_body_for_row = Some(source_body);
-            source_collider_handle_for_row = Some(source_collider_handle);
-        } else {
-            reserved_empty_source_body = Some(
-                world
-                    .bodies
-                    .insert(RigidBodyBuilder::fixed().translation(body_origin)),
-            );
-        }
-
-        let mut pending_adoption: Option<PendingBlastTransitionAdoption> = None;
-        if !unsupported_source_indices.is_empty() {
-            let full_runtime =
-                VoxelRuntime::instantiate(FxFamilyId(actor_key as u32), asset.clone());
-            let Some((mut row, source_cells, child_words, child_materials, child_source_com)) =
-                build_cropped_source_indices_payload(
-                    &full_runtime,
-                    &unsupported_source_indices,
-                    &material_ids,
-                    desc.topology_revision,
-                    desc.topology_version,
-                )
-            else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let child_local_origin = vector(row.child_local_origin);
-            let Some(child_asset) = cropped_pixel_asset_from_words(
-                row.child_width as u32,
-                row.child_height as u32,
-                row.child_pixel_size,
-                &child_words,
-                &child_materials,
-            ) else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let Some(child_collider) = build_pixel_collider(&child_asset, child_local_origin)
-            else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let source_pose = Pose::from_translation(body_origin);
-            let child_position = asset_point_to_world(
-                &source_pose,
-                width,
-                height,
-                desc.pixel_size,
-                pixel_shape_local_origin,
-                child_source_com,
-            );
-            let child_body = world
-                .bodies
-                .insert(RigidBodyBuilder::dynamic().translation(child_position));
-            let child_collider_handle =
-                world
-                    .colliders
-                    .insert_with_parent(child_collider, child_body, &mut world.bodies);
-            if let Some(body) = world.bodies.get_mut(child_body) {
-                body.set_additional_mass(0.0, true);
-                body.recompute_mass_properties_from_colliders(&world.colliders);
-            }
-            let Some(body) = world.bodies.get(child_body) else {
-                return empty_terrain_apply_result(AlchemyRapierStatus::InvalidArgument);
-            };
-            let child_runtime = VoxelRuntime::instantiate(
-                FxFamilyId(pack_body_handle(child_body) as u32),
-                child_asset.clone(),
-            );
-            let child_actor_state = first_actor_id(&child_runtime);
-            world.pixel_rigidbodies.insert(
-                child_body,
-                PixelRigidbodyState {
-                    asset: child_asset,
-                    runtime: child_runtime,
-                    actor: child_actor_state,
-                    collider: child_collider_handle,
-                    width: row.child_width.max(0) as u32,
-                    height: row.child_height.max(0) as u32,
-                    pixel_size: desc.pixel_size,
-                    local_origin: child_local_origin,
-                    topology_revision: desc.topology_revision,
-                    topology_version: desc.topology_version,
-                    material_ids: child_materials.clone(),
-                    support_mask: vec![0u8; child_materials.len()],
-                    solid_count: source_cells.len(),
-                },
-            );
-            row.transition_id = (actor_key as u64 & u64::from(u32::MAX)) as u32;
-            row.source_kind = AlchemyRapierQuerySourceKind::StaticTerrain;
-            row.source_terrain_actor_key = actor_key;
-            row.source_terrain_chunk_x = desc.chunk_x;
-            row.source_terrain_chunk_y = desc.chunk_y;
-            row.source_terrain_world_origin_x = desc.source_world_origin_x;
-            row.source_terrain_world_origin_y = desc.source_world_origin_y;
-            row.source_terrain_revision = desc.revision;
-            if let (Some(source_body), Some(source_collider_handle)) =
-                (source_body_for_row, source_collider_handle_for_row)
-            {
-                row.source_body_handle = handle_to_ffi(source_body);
-                row.source_body_packed_id = pack_body_handle(source_body);
-                row.source_collider_handle = collider_handle_to_ffi(source_collider_handle);
-                row.source_collider_packed_id = pack_collider_handle(source_collider_handle);
-            }
-            row.child_body_handle = handle_to_ffi(child_body);
-            row.child_body_packed_id = pack_body_handle(child_body);
-            row.child_collider_handle = collider_handle_to_ffi(child_collider_handle);
-            row.child_collider_packed_id = pack_collider_handle(child_collider_handle);
-            row.source_width = width.min(i32::MAX as u32) as i32;
-            row.source_height = height.min(i32::MAX as u32) as i32;
-            row.source_local_origin = ffi_vec(pixel_shape_local_origin);
-            row.source_solid_count = retained_source_solid_count;
-            row.source_touched_cell_count = touched_source_indices.len();
-            row.position = ffi_vec(body.center_of_mass());
-            row.rotation = body.rotation().angle();
-            row.linear_velocity = ffi_vec(body.linvel());
-            row.angular_velocity = body.angvel();
-            row.source_topology_revision = desc.topology_revision;
-            row.source_topology_version = desc.topology_version;
-            row.child_topology_revision = desc.topology_revision;
-            row.child_topology_version = desc.topology_version;
-            row.material_hash = material_hash(&material_ids);
-            pending_adoption = Some(PendingBlastTransitionAdoption {
-                row,
-                touched_source_cell_indices: touched_source_indices,
-                removed_source_cell_indices: Vec::new(),
-                source_cell_indices: source_cells,
-                child_occupancy_words: child_words,
-                child_material_ids: child_materials,
-            });
-        }
-
-        if let Some(reserved_body) = reserved_empty_source_body {
-            let _ = world.bodies.remove(
-                reserved_body,
-                &mut world.islands,
-                &mut world.colliders,
-                &mut world.impulse_joints,
-                &mut world.multibody_joints,
-                true,
-            );
-        }
-
-        if let Some(adoption) = pending_adoption {
-            world
-                .pending_split_events
-                .push(pending_split_event_from_adoption(&adoption));
-            world.pending_blast_transition_adoptions.push(adoption);
-        }
-        AlchemyRapierTerrainApplyResult {
-            status: AlchemyRapierStatus::Ok,
-            solid_count: retained_source_solid_count,
-            terrain_chunk_count: world.terrain_chunks.len(),
-            terrain_collider_count: world.terrain_by_collider.len()
-                + world.terrain_fracture_actor_by_collider.len(),
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_terrain_apply_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
-#[deprecated(note = "Legacy terrain fracture ABI is project logic; do not use for new code.")]
-pub extern "C" fn alchemy_rapier_destroy_terrain_fracture_actor(
-    world: *mut AlchemyRapierWorld,
-    actor_key: i64,
-) -> AlchemyRapierStatus {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return AlchemyRapierStatus::NullPointer;
-        };
-        if actor_key == 0 {
-            return AlchemyRapierStatus::InvalidArgument;
-        }
-        if has_pending_static_adoption_for_actor(world, actor_key) {
-            return AlchemyRapierStatus::InvalidArgument;
-        }
-        remove_terrain_fracture_actor(world, actor_key);
-        AlchemyRapierStatus::Ok
-    })) {
-        Ok(status) => status,
-        Err(_) => AlchemyRapierStatus::Panic,
-    }
-}
-
-#[unsafe(no_mangle)]
-#[deprecated(note = "Legacy terrain fracture ABI is project logic; do not use for new code.")]
-pub extern "C" fn alchemy_rapier_apply_terrain_fracture_actor_external_action(
-    world: *mut AlchemyRapierWorld,
-    desc: AlchemyRapierTerrainExternalActionDesc,
-) -> AlchemyRapierTerrainExternalActionResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return empty_terrain_external_action_result(AlchemyRapierStatus::NullPointer);
-        };
-        let demand = desc.demand.max(vector(desc.force).length());
-        if !desc.world_point.x.is_finite()
-            || !desc.world_point.y.is_finite()
-            || !desc.force.x.is_finite()
-            || !desc.force.y.is_finite()
-            || !desc.radius.is_finite()
-            || !desc.demand.is_finite()
-            || demand < 0.0
-        {
-            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        if terrain_external_action_source(desc.action_kind).is_none() {
-            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidArgument);
-        }
-        let Some(actor_key) = terrain_actor_key_for_external_action(world, desc) else {
-            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidHandle);
-        };
-        if has_pending_static_adoption_for_actor(world, actor_key) {
-            let retained_solid_count = world
-                .terrain_fracture_actors
-                .get(&actor_key)
-                .map_or(0, |state| state.solid_count);
-            return AlchemyRapierTerrainExternalActionResult {
-                status: AlchemyRapierStatus::Ok,
-                demand,
-                affected_cell_count: 0,
-                adoption_count: 0,
-                retained_solid_count,
-                actor_key,
-            };
-        }
-        let Some(mut state) = world.terrain_fracture_actors.remove(&actor_key) else {
-            return empty_terrain_external_action_result(AlchemyRapierStatus::InvalidHandle);
-        };
-        if demand < 1.0 {
-            let retained_solid_count = state.solid_count;
-            world.terrain_fracture_actors.insert(actor_key, state);
-            return AlchemyRapierTerrainExternalActionResult {
-                status: AlchemyRapierStatus::Ok,
-                demand,
-                affected_cell_count: 0,
-                adoption_count: 0,
-                retained_solid_count,
-                actor_key,
-            };
-        }
-
-        let force = vector(desc.force);
-        let action_world_point = vector(desc.world_point);
-        let Some((commands, touched_source_cell_indices)) =
-            terrain_actor_fracture_commands_for_external_action(
-                &state,
-                action_world_point,
-                force,
-                demand,
-                desc.action_kind,
-            )
-        else {
-            let retained_solid_count = state.solid_count;
-            world.terrain_fracture_actors.insert(actor_key, state);
-            return AlchemyRapierTerrainExternalActionResult {
-                status: AlchemyRapierStatus::Ok,
-                demand,
-                affected_cell_count: 0,
-                adoption_count: 0,
-                retained_solid_count,
-                actor_key,
-            };
-        };
-        let fracture_events = state.runtime.apply_fracture_commands(&commands);
-        if fracture_events.is_empty() {
-            world.terrain_fracture_actors.insert(actor_key, state);
-            return AlchemyRapierTerrainExternalActionResult {
-                status: AlchemyRapierStatus::Ok,
-                demand,
-                affected_cell_count: 0,
-                adoption_count: 0,
-                retained_solid_count: world
-                    .terrain_fracture_actors
-                    .get(&actor_key)
-                    .map_or(0, |state| state.solid_count),
-                actor_key,
-            };
-        }
-        let split_events = state.runtime.split_dirty_actors();
-        let child_adoption_count = if split_events.is_empty() {
-            0
-        } else {
-            world
-                .terrain_fracture_actor_by_collider
-                .remove(&state.collider);
-            let _ =
-                world
-                    .colliders
-                    .remove(state.collider, &mut world.islands, &mut world.bodies, true);
-
-            state.asset = state.runtime.asset().clone();
-            state.solid_count = actor_solid_count(&state.runtime, state.actor);
-            if state.solid_count > 0 {
-                let Some(source_collider) = build_actor_collider(
-                    &state.runtime,
-                    state.actor,
-                    state.pixel_shape_local_origin,
-                ) else {
-                    let _ = world.bodies.remove(
-                        state.body,
-                        &mut world.islands,
-                        &mut world.colliders,
-                        &mut world.impulse_joints,
-                        &mut world.multibody_joints,
-                        true,
-                    );
-                    return empty_terrain_external_action_result(
-                        AlchemyRapierStatus::InvalidArgument,
-                    );
-                };
-                let source_collider_handle = world.colliders.insert_with_parent(
-                    source_collider,
-                    state.body,
-                    &mut world.bodies,
-                );
-                state.collider = source_collider_handle;
-                world
-                    .terrain_fracture_actor_by_collider
-                    .insert(source_collider_handle, actor_key);
-            }
-            create_pending_terrain_actor_split_adoptions(
-                world,
-                &state,
-                &split_events,
-                &touched_source_cell_indices,
-            )
-        };
-        let adoption_count = child_adoption_count;
-        let retained_solid_count = state.solid_count;
-        if retained_solid_count > 0 {
-            world.terrain_fracture_actors.insert(actor_key, state);
-        } else {
-            let _ = world.bodies.remove(
-                state.body,
-                &mut world.islands,
-                &mut world.colliders,
-                &mut world.impulse_joints,
-                &mut world.multibody_joints,
-                true,
-            );
-        }
-        AlchemyRapierTerrainExternalActionResult {
-            status: AlchemyRapierStatus::Ok,
-            demand,
-            affected_cell_count: fracture_events.len(),
-            adoption_count,
-            retained_solid_count,
-            actor_key,
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_terrain_external_action_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
-#[deprecated(
-    note = "Legacy terrain ABI leaks project terrain logic; use collider destruction for new code."
-)]
-pub extern "C" fn alchemy_rapier_clear_terrain(
-    world: *mut AlchemyRapierWorld,
-    chunk_x: i32,
-    chunk_y: i32,
-) -> AlchemyRapierTerrainApplyResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return empty_terrain_apply_result(AlchemyRapierStatus::NullPointer);
-        };
-        remove_terrain_chunk(
-            world,
-            TerrainKey {
-                x: chunk_x,
-                y: chunk_y,
-            },
-        );
-        AlchemyRapierTerrainApplyResult {
-            status: AlchemyRapierStatus::Ok,
-            solid_count: 0,
-            terrain_chunk_count: world.terrain_chunks.len(),
-            terrain_collider_count: world.terrain_by_collider.len(),
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_terrain_apply_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_body_state(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierRigidBodyHandle,
@@ -4570,53 +3580,6 @@ where
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_read_blast_transition_adoption_rows(
-    world: *mut AlchemyRapierWorld,
-    rows: *mut AlchemyRapierBlastTransitionAdoptionRow,
-    row_capacity: usize,
-) -> AlchemyRapierBlastTransitionAdoptionReadResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if rows.is_null() && row_capacity > 0 {
-            return AlchemyRapierBlastTransitionAdoptionReadResult {
-                status: AlchemyRapierStatus::NullPointer,
-                row_count: 0,
-                written_count: 0,
-            };
-        }
-        let Ok(world) = to_inner(world) else {
-            return AlchemyRapierBlastTransitionAdoptionReadResult {
-                status: AlchemyRapierStatus::NullPointer,
-                row_count: 0,
-                written_count: 0,
-            };
-        };
-        let row_count = world.pending_blast_transition_adoptions.len();
-        let written_count = row_count.min(row_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(rows, written_count) };
-            for (slot, adoption) in out
-                .iter_mut()
-                .zip(world.pending_blast_transition_adoptions.iter())
-            {
-                *slot = adoption.row;
-            }
-        }
-        AlchemyRapierBlastTransitionAdoptionReadResult {
-            status: AlchemyRapierStatus::Ok,
-            row_count,
-            written_count,
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => AlchemyRapierBlastTransitionAdoptionReadResult {
-            status: AlchemyRapierStatus::Panic,
-            row_count: 0,
-            written_count: 0,
-        },
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_read_split_event_rows(
     world: *mut AlchemyRapierWorld,
     rows: *mut AlchemyRapierSplitEventRow,
@@ -4657,157 +3620,6 @@ pub extern "C" fn alchemy_rapier_read_split_event_rows(
             row_count: 0,
             written_count: 0,
         },
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_cells(
-    world: *mut AlchemyRapierWorld,
-    row_index: usize,
-    cells: *mut i32,
-    cell_capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if cells.is_null() && cell_capacity > 0 {
-            return 0;
-        }
-        let Ok(world) = to_inner(world) else {
-            return 0;
-        };
-        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
-            return 0;
-        };
-        let written_count = adoption.source_cell_indices.len().min(cell_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
-            out.copy_from_slice(&adoption.source_cell_indices[..written_count]);
-        }
-        written_count
-    })) {
-        Ok(result) => result,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_touched_cells(
-    world: *mut AlchemyRapierWorld,
-    row_index: usize,
-    cells: *mut i32,
-    cell_capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if cells.is_null() && cell_capacity > 0 {
-            return 0;
-        }
-        let Ok(world) = to_inner(world) else {
-            return 0;
-        };
-        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
-            return 0;
-        };
-        let written_count = adoption
-            .touched_source_cell_indices
-            .len()
-            .min(cell_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
-            out.copy_from_slice(&adoption.touched_source_cell_indices[..written_count]);
-        }
-        written_count
-    })) {
-        Ok(result) => result,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_removed_cells(
-    world: *mut AlchemyRapierWorld,
-    row_index: usize,
-    cells: *mut i32,
-    cell_capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if cells.is_null() && cell_capacity > 0 {
-            return 0;
-        }
-        let Ok(world) = to_inner(world) else {
-            return 0;
-        };
-        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
-            return 0;
-        };
-        let written_count = adoption
-            .removed_source_cell_indices
-            .len()
-            .min(cell_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(cells, written_count) };
-            out.copy_from_slice(&adoption.removed_source_cell_indices[..written_count]);
-        }
-        written_count
-    })) {
-        Ok(result) => result,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_occupancy_words(
-    world: *mut AlchemyRapierWorld,
-    row_index: usize,
-    words: *mut u64,
-    word_capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if words.is_null() && word_capacity > 0 {
-            return 0;
-        }
-        let Ok(world) = to_inner(world) else {
-            return 0;
-        };
-        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
-            return 0;
-        };
-        let written_count = adoption.child_occupancy_words.len().min(word_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(words, written_count) };
-            out.copy_from_slice(&adoption.child_occupancy_words[..written_count]);
-        }
-        written_count
-    })) {
-        Ok(result) => result,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_copy_blast_transition_adoption_material_ids(
-    world: *mut AlchemyRapierWorld,
-    row_index: usize,
-    material_ids: *mut u16,
-    material_id_capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        if material_ids.is_null() && material_id_capacity > 0 {
-            return 0;
-        }
-        let Ok(world) = to_inner(world) else {
-            return 0;
-        };
-        let Some(adoption) = world.pending_blast_transition_adoptions.get(row_index) else {
-            return 0;
-        };
-        let written_count = adoption.child_material_ids.len().min(material_id_capacity);
-        if written_count > 0 {
-            let out = unsafe { slice::from_raw_parts_mut(material_ids, written_count) };
-            out.copy_from_slice(&adoption.child_material_ids[..written_count]);
-        }
-        written_count
-    })) {
-        Ok(result) => result,
-        Err(_) => 0,
     }
 }
 
@@ -4978,76 +3790,6 @@ pub extern "C" fn alchemy_rapier_acknowledge_split_event(
             return AlchemyRapierStatus::InvalidHandle;
         };
         world.pending_split_events.remove(index);
-        if let Some(adoption_index) =
-            world
-                .pending_blast_transition_adoptions
-                .iter()
-                .position(|adoption| {
-                    let row = adoption.row;
-                    row.transition_id == transition_id
-                        && row.source_kind == source_kind
-                        && row.source_body_packed_id == source_body_packed_id
-                        && row.source_terrain_actor_key == source_terrain_actor_key
-                })
-        {
-            world
-                .pending_blast_transition_adoptions
-                .remove(adoption_index);
-        }
-        AlchemyRapierStatus::Ok
-    })) {
-        Ok(status) => status,
-        Err(_) => AlchemyRapierStatus::Panic,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_acknowledge_blast_transition_adoptions(
-    world: *mut AlchemyRapierWorld,
-    acknowledged_count: usize,
-) -> AlchemyRapierStatus {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(_world) = to_inner(world) else {
-            return AlchemyRapierStatus::NullPointer;
-        };
-        if acknowledged_count != 0 {
-            return AlchemyRapierStatus::InvalidArgument;
-        }
-        AlchemyRapierStatus::Ok
-    })) {
-        Ok(status) => status,
-        Err(_) => AlchemyRapierStatus::Panic,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_rapier_acknowledge_blast_transition_adoption(
-    world: *mut AlchemyRapierWorld,
-    transition_id: u32,
-    child_body_packed_id: u64,
-    source_kind: AlchemyRapierQuerySourceKind,
-    source_terrain_actor_key: i64,
-    source_body_packed_id: u64,
-) -> AlchemyRapierStatus {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_inner(world) else {
-            return AlchemyRapierStatus::NullPointer;
-        };
-        let Some(index) = world
-            .pending_blast_transition_adoptions
-            .iter()
-            .position(|adoption| {
-                let row = adoption.row;
-                row.transition_id == transition_id
-                    && row.child_body_packed_id == child_body_packed_id
-                    && row.source_kind == source_kind
-                    && row.source_terrain_actor_key == source_terrain_actor_key
-                    && row.source_body_packed_id == source_body_packed_id
-            })
-        else {
-            return AlchemyRapierStatus::InvalidHandle;
-        };
-        world.pending_blast_transition_adoptions.remove(index);
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -5653,6 +4395,458 @@ where
         Ok(status) => status,
         Err(_) => AlchemyRapierStatus::Panic,
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_create() -> *mut AlchemyFxRapierWorld {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let world = AlchemyFxRapierWorldInner {
+            world: FxRapierWorld2D::new(),
+            last_step: None,
+            snapshot_scratch: Vec::new(),
+        };
+        Box::into_raw(Box::new(world)).cast::<AlchemyFxRapierWorld>()
+    })) {
+        Ok(world) => world,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_destroy(world: *mut AlchemyFxRapierWorld) {
+    if !world.is_null() {
+        unsafe {
+            drop(Box::from_raw(world.cast::<AlchemyFxRapierWorldInner>()));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_set_gravity(
+    world: *mut AlchemyFxRapierWorld,
+    gravity: AlchemyRapierVec2,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        world
+            .world
+            .set_gravity(vector![gravity.x, gravity.y].into());
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_set_timestep(
+    world: *mut AlchemyFxRapierWorld,
+    dt: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !dt.is_finite() || dt <= 0.0 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        world.world.integration_parameters_mut().dt = dt;
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_set_snapshot_mode(
+    world: *mut AlchemyFxRapierWorld,
+    mode: AlchemyFxSnapshotMode,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        world.world.set_snapshot_mode(snapshot_mode_from_ffi(mode));
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_asset2d_author(
+    desc: AlchemyFxVoxelDestructibleDesc,
+) -> AlchemyFxAsset2DCreateResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        match authored_fx_asset_from_desc(desc) {
+            Ok(asset) => AlchemyFxAsset2DCreateResult {
+                status: AlchemyRapierStatus::Ok,
+                asset: Box::into_raw(Box::new(AlchemyFxAsset2DInner { asset }))
+                    .cast::<AlchemyFxAsset2D>(),
+            },
+            Err(status) => empty_fx_asset_result(status),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_fx_asset_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_asset2d_destroy(asset: *mut AlchemyFxAsset2D) {
+    if !asset.is_null() {
+        unsafe {
+            drop(Box::from_raw(asset.cast::<AlchemyFxAsset2DInner>()));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_add_destructible(
+    world: *mut AlchemyFxRapierWorld,
+    family_id: u32,
+    asset: *const AlchemyFxAsset2D,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let Ok(asset) = to_fx_asset(asset) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        match world
+            .world
+            .add_destructible(FxFamilyId(family_id), asset.asset.clone())
+        {
+            Ok(()) => AlchemyRapierStatus::Ok,
+            Err(error) => fx_error_status(error),
+        }
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_queue_fracture_field(
+    world: *mut AlchemyFxRapierWorld,
+    desc: AlchemyFxFractureFieldDesc,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !desc.radius.is_finite()
+            || desc.radius < 0.0
+            || !desc.center.x.is_finite()
+            || !desc.center.y.is_finite()
+            || !desc.force.x.is_finite()
+            || !desc.force.y.is_finite()
+            || !desc.health_loss.is_finite()
+            || !desc.effective_length_loss.is_finite()
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let center = Vec2::new(desc.center.x, desc.center.y);
+        let mut field = match desc.mode {
+            AlchemyFxFractureFieldMode::Stress => {
+                FractureField2D::stress(center, desc.radius, Vec2::new(desc.force.x, desc.force.y))
+            }
+            AlchemyFxFractureFieldMode::DirectDamage => {
+                FractureField2D::direct_damage(center, desc.radius, desc.health_loss)
+                    .with_effective_length_loss(desc.effective_length_loss)
+            }
+        }
+        .with_source(damage_source_from_ffi(desc.source));
+        if desc.has_family != 0 {
+            field = field.with_family(FxFamilyId(desc.family_id));
+        }
+        world.world.queue_fracture_field(field);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_clear_fracture_fields(
+    world: *mut AlchemyFxRapierWorld,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        world.world.clear_fracture_fields();
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_step(
+    world: *mut AlchemyFxRapierWorld,
+    out_report: *mut AlchemyFxStepReport,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        match world.world.step_with_diagnostics() {
+            Ok(step) => {
+                let budget = step.diagnostics.budget;
+                let report = AlchemyFxStepReport {
+                    status: AlchemyRapierStatus::Ok,
+                    tick: world.world.tick(),
+                    quick_impact_count: step.report.quick_impacts.len(),
+                    contact_impulse_count: step.report.contact_impulses.len(),
+                    joint_feedback_count: step.report.joint_feedback.len(),
+                    fracture_field_effect_count: step.report.fracture_field_effects.len(),
+                    stress_input_count: step.report.stress_inputs.len(),
+                    fracture_event_count: step.report.fracture_events.len(),
+                    split_event_count: step.report.split_events.len(),
+                    impulse_joint_handle_replacement_count: step
+                        .report
+                        .impulse_joint_handle_replacements
+                        .len(),
+                    occupied_voxel_count: budget
+                        .map(|budget| budget.occupied_voxels)
+                        .unwrap_or_default(),
+                    occupied_voxel_budget: budget
+                        .map(|budget| budget.occupied_voxel_budget)
+                        .unwrap_or_default(),
+                    support_node_count: budget
+                        .map(|budget| budget.support_nodes)
+                        .unwrap_or_default(),
+                    support_node_budget: budget
+                        .map(|budget| budget.support_node_budget)
+                        .unwrap_or_default(),
+                    active_body_count: budget
+                        .map(|budget| budget.active_bodies)
+                        .unwrap_or_default(),
+                    active_body_budget: budget
+                        .map(|budget| budget.active_body_budget)
+                        .unwrap_or_default(),
+                };
+                world.last_step = Some(step);
+                if !out_report.is_null() {
+                    unsafe {
+                        *out_report = report;
+                    }
+                }
+                AlchemyRapierStatus::Ok
+            }
+            Err(error) => fx_error_status(error),
+        }
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_read_split_event_rows(
+    world: *mut AlchemyFxRapierWorld,
+    rows: *mut AlchemyFxSplitEventRow,
+    capacity: usize,
+) -> AlchemyFxSplitEventReadResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyFxSplitEventReadResult {
+                status: AlchemyRapierStatus::NullPointer,
+                row_count: 0,
+                written_count: 0,
+            };
+        };
+        let Some(events) = fx_split_events(world) else {
+            return AlchemyFxSplitEventReadResult {
+                status: AlchemyRapierStatus::Ok,
+                row_count: 0,
+                written_count: 0,
+            };
+        };
+        let written_count = if rows.is_null() {
+            0
+        } else {
+            events.len().min(capacity)
+        };
+        for (index, event) in events.iter().take(written_count).enumerate() {
+            unsafe {
+                *rows.add(index) = AlchemyFxSplitEventRow {
+                    event_id: event.event_id.0,
+                    family_id: event.family.0,
+                    parent_actor_id: event.parent_actor.0,
+                    kept_actor_id: event.kept_actor.0,
+                    created_child_count: event.created_children.len(),
+                    fragment_count: event.fragments.len(),
+                    kept_node_count: event.kept_fragment.len(),
+                };
+            }
+        }
+        AlchemyFxSplitEventReadResult {
+            status: AlchemyRapierStatus::Ok,
+            row_count: events.len(),
+            written_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => AlchemyFxSplitEventReadResult {
+            status: AlchemyRapierStatus::Panic,
+            row_count: 0,
+            written_count: 0,
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_copy_split_event_created_children(
+    world: *mut AlchemyFxRapierWorld,
+    row_index: usize,
+    actors: *mut u32,
+    capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return 0;
+        };
+        fx_split_events(world)
+            .and_then(|events| events.get(row_index))
+            .map(|event| {
+                copy_u32_slice_to_ffi(
+                    event.created_children.iter().map(|actor| actor.0),
+                    actors,
+                    capacity,
+                )
+            })
+            .unwrap_or(0)
+    })) {
+        Ok(written) => written,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_copy_split_event_kept_nodes(
+    world: *mut AlchemyFxRapierWorld,
+    row_index: usize,
+    nodes: *mut u32,
+    capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return 0;
+        };
+        fx_split_events(world)
+            .and_then(|events| events.get(row_index))
+            .map(|event| {
+                copy_u32_slice_to_ffi(
+                    event.kept_fragment.iter().map(|node| node.0),
+                    nodes,
+                    capacity,
+                )
+            })
+            .unwrap_or(0)
+    })) {
+        Ok(written) => written,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_copy_split_event_fragment_nodes(
+    world: *mut AlchemyFxRapierWorld,
+    row_index: usize,
+    fragment_index: usize,
+    nodes: *mut u32,
+    capacity: usize,
+) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return 0;
+        };
+        fx_split_events(world)
+            .and_then(|events| events.get(row_index))
+            .and_then(|event| event.fragments.get(fragment_index))
+            .map(|fragment| {
+                copy_u32_slice_to_ffi(fragment.iter().map(|node| node.0), nodes, capacity)
+            })
+            .unwrap_or(0)
+    })) {
+        Ok(written) => written,
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_capture_snapshot(
+    world: *mut AlchemyFxRapierWorld,
+    out_slice: *mut AlchemyFxByteSlice,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        match world.world.snapshot() {
+            Ok(bytes) => {
+                world.snapshot_scratch = bytes;
+                if !out_slice.is_null() {
+                    unsafe {
+                        *out_slice = AlchemyFxByteSlice {
+                            data: world.snapshot_scratch.as_ptr(),
+                            len: world.snapshot_scratch.len(),
+                        };
+                    }
+                }
+                AlchemyRapierStatus::Ok
+            }
+            Err(error) => fx_error_status(error),
+        }
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_restore_snapshot(
+    bytes: *const u8,
+    len: usize,
+) -> *mut AlchemyFxRapierWorld {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if bytes.is_null() && len != 0 {
+            return ptr::null_mut();
+        }
+        let bytes = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(bytes, len) }
+        };
+        match FxRapierWorld2D::restore_snapshot(bytes) {
+            Ok(world) => Box::into_raw(Box::new(AlchemyFxRapierWorldInner {
+                world,
+                last_step: None,
+                snapshot_scratch: Vec::new(),
+            }))
+            .cast::<AlchemyFxRapierWorld>(),
+            Err(_) => ptr::null_mut(),
+        }
+    })) {
+        Ok(world) => world,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_version_string() -> *const c_char {
+    concat!("alchemy_fx_rapier_ffi ", env!("CARGO_PKG_VERSION"), "\0")
+        .as_ptr()
+        .cast::<c_char>()
 }
 
 #[unsafe(no_mangle)]
