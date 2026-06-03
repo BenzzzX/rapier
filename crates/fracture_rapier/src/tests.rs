@@ -16,6 +16,7 @@ use crate::contact_map::{ContactPairSide, collider_key, map_contact_pair};
 use crate::snapshot::{
     PrestressBaselineTargetSnapshot, decode_world_snapshot, encode_world_snapshot,
 };
+use crate::world::{FxActorAppliedStaticAnchorPolicy, FxActorBodyType};
 use crate::{
     ActorPhysicsHandles, ColliderLodSettings, ContactMaterialProperties,
     DynamicStructuralConnectionDesc, FractureField2D, FractureFieldMode, FxRapierError,
@@ -141,6 +142,83 @@ fn four_node_line_asset() -> fracture_voxel::AuthoredVoxelAsset {
     input.support_node_hint = Some(vec![Some(0), Some(1), Some(2), Some(3)]);
     input.default_bond_health = 1.0;
     author_voxel_asset(input).unwrap()
+}
+
+fn line_asset_from_occupancy(occupancy: &[bool]) -> fracture_voxel::AuthoredVoxelAsset {
+    let mut input = VoxelAuthoringInput::new(
+        occupancy.len() as u32,
+        1,
+        1.0,
+        occupancy.to_vec(),
+        occupancy
+            .iter()
+            .map(|occupied| if *occupied { 1 } else { 0 })
+            .collect(),
+        occupancy
+            .iter()
+            .map(|occupied| if *occupied { 5 } else { 0 })
+            .collect(),
+        (0..occupancy.len() as u32).collect(),
+    );
+    input.support_node_hint = Some(
+        occupancy
+            .iter()
+            .enumerate()
+            .map(|(index, occupied)| occupied.then_some(index as u32))
+            .collect(),
+    );
+    input.default_bond_health = 1.0;
+    input.default_tension_limit = 0.01;
+    input.default_shear_limit = 0.01;
+    author_voxel_asset(input).unwrap()
+}
+
+#[test]
+fn update_destructible_from_voxels_adds_to_neighbor_actor() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(
+            family,
+            line_asset_from_occupancy(&[true, true, false, false]),
+        )
+        .unwrap();
+
+    world
+        .update_destructible_from_voxels(
+            family,
+            line_asset_from_occupancy(&[true, true, true, false]),
+        )
+        .unwrap();
+
+    let actor_count = world.family(family).unwrap().actors().count();
+    assert_eq!(actor_count, 1);
+}
+
+#[test]
+fn update_destructible_from_voxels_rejects_cross_actor_bridge() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world
+        .add_destructible(family, line_asset_from_occupancy(&[true, true, true, true]))
+        .unwrap();
+    world
+        .update_destructible_from_voxels(
+            family,
+            line_asset_from_occupancy(&[true, false, true, true]),
+        )
+        .unwrap();
+    assert_eq!(world.family(family).unwrap().actors().count(), 2);
+
+    let err = world
+        .update_destructible_from_voxels(
+            family,
+            line_asset_from_occupancy(&[true, true, true, true]),
+        )
+        .unwrap_err();
+
+    assert_eq!(err, FxRapierError::InvalidVoxelUpdate);
+    assert_eq!(world.family(family).unwrap().actors().count(), 2);
 }
 
 fn two_by_two_four_node_asset() -> fracture_voxel::AuthoredVoxelAsset {
@@ -490,6 +568,61 @@ fn static_anchor_policy_moves_to_split_child() {
 }
 
 #[test]
+fn actor_state_readback_tracks_split_anchor_policy_migration() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, four_node_line_asset())
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(9, 3))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let before = world.read_actor_state(family, FxActorId(0)).unwrap();
+    assert_eq!(before.body_type, FxActorBodyType::Fixed);
+    assert!(before.has_body);
+    assert!(before.has_collider);
+    assert_eq!(
+        before.applied_static_anchor_policy,
+        FxActorAppliedStaticAnchorPolicy::Fixed
+    );
+    assert_eq!(before.live_external_anchor_count, 1);
+    assert_eq!(before.live_non_preserve_static_anchor_count, 1);
+    assert_eq!(before.occupied_node_count, 4);
+
+    let split = world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_bond_command(0, family, FxActorId(0), BondId(2))],
+        )
+        .unwrap();
+
+    assert_eq!(split.len(), 1);
+    assert_eq!(split[0].created_children, vec![FxActorId(1)]);
+    let kept = world.read_actor_state(family, FxActorId(0)).unwrap();
+    let child = world.read_actor_state(family, FxActorId(1)).unwrap();
+    assert_eq!(kept.body_type, FxActorBodyType::Dynamic);
+    assert_eq!(
+        kept.applied_static_anchor_policy,
+        FxActorAppliedStaticAnchorPolicy::None
+    );
+    assert_eq!(kept.live_external_anchor_count, 0);
+    assert_eq!(kept.live_non_preserve_static_anchor_count, 0);
+    assert_eq!(child.body_type, FxActorBodyType::Fixed);
+    assert_eq!(
+        child.applied_static_anchor_policy,
+        FxActorAppliedStaticAnchorPolicy::Fixed
+    );
+    assert_eq!(child.live_external_anchor_count, 1);
+    assert_eq!(child.live_non_preserve_static_anchor_count, 1);
+}
+
+#[test]
 fn static_anchor_grouping_prevents_spurious_split() {
     let family = FxFamilyId(1);
     let mut world = FxRapierWorld2D::new();
@@ -568,6 +701,54 @@ fn broken_static_anchor_clears_body_policy() {
         world.rigid_bodies().get(actor.body).unwrap().is_dynamic(),
         "broken external bond must release the temporary anchor body policy"
     );
+}
+
+#[test]
+fn actor_state_readback_clears_broken_static_anchor_policy() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, single_node_asset(7))
+        .unwrap();
+    world
+        .connect_static_anchor(
+            family,
+            StaticAnchorConnectionDesc::new(static_anchor_desc(11, 0))
+                .with_body_policy(StaticAnchorBodyPolicy::Fixed),
+        )
+        .unwrap();
+
+    let anchored = world.read_actor_state(family, FxActorId(0)).unwrap();
+    assert_eq!(anchored.body_type, FxActorBodyType::Fixed);
+    assert_eq!(
+        anchored.applied_static_anchor_policy,
+        FxActorAppliedStaticAnchorPolicy::Fixed
+    );
+    assert_eq!(anchored.live_external_anchor_count, 1);
+    assert_eq!(anchored.live_non_preserve_static_anchor_count, 1);
+
+    let split = world
+        .fracture_and_sync_for_test(
+            family,
+            &[break_external_bond_command(
+                0,
+                family,
+                FxActorId(0),
+                ExternalBondId(11),
+            )],
+        )
+        .unwrap();
+
+    assert!(split.is_empty());
+    let released = world.read_actor_state(family, FxActorId(0)).unwrap();
+    assert_eq!(released.body_type, FxActorBodyType::Dynamic);
+    assert_eq!(
+        released.applied_static_anchor_policy,
+        FxActorAppliedStaticAnchorPolicy::None
+    );
+    assert_eq!(released.live_external_anchor_count, 0);
+    assert_eq!(released.live_non_preserve_static_anchor_count, 0);
 }
 
 #[test]

@@ -342,6 +342,14 @@ impl AuthoredVoxelAsset {
         &self.external_id
     }
 
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
     pub fn orientation_map(&self) -> Option<&[u16]> {
         self.orientation.as_deref()
     }
@@ -407,6 +415,9 @@ pub enum RuntimeEdit {
         actor: FxActorId,
         voxels: Vec<VoxelAdd>,
     },
+    SetVoxels {
+        voxels: Vec<VoxelAdd>,
+    },
     SetMaterial {
         voxels: Vec<GridCoord>,
         fracture_material: u16,
@@ -428,6 +439,17 @@ pub struct RepairReport {
     pub unaffected_region_preserved: bool,
 }
 
+struct RuntimeUpdateState {
+    occupancy: Vec<bool>,
+    fracture_material: Vec<u16>,
+    contact_material: Vec<u16>,
+    external_id: Vec<u32>,
+    orientation: Option<Vec<u16>>,
+    voxel_owner: Vec<Option<FxActorId>>,
+    edited: Vec<GridCoord>,
+    dirty_actors: BTreeSet<FxActorId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnchangedBondProof {
     pub old_bond: BondId,
@@ -447,6 +469,10 @@ pub struct VoxelRuntime {
 impl VoxelRuntime {
     pub fn instantiate(family_id: FxFamilyId, asset: AuthoredVoxelAsset) -> Self {
         let family = FxFamily::instantiate(family_id, asset.core.clone());
+        Self::from_family(asset, family)
+    }
+
+    pub fn from_family(asset: AuthoredVoxelAsset, family: FxFamily) -> Self {
         let mut voxel_owner = vec![None; cell_count(asset.width, asset.height)];
         for coord in all_coords(asset.width, asset.height) {
             let idx = index(asset.width, coord);
@@ -481,6 +507,10 @@ impl VoxelRuntime {
         &self.family
     }
 
+    pub fn family_mut(&mut self) -> &mut FxFamily {
+        &mut self.family
+    }
+
     pub fn asset(&self) -> &AuthoredVoxelAsset {
         &self.asset
     }
@@ -500,6 +530,127 @@ impl VoxelRuntime {
         fracture_core::split_dirty_actors(&mut self.family)
     }
 
+    pub fn apply_asset_update(
+        &mut self,
+        asset: AuthoredVoxelAsset,
+    ) -> Result<RepairReport, VoxelError> {
+        let old_asset = self.asset.clone();
+        if old_asset.width != asset.width || old_asset.height != asset.height {
+            return Err(VoxelError::AssetDimensionMismatch {
+                expected_width: old_asset.width,
+                expected_height: old_asset.height,
+                actual_width: asset.width,
+                actual_height: asset.height,
+            });
+        }
+
+        let old_family = self.family.clone();
+        let old_voxel_owner = self.voxel_owner.clone();
+        let old_node_lineage = self.node_lineage.clone();
+        let old_dirty_actors = old_family.dirty_actors().collect::<BTreeSet<_>>();
+        let old_occupancy = old_asset.occupancy();
+        let new_occupancy = asset.occupancy();
+        let mut state = RuntimeUpdateState {
+            occupancy: new_occupancy.clone(),
+            fracture_material: asset.fracture_material.clone(),
+            contact_material: asset.contact_material.clone(),
+            external_id: asset.external_id.clone(),
+            orientation: asset.orientation.clone(),
+            voxel_owner: old_voxel_owner.clone(),
+            edited: Vec::new(),
+            dirty_actors: BTreeSet::new(),
+        };
+        let mut added_voxels = BTreeSet::new();
+
+        for (cell_index, new_occupied) in new_occupancy.iter().copied().enumerate() {
+            let coord = GridCoord::new(
+                (cell_index as u32) % asset.width,
+                (cell_index as u32) / asset.width,
+            );
+            let old_occupied = old_occupancy.get(cell_index).copied().unwrap_or(false);
+            match (old_occupied, new_occupied) {
+                (true, false) => {
+                    if let Some(actor) = old_voxel_owner[cell_index] {
+                        state.dirty_actors.insert(actor);
+                    }
+                    state.voxel_owner[cell_index] = None;
+                    state.edited.push(coord);
+                }
+                (false, true) => {
+                    state.voxel_owner[cell_index] = None;
+                    state.edited.push(coord);
+                    added_voxels.insert(coord);
+                }
+                (true, true) => {
+                    let old_metadata = old_asset.voxel_metadata(coord)?;
+                    let new_metadata = asset.voxel_metadata(coord)?;
+                    if old_metadata.fracture_material != new_metadata.fracture_material
+                        || old_metadata.contact_material != new_metadata.contact_material
+                        || old_metadata.external_id != new_metadata.external_id
+                        || old_metadata.orientation != new_metadata.orientation
+                    {
+                        if let Some(actor) = old_voxel_owner[cell_index] {
+                            state.dirty_actors.insert(actor);
+                        }
+                        state.edited.push(coord);
+                    }
+                }
+                (false, false) => {
+                    state.voxel_owner[cell_index] = None;
+                }
+            }
+        }
+
+        let mut visited = BTreeSet::new();
+        for start in added_voxels.iter().copied() {
+            if !visited.insert(start) {
+                continue;
+            }
+
+            let mut owner = None;
+            let mut stack = vec![start];
+            let mut component = Vec::new();
+            while let Some(coord) = stack.pop() {
+                component.push(coord);
+                for neighbor in four_neighbors(asset.width, asset.height, coord) {
+                    if added_voxels.contains(&neighbor) {
+                        if visited.insert(neighbor) {
+                            stack.push(neighbor);
+                        }
+                        continue;
+                    }
+
+                    let neighbor_index = index(asset.width, neighbor);
+                    if old_occupancy.get(neighbor_index).copied().unwrap_or(false)
+                        && new_occupancy.get(neighbor_index).copied().unwrap_or(false)
+                    {
+                        let neighbor_owner = old_voxel_owner[neighbor_index]
+                            .ok_or(VoxelError::MissingVoxelUpdateOwner(neighbor))?;
+                        if owner.is_some_and(|current| current != neighbor_owner) {
+                            return Err(VoxelError::AmbiguousVoxelUpdateOwner(coord));
+                        }
+                        owner = Some(neighbor_owner);
+                    }
+                }
+            }
+
+            let owner = owner.ok_or(VoxelError::MissingVoxelUpdateOwner(start))?;
+            state.dirty_actors.insert(owner);
+            for coord in component {
+                state.voxel_owner[index(asset.width, coord)] = Some(owner);
+            }
+        }
+
+        self.commit_update_state(
+            old_asset,
+            old_family,
+            old_voxel_owner,
+            old_node_lineage,
+            old_dirty_actors,
+            state,
+        )
+    }
+
     pub fn apply_edit(&mut self, edit: RuntimeEdit) -> Result<RepairReport, VoxelError> {
         let old_asset = self.asset.clone();
         let old_family = self.family.clone();
@@ -507,27 +658,29 @@ impl VoxelRuntime {
         let old_node_lineage = self.node_lineage.clone();
         let old_dirty_actors = old_family.dirty_actors().collect::<BTreeSet<_>>();
 
-        let mut occupancy = old_asset.occupancy();
-        let mut fracture_material = old_asset.fracture_material.clone();
-        let mut contact_material = old_asset.contact_material.clone();
-        let mut external_id = old_asset.external_id.clone();
-        let mut orientation = old_asset.orientation.clone();
-        let mut voxel_owner = self.voxel_owner.clone();
-        let mut edited = Vec::new();
-        let mut dirty_actors = BTreeSet::new();
+        let mut state = RuntimeUpdateState {
+            occupancy: old_asset.occupancy(),
+            fracture_material: old_asset.fracture_material.clone(),
+            contact_material: old_asset.contact_material.clone(),
+            external_id: old_asset.external_id.clone(),
+            orientation: old_asset.orientation.clone(),
+            voxel_owner: self.voxel_owner.clone(),
+            edited: Vec::new(),
+            dirty_actors: BTreeSet::new(),
+        };
 
         match edit {
             RuntimeEdit::RemoveVoxels { voxels } => {
                 for coord in voxels {
                     self.require_in_bounds(coord)?;
                     let idx = index(self.asset.width, coord);
-                    if occupancy[idx] {
-                        if let Some(actor) = voxel_owner[idx] {
-                            dirty_actors.insert(actor);
+                    if state.occupancy[idx] {
+                        if let Some(actor) = state.voxel_owner[idx] {
+                            state.dirty_actors.insert(actor);
                         }
-                        occupancy[idx] = false;
-                        voxel_owner[idx] = None;
-                        edited.push(coord);
+                        state.occupancy[idx] = false;
+                        state.voxel_owner[idx] = None;
+                        state.edited.push(coord);
                     }
                 }
             }
@@ -538,22 +691,22 @@ impl VoxelRuntime {
                 for add in voxels {
                     self.require_in_bounds(add.coord)?;
                     let idx = index(self.asset.width, add.coord);
-                    if occupancy[idx] {
+                    if state.occupancy[idx] {
                         return Err(VoxelError::OccupiedVoxel(add.coord));
                     }
-                    occupancy[idx] = true;
-                    fracture_material[idx] = add.fracture_material;
-                    contact_material[idx] = add.contact_material;
-                    external_id[idx] = add.external_id;
-                    if add.orientation.is_some() && orientation.is_none() {
-                        orientation = Some(vec![0; occupancy.len()]);
+                    state.occupancy[idx] = true;
+                    state.fracture_material[idx] = add.fracture_material;
+                    state.contact_material[idx] = add.contact_material;
+                    state.external_id[idx] = add.external_id;
+                    if add.orientation.is_some() && state.orientation.is_none() {
+                        state.orientation = Some(vec![0; state.occupancy.len()]);
                     }
-                    if let (Some(map), Some(angle)) = (&mut orientation, add.orientation) {
+                    if let (Some(map), Some(angle)) = (&mut state.orientation, add.orientation) {
                         map[idx] = angle;
                     }
-                    voxel_owner[idx] = Some(actor);
-                    dirty_actors.insert(actor);
-                    edited.push(add.coord);
+                    state.voxel_owner[idx] = Some(actor);
+                    state.dirty_actors.insert(actor);
+                    state.edited.push(add.coord);
                 }
             }
             RuntimeEdit::SetMaterial {
@@ -563,18 +716,60 @@ impl VoxelRuntime {
                 for coord in voxels {
                     self.require_in_bounds(coord)?;
                     let idx = index(self.asset.width, coord);
-                    if occupancy[idx] {
-                        fracture_material[idx] = new_material;
-                        if let Some(actor) = voxel_owner[idx] {
-                            dirty_actors.insert(actor);
+                    if state.occupancy[idx] {
+                        state.fracture_material[idx] = new_material;
+                        if let Some(actor) = state.voxel_owner[idx] {
+                            state.dirty_actors.insert(actor);
                         }
-                        edited.push(coord);
+                        state.edited.push(coord);
+                    }
+                }
+            }
+            RuntimeEdit::SetVoxels { voxels } => {
+                for update in voxels {
+                    self.require_in_bounds(update.coord)?;
+                    let idx = index(self.asset.width, update.coord);
+                    if state.occupancy[idx] {
+                        state.fracture_material[idx] = update.fracture_material;
+                        state.contact_material[idx] = update.contact_material;
+                        state.external_id[idx] = update.external_id;
+                        if update.orientation.is_some() && state.orientation.is_none() {
+                            state.orientation = Some(vec![0; state.occupancy.len()]);
+                        }
+                        if let (Some(map), Some(angle)) =
+                            (&mut state.orientation, update.orientation)
+                        {
+                            map[idx] = angle;
+                        }
+                        if let Some(actor) = state.voxel_owner[idx] {
+                            state.dirty_actors.insert(actor);
+                        }
+                        state.edited.push(update.coord);
                     }
                 }
             }
         }
 
-        let dirty_bbox = bbox_for_edits(self.asset.width, self.asset.height, &edited);
+        self.commit_update_state(
+            old_asset,
+            old_family,
+            old_voxel_owner,
+            old_node_lineage,
+            old_dirty_actors,
+            state,
+        )
+    }
+
+    fn commit_update_state(
+        &mut self,
+        old_asset: AuthoredVoxelAsset,
+        old_family: FxFamily,
+        old_voxel_owner: Vec<Option<FxActorId>>,
+        old_node_lineage: BTreeMap<SupportNodeId, SupportNodeId>,
+        old_dirty_actors: BTreeSet<FxActorId>,
+        mut state: RuntimeUpdateState,
+    ) -> Result<RepairReport, VoxelError> {
+        let dirty_bbox = bbox_for_edits(self.asset.width, self.asset.height, &state.edited);
         let Some(dirty_bbox) = dirty_bbox else {
             return Ok(RepairReport {
                 dirty_bbox: None,
@@ -609,26 +804,27 @@ impl VoxelRuntime {
         let affected_old_nodes = affected_nodes(&old_asset.core, dirty_bbox);
         for node in &affected_old_nodes {
             if let Some(actor) = old_family.node_owner(*node) {
-                dirty_actors.insert(actor);
+                state.dirty_actors.insert(actor);
             }
         }
 
+        let mut next_node_id = self.next_node_id;
         let repair = build_repaired_topology(RepairBuildInput {
             width: self.asset.width,
             height: self.asset.height,
             voxel_size: self.asset.core.voxel_size(),
-            occupancy: &occupancy,
-            fracture_material: &fracture_material,
-            contact_material: &contact_material,
-            external_id: &external_id,
-            orientation: orientation.as_ref(),
-            voxel_owner: &voxel_owner,
+            occupancy: &state.occupancy,
+            fracture_material: &state.fracture_material,
+            contact_material: &state.contact_material,
+            external_id: &state.external_id,
+            orientation: state.orientation.as_ref(),
+            voxel_owner: &state.voxel_owner,
             old_asset: &old_asset.core,
             old_family: &old_family,
             old_voxel_owner: &old_voxel_owner,
             old_node_lineage: &old_node_lineage,
             affected_old_nodes: &affected_old_nodes,
-            next_node_id: &mut self.next_node_id,
+            next_node_id: &mut next_node_id,
             default_bond_health: old_asset.default_bond_health,
             default_tension_limit: old_asset.default_tension_limit,
             default_shear_limit: old_asset.default_shear_limit,
@@ -641,12 +837,12 @@ impl VoxelRuntime {
             .collect::<BTreeSet<_>>();
         for actor in &old_dirty_actors {
             if post_actors.contains(actor) {
-                dirty_actors.insert(*actor);
+                state.dirty_actors.insert(*actor);
             }
         }
         let preserved_dirty_actors = old_dirty_actors
             .iter()
-            .filter(|actor| dirty_actors.contains(actor))
+            .filter(|actor| state.dirty_actors.contains(actor))
             .copied()
             .collect::<Vec<_>>();
 
@@ -655,12 +851,13 @@ impl VoxelRuntime {
             node_owners: repair.node_owners,
             node_states: repair.node_states,
             bond_states: repair.bond_states,
-            dirty_actors: dirty_actors.iter().copied().collect(),
+            dirty_actors: state.dirty_actors.iter().copied().collect(),
         };
         let summary = self.family.apply_repair_plan(plan)?;
 
+        self.next_node_id = next_node_id;
         self.asset = repair.asset;
-        self.voxel_owner = voxel_owner;
+        self.voxel_owner = state.voxel_owner;
         self.node_lineage = repair.node_lineage;
         let report = RepairReport {
             dirty_bbox: Some(dirty_bbox),
@@ -2197,12 +2394,25 @@ pub enum VoxelError {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "asset dimension mismatch: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+    )]
+    AssetDimensionMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
     #[error("coordinate out of bounds: {0:?}")]
     CoordinateOutOfBounds(GridCoord),
     #[error("cannot add voxel at occupied coordinate {0:?}")]
     OccupiedVoxel(GridCoord),
     #[error("unknown actor {0:?}")]
     UnknownActor(FxActorId),
+    #[error("added voxel component near {0:?} has no live actor owner")]
+    MissingVoxelUpdateOwner(GridCoord),
+    #[error("added voxel component near {0:?} touches multiple actor owners")]
+    AmbiguousVoxelUpdateOwner(GridCoord),
     #[error("old node {0:?} has no actor owner")]
     MissingOldNodeOwner(SupportNodeId),
     #[error("occupied voxel {0:?} is missing support coverage")]

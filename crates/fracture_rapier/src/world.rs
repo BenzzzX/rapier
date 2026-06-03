@@ -10,7 +10,7 @@ use fracture_core::{
     snapshot::{SnapshotMode, encode_family_snapshot, restore_family_snapshot},
     sort_fracture_commands, sort_stress_fracture_command_groups, split_dirty_actors,
 };
-use fracture_voxel::AuthoredVoxelAsset;
+use fracture_voxel::{AuthoredVoxelAsset, VoxelRuntime};
 use rapier2d::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -74,6 +74,8 @@ pub enum FxRapierError {
     UnknownReplayFamily(FxFamilyId),
     #[error("duplicate ambiguous replay key at tick {tick} stable_order {stable_order}")]
     DuplicateReplayKey { tick: u64, stable_order: u64 },
+    #[error("invalid voxel destructible update")]
+    InvalidVoxelUpdate,
     #[error(transparent)]
     Snapshot(#[from] FxRapierSnapshotError),
 }
@@ -150,15 +152,74 @@ pub struct FractureFieldEffect {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DestructibleFamily {
-    pub(crate) asset: AuthoredVoxelAsset,
-    pub(crate) family: FxFamily,
+    pub(crate) runtime: VoxelRuntime,
     pub(crate) physics: BTreeMap<FxActorId, ActorPhysicsState>,
+}
+
+impl DestructibleFamily {
+    fn new(family_id: FxFamilyId, asset: AuthoredVoxelAsset) -> Self {
+        Self {
+            runtime: VoxelRuntime::instantiate(family_id, asset),
+            physics: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn asset(&self) -> &AuthoredVoxelAsset {
+        self.runtime.asset()
+    }
+
+    pub(crate) fn family(&self) -> &FxFamily {
+        self.runtime.family()
+    }
+
+    pub(crate) fn family_mut(&mut self) -> &mut FxFamily {
+        self.runtime.family_mut()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ActorPhysicsState {
     pub(crate) handles: ActorPhysicsHandles,
     pub(crate) body_local_origin_in_asset: Vec2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxActorBodyType {
+    Dynamic,
+    KinematicVelocityBased,
+    Fixed,
+    KinematicPositionBased,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxActorAppliedStaticAnchorPolicy {
+    None,
+    Preserve,
+    Fixed,
+    KinematicVelocityBased,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FxRapierHandleReadback {
+    pub index: u32,
+    pub generation: u32,
+    pub packed_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FxActorStateReadback {
+    pub family_id: FxFamilyId,
+    pub actor_id: FxActorId,
+    pub body_type: FxActorBodyType,
+    pub has_body: bool,
+    pub body_handle: Option<FxRapierHandleReadback>,
+    pub has_collider: bool,
+    pub collider_handle: Option<FxRapierHandleReadback>,
+    pub applied_static_anchor_policy: FxActorAppliedStaticAnchorPolicy,
+    pub live_external_anchor_count: usize,
+    pub live_non_preserve_static_anchor_count: usize,
+    pub occupied_node_count: usize,
+    pub occupied_voxel_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -384,7 +445,7 @@ impl FxRapierWorld2D {
             self.families
                 .values()
                 .fold((0usize, 0usize), |(occupied, support), entry| {
-                    let metrics = entry.asset.metrics();
+                    let metrics = entry.asset().metrics();
                     (
                         occupied + metrics.occupied_voxels,
                         support + metrics.support_nodes,
@@ -607,20 +668,68 @@ impl FxRapierWorld2D {
         if self.families.contains_key(&family_id) {
             return Err(FxRapierError::DuplicateFamily(family_id));
         }
-        let family = FxFamily::instantiate(family_id, asset.core().clone());
-        self.families.insert(
-            family_id,
-            DestructibleFamily {
-                asset,
-                family,
-                physics: BTreeMap::new(),
-            },
-        );
+        self.families
+            .insert(family_id, DestructibleFamily::new(family_id, asset));
         self.sync_family_actors(family_id)
     }
 
+    pub fn remove_destructible(&mut self, family_id: FxFamilyId) -> Result<(), FxRapierError> {
+        if !self.families.contains_key(&family_id) {
+            return Err(FxRapierError::UnknownFamily(family_id));
+        }
+        let actor_ids = self
+            .families
+            .get(&family_id)
+            .map(|entry| entry.physics.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for actor_id in actor_ids {
+            self.remove_actor_handles(family_id, actor_id);
+        }
+        self.families.remove(&family_id);
+        self.prestress_baselines.remove(&family_id);
+        self.static_anchor_policies
+            .retain(|(family, _), _| *family != family_id);
+        self.applied_static_anchor_policies
+            .retain(|(family, _), _| *family != family_id);
+        self.static_anchor_body_baselines
+            .retain(|(family, _), _| *family != family_id);
+        self.pending_field_fracture_commands
+            .retain(|command| command.order_key.family_id != family_id);
+        Ok(())
+    }
+
+    pub fn update_destructible_from_voxels(
+        &mut self,
+        family_id: FxFamilyId,
+        asset: AuthoredVoxelAsset,
+    ) -> Result<(), FxRapierError> {
+        if !self.families.contains_key(&family_id) {
+            return self.add_destructible(family_id, asset);
+        }
+
+        let parent_snapshots = self.snapshot_family_bodies(family_id);
+        let split_events = {
+            let entry = self
+                .families
+                .get_mut(&family_id)
+                .ok_or(FxRapierError::UnknownFamily(family_id))?;
+            entry
+                .runtime
+                .apply_asset_update(asset)
+                .map_err(|_| FxRapierError::InvalidVoxelUpdate)?;
+            split_dirty_actors(entry.family_mut())
+        };
+        self.invalidate_prestress_baseline(family_id);
+        if !split_events.is_empty() {
+            let _ = self.sync_split_family_actors(family_id, &parent_snapshots, &split_events)?;
+        } else {
+            self.sync_family_actors(family_id)?;
+        }
+        Ok(())
+    }
+
     pub fn family(&self, family_id: FxFamilyId) -> Option<&FxFamily> {
-        self.families.get(&family_id).map(|entry| &entry.family)
+        self.families.get(&family_id).map(|entry| entry.family())
     }
 
     pub fn actor_handles(
@@ -642,6 +751,81 @@ impl FxRapierWorld2D {
             .ok_or(FxRapierError::UnknownActor { family, actor })
     }
 
+    pub fn read_actor_state(
+        &self,
+        family_id: FxFamilyId,
+        actor_id: FxActorId,
+    ) -> Result<FxActorStateReadback, FxRapierError> {
+        let entry = self
+            .families
+            .get(&family_id)
+            .ok_or(FxRapierError::UnknownFamily(family_id))?;
+        let actor = entry
+            .family()
+            .actor(actor_id)
+            .ok_or(FxRapierError::UnknownActor {
+                family: family_id,
+                actor: actor_id,
+            })?;
+
+        let mut live_external_anchor_count = 0usize;
+        let mut live_non_preserve_static_anchor_count = 0usize;
+        for (bond_id, bond) in entry.family().external_bonds() {
+            if bond.runtime.is_broken() || entry.family().node_owner(bond.node) != Some(actor_id) {
+                continue;
+            }
+            live_external_anchor_count += 1;
+            let policy = self
+                .static_anchor_policies
+                .get(&(family_id, *bond_id))
+                .copied()
+                .unwrap_or(StaticAnchorBodyPolicy::Preserve);
+            if policy != StaticAnchorBodyPolicy::Preserve {
+                live_non_preserve_static_anchor_count += 1;
+            }
+        }
+
+        let state = entry.physics.get(&actor_id);
+        let body = state.and_then(|state| {
+            self.bodies
+                .get(state.handles.body)
+                .map(|body| (state.handles.body, body))
+        });
+        let collider = state.and_then(|state| {
+            self.colliders
+                .get(state.handles.collider)
+                .map(|_| state.handles.collider)
+        });
+        let occupied_voxel_count = actor
+            .owned_nodes
+            .iter()
+            .filter_map(|node| entry.asset().core().node(*node))
+            .map(|node| node.voxels.len())
+            .sum();
+
+        Ok(FxActorStateReadback {
+            family_id,
+            actor_id,
+            body_type: body
+                .map(|(_, body)| fx_actor_body_type_from_rapier(body.body_type()))
+                .unwrap_or(FxActorBodyType::Dynamic),
+            has_body: body.is_some(),
+            body_handle: body.map(|(handle, _)| rapier_handle_readback(handle.into_raw_parts())),
+            has_collider: collider.is_some(),
+            collider_handle: collider.map(|handle| rapier_handle_readback(handle.into_raw_parts())),
+            applied_static_anchor_policy: self
+                .applied_static_anchor_policies
+                .get(&(family_id, actor_id))
+                .copied()
+                .map(fx_actor_anchor_policy_from_static_anchor_policy)
+                .unwrap_or(FxActorAppliedStaticAnchorPolicy::None),
+            live_external_anchor_count,
+            live_non_preserve_static_anchor_count,
+            occupied_node_count: actor.owned_nodes.len(),
+            occupied_voxel_count,
+        })
+    }
+
     pub fn connect_static_anchor(
         &mut self,
         family_id: FxFamilyId,
@@ -652,7 +836,7 @@ impl FxRapierWorld2D {
             .families
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family()
             .node_owner(desc.core.node)
             .ok_or(ConnectionError::UnknownNode(desc.core.node))?;
         if desc.body_policy != StaticAnchorBodyPolicy::Preserve {
@@ -662,7 +846,7 @@ impl FxRapierWorld2D {
             .families
             .get_mut(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family_mut()
             .connect_static_anchor(desc.core)?;
         self.invalidate_prestress_baseline(family_id);
         if desc.body_policy != StaticAnchorBodyPolicy::Preserve {
@@ -687,7 +871,7 @@ impl FxRapierWorld2D {
             .families
             .get_mut(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family_mut()
             .connect_dynamic_structural_bond_graph_only(desc.core)?;
         self.invalidate_prestress_baseline(family_id);
         debug_assert_eq!(self.impulse_joints.len(), before_joints);
@@ -738,13 +922,13 @@ impl FxRapierWorld2D {
             .families
             .get_mut(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family_mut()
             .merge_actors(actor_a, actor_b)?;
         self.invalidate_prestress_baseline(family_id);
         let merged_local_origin = self
             .families
             .get(&family_id)
-            .and_then(|entry| entry.family.actor(result.kept_actor))
+            .and_then(|entry| entry.family().actor(result.kept_actor))
             .ok_or(FxRapierError::UnknownActor {
                 family: family_id,
                 actor: result.kept_actor,
@@ -809,7 +993,7 @@ impl FxRapierWorld2D {
         let families = self
             .families
             .iter()
-            .map(|(id, entry)| (*id, &entry.family))
+            .map(|(id, entry)| (*id, entry.family()))
             .collect::<Vec<_>>();
         let registry = self.hooks.registry();
         let registry = registry
@@ -896,7 +1080,7 @@ impl FxRapierWorld2D {
                 let Some(entry) = self.families.get(family_id) else {
                     return Err(FxRapierError::UnknownFamily(*family_id));
                 };
-                if !self.should_solve_family_stress(*family_id, &entry.family, &stress_inputs) {
+                if !self.should_solve_family_stress(*family_id, entry.family(), &stress_inputs) {
                     continue;
                 }
                 let mut stress_context = self.stress_context_for_family(*family_id, entry);
@@ -904,7 +1088,7 @@ impl FxRapierWorld2D {
                     Some(baseline) => baseline.clone(),
                     None => {
                         let baseline =
-                            uncapped_solver.capture_load_baseline(&entry.family, &stress_context);
+                            uncapped_solver.capture_load_baseline(entry.family(), &stress_context);
                         self.prestress_baselines
                             .insert(*family_id, baseline.clone());
                         baseline
@@ -913,7 +1097,7 @@ impl FxRapierWorld2D {
                 stress_context.load_baseline = Some(baseline);
                 stress_jobs.push(FamilyStressSolveJob {
                     family_id: *family_id,
-                    family: &entry.family,
+                    family: entry.family(),
                     context: stress_context,
                     inputs: stress_inputs,
                 });
@@ -1018,11 +1202,11 @@ impl FxRapierWorld2D {
                 };
                 let mut baseline_dirty = false;
                 if let Some(commands) = selected_by_family.get(&family_id) {
-                    let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+                    let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
                     baseline_dirty |= !fracture_events.is_empty();
                     report.fracture_events.extend(fracture_events);
                 }
-                let split_events = split_dirty_actors(&mut entry.family);
+                let split_events = split_dirty_actors(entry.family_mut());
                 baseline_dirty |= !split_events.is_empty();
                 (split_events, baseline_dirty)
             };
@@ -1117,7 +1301,7 @@ impl FxRapierWorld2D {
                 let context = self.stress_context_for_family(family_id, entry);
                 let mut damage_inputs = Vec::new();
                 for node_context in &context.nodes {
-                    let Some(actor) = entry.family.node_owner(node_context.node) else {
+                    let Some(actor) = entry.family().node_owner(node_context.node) else {
                         continue;
                     };
                     let delta = node_context.position - field.center;
@@ -1173,7 +1357,7 @@ impl FxRapierWorld2D {
                 }
                 if !damage_inputs.is_empty() {
                     pending_field_fracture_commands
-                        .extend(generate_damage_commands(&entry.family, &damage_inputs));
+                        .extend(generate_damage_commands(entry.family(), &damage_inputs));
                 }
             }
         }
@@ -1187,10 +1371,10 @@ impl FxRapierWorld2D {
         family_id: FxFamilyId,
         entry: &DestructibleFamily,
     ) -> StressContext2D {
-        let mut context = StressContext2D::from_family(&entry.family);
+        let mut context = StressContext2D::from_family(entry.family());
         context.gravity = Vec2::new(self.gravity.x, self.gravity.y);
         context.fallback_order_keys = entry
-            .family
+            .family()
             .actors()
             .map(|(actor, _)| {
                 (
@@ -1201,10 +1385,10 @@ impl FxRapierWorld2D {
             .collect();
 
         for node_context in &mut context.nodes {
-            let Some(actor) = entry.family.node_owner(node_context.node) else {
+            let Some(actor) = entry.family().node_owner(node_context.node) else {
                 continue;
             };
-            let Some(actor_core) = entry.family.actor(actor) else {
+            let Some(actor_core) = entry.family().actor(actor) else {
                 continue;
             };
             let Some(physics) = entry.physics.get(&actor) else {
@@ -1259,8 +1443,8 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
-            let split_events = split_dirty_actors(&mut entry.family);
+            let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
+            let split_events = split_dirty_actors(entry.family_mut());
             (fracture_events, split_events)
         };
         let (fracture_events, split_events) = split_events;
@@ -1336,10 +1520,10 @@ impl FxRapierWorld2D {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
-                let fracture_events = apply_fracture_commands(&mut entry.family, commands);
+                let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
                 let mut baseline_dirty = !fracture_events.is_empty();
                 report.fracture_events.extend(fracture_events);
-                let split_events = split_dirty_actors(&mut entry.family);
+                let split_events = split_dirty_actors(entry.family_mut());
                 baseline_dirty |= !split_events.is_empty();
                 (split_events, baseline_dirty)
             };
@@ -1372,8 +1556,8 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
-            let split_events = split_dirty_actors(&mut entry.family);
+            let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
+            let split_events = split_dirty_actors(entry.family_mut());
             let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
             (split_events, baseline_dirty)
         };
@@ -1401,8 +1585,8 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
-            let split_events = split_dirty_actors(&mut entry.family);
+            let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
+            let split_events = split_dirty_actors(entry.family_mut());
             let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
             (split_events, baseline_dirty)
         };
@@ -1432,8 +1616,8 @@ impl FxRapierWorld2D {
             let Some(entry) = self.families.get_mut(&family_id) else {
                 return Err(FxRapierError::UnknownFamily(family_id));
             };
-            let fracture_events = apply_fracture_commands(&mut entry.family, commands);
-            let split_events = split_dirty_actors(&mut entry.family);
+            let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
+            let split_events = split_dirty_actors(entry.family_mut());
             let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
             (split_events, baseline_dirty)
         };
@@ -1477,8 +1661,8 @@ impl FxRapierWorld2D {
                 let Some(entry) = self.families.get_mut(&family_id) else {
                     return Err(FxRapierError::UnknownFamily(family_id));
                 };
-                let fracture_events = apply_fracture_commands(&mut entry.family, commands);
-                let split_events = split_dirty_actors(&mut entry.family);
+                let fracture_events = apply_fracture_commands(entry.family_mut(), commands);
+                let split_events = split_dirty_actors(entry.family_mut());
                 let baseline_dirty = !fracture_events.is_empty() || !split_events.is_empty();
                 (split_events, baseline_dirty)
             };
@@ -1541,7 +1725,7 @@ impl FxRapierWorld2D {
         let mut actor_physics = Vec::new();
         for (family_id, entry) in &self.families {
             for (actor_id, state) in &entry.physics {
-                if entry.family.actor(*actor_id).is_none() {
+                if entry.family().actor(*actor_id).is_none() {
                     return Err(FxRapierSnapshotError::StateMismatch(
                         "actor physics unknown actor",
                     )
@@ -1588,11 +1772,11 @@ impl FxRapierWorld2D {
                 family: *family_id,
                 asset: fracture_voxel::AuthoredVoxelAssetSnapshot {
                     bytes: entry
-                        .asset
+                        .asset()
                         .to_snapshot_bytes()
                         .map_err(FxRapierSnapshotError::Voxel)?,
                 },
-                core_family: encode_family_snapshot(&entry.family, self.snapshot_mode)
+                core_family: encode_family_snapshot(entry.family(), self.snapshot_mode)
                     .map_err(FxRapierSnapshotError::Core)?,
             });
         }
@@ -1748,8 +1932,7 @@ impl FxRapierWorld2D {
             world.families.insert(
                 family_snapshot.family,
                 DestructibleFamily {
-                    asset,
-                    family,
+                    runtime: VoxelRuntime::from_family(asset, family),
                     physics: BTreeMap::new(),
                 },
             );
@@ -1760,7 +1943,7 @@ impl FxRapierWorld2D {
             .iter()
             .flat_map(|(family_id, entry)| {
                 entry
-                    .family
+                    .family()
                     .actors()
                     .map(move |(actor_id, _)| (*family_id, *actor_id))
             })
@@ -1775,7 +1958,7 @@ impl FxRapierWorld2D {
                         "actor physics unknown family",
                     ));
                 };
-                if entry.family.actor(item.actor).is_none() {
+                if entry.family().actor(item.actor).is_none() {
                     return Err(FxRapierSnapshotError::StateMismatch(
                         "actor physics unknown actor",
                     ));
@@ -1849,13 +2032,13 @@ impl FxRapierWorld2D {
             .families
             .iter()
             .flat_map(|(family_id, entry)| {
-                entry.family.actors().map(move |(actor_id, actor)| {
+                entry.family().actors().map(move |(actor_id, actor)| {
                     (
                         DestructibleActorRef {
                             family: *family_id,
                             actor: *actor_id,
                         },
-                        actor_contact_metadata(actor, &entry.asset, lod_settings),
+                        actor_contact_metadata(actor, entry.asset(), lod_settings),
                     )
                 })
             })
@@ -1919,7 +2102,7 @@ impl FxRapierWorld2D {
 
         for (family_id, entry) in &self.families {
             let actor_ids = entry
-                .family
+                .family()
                 .actors()
                 .map(|(actor, _)| *actor)
                 .collect::<BTreeSet<_>>();
@@ -1985,13 +2168,13 @@ impl FxRapierWorld2D {
                 }
                 let actor =
                     entry
-                        .family
+                        .family()
                         .actor(*actor_id)
                         .ok_or(FxRapierSnapshotError::StateMismatch(
                             "actor physics unknown actor",
                         ))?;
                 let material_id =
-                    actor_default_contact_material(actor, &entry.asset).unwrap_or_default();
+                    actor_default_contact_material(actor, entry.asset()).unwrap_or_default();
                 let properties = registry
                     .material_properties
                     .get(&material_id)
@@ -1999,7 +2182,7 @@ impl FxRapierWorld2D {
                     .unwrap_or_default();
                 let expected_voxels = actor_collider_build(
                     actor,
-                    &entry.asset,
+                    entry.asset(),
                     state.body_local_origin_in_asset,
                     properties,
                     self.lod_settings,
@@ -2085,7 +2268,7 @@ impl FxRapierWorld2D {
                     FxRapierSnapshotError::StateMismatch("static policy unknown family").into(),
                 );
             };
-            if entry.family.external_bond(*bond).is_none() {
+            if entry.family().external_bond(*bond).is_none() {
                 return Err(
                     FxRapierSnapshotError::StateMismatch("static policy unknown bond").into(),
                 );
@@ -2141,7 +2324,7 @@ impl FxRapierWorld2D {
         if self
             .families
             .get(&actor.family)
-            .is_some_and(|entry| entry.family.actor(actor.actor).is_some())
+            .is_some_and(|entry| entry.family().actor(actor.actor).is_some())
         {
             Ok(())
         } else {
@@ -2154,7 +2337,7 @@ impl FxRapierWorld2D {
             .families
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family()
             .actors()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
@@ -2168,7 +2351,7 @@ impl FxRapierWorld2D {
             .families
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family()
             .actors()
             .map(|(id, _)| *id)
             .collect::<BTreeSet<_>>();
@@ -2197,7 +2380,7 @@ impl FxRapierWorld2D {
             let Some(body) = self.bodies.get(state.handles.body) else {
                 continue;
             };
-            let Some(_actor) = entry.family.actor(*actor_id) else {
+            let Some(_actor) = entry.family().actor(*actor_id) else {
                 continue;
             };
             out.insert(
@@ -2260,7 +2443,7 @@ impl FxRapierWorld2D {
             .families
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?
-            .family
+            .family()
             .actors()
             .map(|(id, _)| *id)
             .collect::<BTreeSet<_>>();
@@ -2331,11 +2514,11 @@ impl FxRapierWorld2D {
                 let asset_anchor = parent_state.body_local_origin_in_asset
                     + Vec2::new(local_anchor.x, local_anchor.y);
                 let Some(node) =
-                    support_node_for_asset_point(&entry.asset, &candidate_nodes, asset_anchor)
+                    support_node_for_asset_point(entry.asset(), &candidate_nodes, asset_anchor)
                 else {
                     continue;
                 };
-                let Some(new_actor) = entry.family.node_owner(node) else {
+                let Some(new_actor) = entry.family().node_owner(node) else {
                     continue;
                 };
                 if new_actor == event.parent_actor {
@@ -2434,13 +2617,13 @@ impl FxRapierWorld2D {
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?;
         let actor = entry
-            .family
+            .family()
             .actor(actor_id)
             .ok_or(FxRapierError::UnknownActor {
                 family: family_id,
                 actor: actor_id,
             })?;
-        let material_id = actor_default_contact_material(actor, &entry.asset).unwrap_or_default();
+        let material_id = actor_default_contact_material(actor, entry.asset()).unwrap_or_default();
         let properties = self
             .hooks
             .registry()
@@ -2456,7 +2639,7 @@ impl FxRapierWorld2D {
         let local_origin = actor.local_com;
         let Some(collider_build) = actor_collider_build(
             actor,
-            &entry.asset,
+            entry.asset(),
             local_origin,
             properties,
             self.lod_settings,
@@ -2480,7 +2663,7 @@ impl FxRapierWorld2D {
             family: family_id,
             actor: actor_id,
         };
-        let actor_metadata = actor_contact_metadata(actor, &entry.asset, self.lod_settings);
+        let actor_metadata = actor_contact_metadata(actor, entry.asset(), self.lod_settings);
         {
             let registry = self.hooks.registry();
             let mut registry = registry
@@ -2552,13 +2735,13 @@ impl FxRapierWorld2D {
             .get(&family_id)
             .ok_or(FxRapierError::UnknownFamily(family_id))?;
         let actor = entry
-            .family
+            .family()
             .actor(actor_id)
             .ok_or(FxRapierError::UnknownActor {
                 family: family_id,
                 actor: actor_id,
             })?;
-        let material_id = actor_default_contact_material(actor, &entry.asset).unwrap_or_default();
+        let material_id = actor_default_contact_material(actor, entry.asset()).unwrap_or_default();
         let properties = self
             .hooks
             .registry()
@@ -2573,7 +2756,7 @@ impl FxRapierWorld2D {
             .unwrap_or(old_state.body_local_origin_in_asset);
         let Some(collider_build) = actor_collider_build(
             actor,
-            &entry.asset,
+            entry.asset(),
             local_origin,
             properties,
             self.lod_settings,
@@ -2599,7 +2782,7 @@ impl FxRapierWorld2D {
             family: family_id,
             actor: actor_id,
         };
-        let actor_metadata = actor_contact_metadata(actor, &entry.asset, self.lod_settings);
+        let actor_metadata = actor_contact_metadata(actor, entry.asset(), self.lod_settings);
         {
             let registry = self.hooks.registry();
             let mut registry = registry
@@ -2719,13 +2902,13 @@ impl FxRapierWorld2D {
                 if *policy_family != family_id || *policy == StaticAnchorBodyPolicy::Preserve {
                     continue;
                 }
-                let Some(bond) = entry.family.external_bond(*bond_id) else {
+                let Some(bond) = entry.family().external_bond(*bond_id) else {
                     continue;
                 };
                 if bond.runtime.is_broken() {
                     continue;
                 }
-                let Some(actor) = entry.family.node_owner(bond.node) else {
+                let Some(actor) = entry.family().node_owner(bond.node) else {
                     continue;
                 };
                 desired
@@ -2736,7 +2919,7 @@ impl FxRapierWorld2D {
                     .or_insert(*policy);
             }
             let live_actors = entry
-                .family
+                .family()
                 .actors()
                 .map(|(actor, _)| *actor)
                 .collect::<BTreeSet<_>>();
@@ -2808,7 +2991,7 @@ impl FxRapierWorld2D {
             let context = self.stress_context_for_family(snapshot.family, entry);
             let current = self
                 .stress_solver
-                .capture_load_baseline(&entry.family, &context);
+                .capture_load_baseline(entry.family(), &context);
             if snapshot.topology_signature != current.topology_signature {
                 return Err(FxRapierSnapshotError::StateMismatch(
                     "prestress baseline topology mismatch",
@@ -3305,6 +3488,35 @@ fn rigid_body_type_for_anchor_policy(policy: StaticAnchorBodyPolicy) -> RigidBod
         StaticAnchorBodyPolicy::Preserve => RigidBodyType::Dynamic,
         StaticAnchorBodyPolicy::Fixed => RigidBodyType::Fixed,
         StaticAnchorBodyPolicy::KinematicVelocityBased => RigidBodyType::KinematicVelocityBased,
+    }
+}
+
+fn fx_actor_body_type_from_rapier(body_type: RigidBodyType) -> FxActorBodyType {
+    match body_type {
+        RigidBodyType::Dynamic => FxActorBodyType::Dynamic,
+        RigidBodyType::KinematicVelocityBased => FxActorBodyType::KinematicVelocityBased,
+        RigidBodyType::Fixed => FxActorBodyType::Fixed,
+        RigidBodyType::KinematicPositionBased => FxActorBodyType::KinematicPositionBased,
+    }
+}
+
+fn fx_actor_anchor_policy_from_static_anchor_policy(
+    policy: StaticAnchorBodyPolicy,
+) -> FxActorAppliedStaticAnchorPolicy {
+    match policy {
+        StaticAnchorBodyPolicy::Preserve => FxActorAppliedStaticAnchorPolicy::Preserve,
+        StaticAnchorBodyPolicy::Fixed => FxActorAppliedStaticAnchorPolicy::Fixed,
+        StaticAnchorBodyPolicy::KinematicVelocityBased => {
+            FxActorAppliedStaticAnchorPolicy::KinematicVelocityBased
+        }
+    }
+}
+
+fn rapier_handle_readback((index, generation): (u32, u32)) -> FxRapierHandleReadback {
+    FxRapierHandleReadback {
+        index,
+        generation,
+        packed_id: u64::from(index) | (u64::from(generation) << 32),
     }
 }
 

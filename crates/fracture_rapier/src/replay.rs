@@ -140,7 +140,7 @@ impl FxRapierWorld2D {
     pub fn family_digests(&self) -> Vec<(FxFamilyId, u64)> {
         self.families
             .iter()
-            .map(|(id, entry)| (*id, entry.family.deterministic_state_digest()))
+            .map(|(id, entry)| (*id, entry.family().deterministic_state_digest()))
             .collect()
     }
 

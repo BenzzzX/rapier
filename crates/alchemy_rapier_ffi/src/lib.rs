@@ -1,6 +1,7 @@
 use fracture_core::{
     DamageSource, FxActorId, FxFamilyId, GridCoord, SplitEvent, Vec2, snapshot::SnapshotMode,
 };
+use fracture_rapier::world::FxActorBodyType;
 use fracture_rapier::{FractureField2D, FxRapierError, FxRapierWorld2D, FxStepWithDiagnostics};
 use fracture_voxel::{
     AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
@@ -41,6 +42,12 @@ pub enum AlchemyRapierBodyType {
     Kinematic = 1,
     Fixed = 2,
     KinematicPosition = 3,
+}
+
+impl Default for AlchemyRapierBodyType {
+    fn default() -> Self {
+        Self::Dynamic
+    }
 }
 
 #[repr(C)]
@@ -125,9 +132,18 @@ pub struct AlchemyFxFractureFieldDesc {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AlchemyFxAsset2DCreateResult {
+pub struct AlchemyFxActorStateResult {
     pub status: AlchemyRapierStatus,
-    pub asset: *mut AlchemyFxAsset2D,
+    pub family_id: u32,
+    pub actor_id: u32,
+    pub body_type: AlchemyRapierBodyType,
+    pub has_body: u8,
+    pub body_handle: AlchemyRapierRigidBodyHandle,
+    pub body_packed_id: u64,
+    pub has_collider: u8,
+    pub collider_handle: AlchemyRapierColliderHandle,
+    pub collider_packed_id: u64,
+    pub occupied_voxel_count: usize,
 }
 
 #[repr(C)]
@@ -145,8 +161,6 @@ pub struct AlchemyFxStepReport {
     pub impulse_joint_handle_replacement_count: usize,
     pub occupied_voxel_count: usize,
     pub occupied_voxel_budget: usize,
-    pub support_node_count: usize,
-    pub support_node_budget: usize,
     pub active_body_count: usize,
     pub active_body_budget: usize,
 }
@@ -168,7 +182,6 @@ pub struct AlchemyFxSplitEventRow {
     pub kept_actor_id: u32,
     pub created_child_count: usize,
     pub fragment_count: usize,
-    pub kept_node_count: usize,
 }
 
 #[repr(C)]
@@ -566,19 +579,10 @@ pub struct AlchemyFxRapierWorld {
     _private: [u8; 0],
 }
 
-#[repr(C)]
-pub struct AlchemyFxAsset2D {
-    _private: [u8; 0],
-}
-
 struct AlchemyFxRapierWorldInner {
     world: FxRapierWorld2D,
     last_step: Option<FxStepWithDiagnostics>,
     snapshot_scratch: Vec<u8>,
-}
-
-struct AlchemyFxAsset2DInner {
-    asset: AuthoredVoxelAsset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -890,15 +894,6 @@ fn to_fx_world<'a>(
     Ok(unsafe { &mut *world.cast::<AlchemyFxRapierWorldInner>() })
 }
 
-fn to_fx_asset<'a>(
-    asset: *const AlchemyFxAsset2D,
-) -> Result<&'a AlchemyFxAsset2DInner, AlchemyRapierStatus> {
-    if asset.is_null() {
-        return Err(AlchemyRapierStatus::NullPointer);
-    }
-    Ok(unsafe { &*asset.cast::<AlchemyFxAsset2DInner>() })
-}
-
 fn fx_error_status(error: FxRapierError) -> AlchemyRapierStatus {
     match error {
         FxRapierError::UnknownFamily(_)
@@ -910,6 +905,7 @@ fn fx_error_status(error: FxRapierError) -> AlchemyRapierStatus {
         FxRapierError::DuplicateFamily(_)
         | FxRapierError::DuplicateReplayKey { .. }
         | FxRapierError::Connection(_)
+        | FxRapierError::InvalidVoxelUpdate
         | FxRapierError::Snapshot(_) => AlchemyRapierStatus::InvalidArgument,
     }
 }
@@ -930,10 +926,12 @@ fn damage_source_from_ffi(source: AlchemyFxDamageSource) -> DamageSource {
     }
 }
 
-fn empty_fx_asset_result(status: AlchemyRapierStatus) -> AlchemyFxAsset2DCreateResult {
-    AlchemyFxAsset2DCreateResult {
-        status,
-        asset: ptr::null_mut(),
+fn fx_actor_body_type_to_ffi(body_type: FxActorBodyType) -> AlchemyRapierBodyType {
+    match body_type {
+        FxActorBodyType::Dynamic => AlchemyRapierBodyType::Dynamic,
+        FxActorBodyType::KinematicVelocityBased => AlchemyRapierBodyType::Kinematic,
+        FxActorBodyType::Fixed => AlchemyRapierBodyType::Fixed,
+        FxActorBodyType::KinematicPositionBased => AlchemyRapierBodyType::KinematicPosition,
     }
 }
 
@@ -4478,49 +4476,21 @@ pub extern "C" fn alchemy_fx_world_set_snapshot_mode(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn alchemy_fx_asset2d_author(
-    desc: AlchemyFxVoxelDestructibleDesc,
-) -> AlchemyFxAsset2DCreateResult {
-    match catch_unwind(AssertUnwindSafe(|| {
-        match authored_fx_asset_from_desc(desc) {
-            Ok(asset) => AlchemyFxAsset2DCreateResult {
-                status: AlchemyRapierStatus::Ok,
-                asset: Box::into_raw(Box::new(AlchemyFxAsset2DInner { asset }))
-                    .cast::<AlchemyFxAsset2D>(),
-            },
-            Err(status) => empty_fx_asset_result(status),
-        }
-    })) {
-        Ok(result) => result,
-        Err(_) => empty_fx_asset_result(AlchemyRapierStatus::Panic),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_fx_asset2d_destroy(asset: *mut AlchemyFxAsset2D) {
-    if !asset.is_null() {
-        unsafe {
-            drop(Box::from_raw(asset.cast::<AlchemyFxAsset2DInner>()));
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_fx_world_add_destructible(
+pub extern "C" fn alchemy_fx_world_update_destructible_from_voxels(
     world: *mut AlchemyFxRapierWorld,
-    family_id: u32,
-    asset: *const AlchemyFxAsset2D,
+    desc: AlchemyFxVoxelDestructibleDesc,
 ) -> AlchemyRapierStatus {
     match catch_unwind(AssertUnwindSafe(|| {
         let Ok(world) = to_fx_world(world) else {
             return AlchemyRapierStatus::NullPointer;
         };
-        let Ok(asset) = to_fx_asset(asset) else {
-            return AlchemyRapierStatus::NullPointer;
+        let asset = match authored_fx_asset_from_desc(desc) {
+            Ok(asset) => asset,
+            Err(status) => return status,
         };
         match world
             .world
-            .add_destructible(FxFamilyId(family_id), asset.asset.clone())
+            .update_destructible_from_voxels(FxFamilyId(desc.family_id), asset)
         {
             Ok(()) => AlchemyRapierStatus::Ok,
             Err(error) => fx_error_status(error),
@@ -4528,6 +4498,97 @@ pub extern "C" fn alchemy_fx_world_add_destructible(
     })) {
         Ok(status) => status,
         Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_remove_destructible(
+    world: *mut AlchemyFxRapierWorld,
+    family_id: u32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        match world.world.remove_destructible(FxFamilyId(family_id)) {
+            Ok(()) => AlchemyRapierStatus::Ok,
+            Err(error) => fx_error_status(error),
+        }
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_fx_world_read_actor_state(
+    world: *mut AlchemyFxRapierWorld,
+    family_id: u32,
+    actor_id: u32,
+) -> AlchemyFxActorStateResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_fx_world(world) else {
+            return AlchemyFxActorStateResult {
+                status: AlchemyRapierStatus::NullPointer,
+                family_id,
+                actor_id,
+                ..AlchemyFxActorStateResult::default()
+            };
+        };
+        match world
+            .world
+            .read_actor_state(FxFamilyId(family_id), FxActorId(actor_id))
+        {
+            Ok(state) => {
+                let body_handle = state
+                    .body_handle
+                    .map(|handle| AlchemyRapierRigidBodyHandle {
+                        index: handle.index,
+                        generation: handle.generation,
+                    })
+                    .unwrap_or_default();
+                let collider_handle = state
+                    .collider_handle
+                    .map(|handle| AlchemyRapierColliderHandle {
+                        index: handle.index,
+                        generation: handle.generation,
+                    })
+                    .unwrap_or_default();
+                AlchemyFxActorStateResult {
+                    status: AlchemyRapierStatus::Ok,
+                    family_id: state.family_id.0,
+                    actor_id: state.actor_id.0,
+                    body_type: fx_actor_body_type_to_ffi(state.body_type),
+                    has_body: u8::from(state.has_body),
+                    body_handle,
+                    body_packed_id: state
+                        .body_handle
+                        .map(|handle| handle.packed_id)
+                        .unwrap_or_default(),
+                    has_collider: u8::from(state.has_collider),
+                    collider_handle,
+                    collider_packed_id: state
+                        .collider_handle
+                        .map(|handle| handle.packed_id)
+                        .unwrap_or_default(),
+                    occupied_voxel_count: state.occupied_voxel_count,
+                }
+            }
+            Err(error) => AlchemyFxActorStateResult {
+                status: fx_error_status(error),
+                family_id,
+                actor_id,
+                ..AlchemyFxActorStateResult::default()
+            },
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => AlchemyFxActorStateResult {
+            status: AlchemyRapierStatus::Panic,
+            family_id,
+            actor_id,
+            ..AlchemyFxActorStateResult::default()
+        },
     }
 }
 
@@ -4621,12 +4682,6 @@ pub extern "C" fn alchemy_fx_world_step(
                     occupied_voxel_budget: budget
                         .map(|budget| budget.occupied_voxel_budget)
                         .unwrap_or_default(),
-                    support_node_count: budget
-                        .map(|budget| budget.support_nodes)
-                        .unwrap_or_default(),
-                    support_node_budget: budget
-                        .map(|budget| budget.support_node_budget)
-                        .unwrap_or_default(),
                     active_body_count: budget
                         .map(|budget| budget.active_bodies)
                         .unwrap_or_default(),
@@ -4685,7 +4740,6 @@ pub extern "C" fn alchemy_fx_world_read_split_event_rows(
                     kept_actor_id: event.kept_actor.0,
                     created_child_count: event.created_children.len(),
                     fragment_count: event.fragments.len(),
-                    kept_node_count: event.kept_fragment.len(),
                 };
             }
         }
@@ -4723,58 +4777,6 @@ pub extern "C" fn alchemy_fx_world_copy_split_event_created_children(
                     actors,
                     capacity,
                 )
-            })
-            .unwrap_or(0)
-    })) {
-        Ok(written) => written,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_fx_world_copy_split_event_kept_nodes(
-    world: *mut AlchemyFxRapierWorld,
-    row_index: usize,
-    nodes: *mut u32,
-    capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_fx_world(world) else {
-            return 0;
-        };
-        fx_split_events(world)
-            .and_then(|events| events.get(row_index))
-            .map(|event| {
-                copy_u32_slice_to_ffi(
-                    event.kept_fragment.iter().map(|node| node.0),
-                    nodes,
-                    capacity,
-                )
-            })
-            .unwrap_or(0)
-    })) {
-        Ok(written) => written,
-        Err(_) => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alchemy_fx_world_copy_split_event_fragment_nodes(
-    world: *mut AlchemyFxRapierWorld,
-    row_index: usize,
-    fragment_index: usize,
-    nodes: *mut u32,
-    capacity: usize,
-) -> usize {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let Ok(world) = to_fx_world(world) else {
-            return 0;
-        };
-        fx_split_events(world)
-            .and_then(|events| events.get(row_index))
-            .and_then(|event| event.fragments.get(fragment_index))
-            .map(|fragment| {
-                copy_u32_slice_to_ffi(fragment.iter().map(|node| node.0), nodes, capacity)
             })
             .unwrap_or(0)
     })) {
