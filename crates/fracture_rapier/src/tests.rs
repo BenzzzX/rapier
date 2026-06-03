@@ -19,8 +19,8 @@ use crate::snapshot::{
 use crate::world::{FxActorAppliedStaticAnchorPolicy, FxActorBodyType};
 use crate::{
     ActorPhysicsHandles, ColliderLodSettings, ContactMaterialProperties,
-    DynamicStructuralConnectionDesc, FractureField2D, FractureFieldMode, FxRapierError,
-    FxRapierSnapshotError, FxRapierWorld2D, QuickImpactAction, QuickImpactSettings,
+    DynamicStructuralConnectionDesc, FractureField2D, FractureFieldMode, FxFamilyDeltaKind,
+    FxRapierError, FxRapierSnapshotError, FxRapierWorld2D, QuickImpactAction, QuickImpactSettings,
     StaticAnchorBodyPolicy, StaticAnchorConnectionDesc,
 };
 
@@ -196,29 +196,82 @@ fn update_destructible_from_voxels_adds_to_neighbor_actor() {
 }
 
 #[test]
-fn update_destructible_from_voxels_rejects_cross_actor_bridge() {
+fn update_destructible_from_voxels_promotes_split_child_family() {
     let family = FxFamilyId(1);
     let mut world = FxRapierWorld2D::new();
     world
         .add_destructible(family, line_asset_from_occupancy(&[true, true, true, true]))
         .unwrap();
-    world
+    let initial_state = world.read_family_state(family).unwrap();
+    assert_eq!(initial_state.actor_count, 1);
+    assert_eq!(initial_state.body_count, 1);
+    assert_eq!(initial_state.collider_count, 1);
+    assert_eq!(
+        initial_state.single_body_type,
+        Some(FxActorBodyType::Dynamic)
+    );
+    assert!(initial_state.single_body_handle.is_some());
+    assert!(initial_state.single_collider_handle.is_some());
+
+    let (_sync_report, deltas) = world
         .update_destructible_from_voxels(
             family,
             line_asset_from_occupancy(&[true, false, true, true]),
         )
         .unwrap();
-    assert_eq!(world.family(family).unwrap().actors().count(), 2);
+    let created = deltas
+        .iter()
+        .find(|delta| delta.kind == FxFamilyDeltaKind::Created)
+        .expect("voxel update split should promote the child actor to a new family");
+    assert_ne!(created.family_id, family);
+    assert_eq!(created.parent_family_id, family);
+    assert_eq!(world.family(family).unwrap().actors().count(), 1);
+    assert_eq!(world.family(created.family_id).unwrap().actors().count(), 1);
+}
 
-    let err = world
+#[test]
+fn read_family_state_reports_split_family_runtime_counts() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_lod_settings(ColliderLodSettings::small_debris_box(4, 1));
+    world
+        .add_destructible(family, line_asset_from_occupancy(&[true, true, true, true]))
+        .unwrap();
+    let (_sync_report, deltas) = world
         .update_destructible_from_voxels(
             family,
-            line_asset_from_occupancy(&[true, true, true, true]),
+            line_asset_from_occupancy(&[true, false, true, true]),
         )
-        .unwrap_err();
+        .unwrap();
+    let child_family = deltas
+        .iter()
+        .find(|delta| delta.kind == FxFamilyDeltaKind::Created)
+        .expect("voxel update split should create a child family")
+        .family_id;
 
-    assert_eq!(err, FxRapierError::InvalidVoxelUpdate);
-    assert_eq!(world.family(family).unwrap().actors().count(), 2);
+    let state = world.read_family_state(family).unwrap();
+    assert_eq!(state.family_id, family);
+    assert_eq!(state.actor_count, 1);
+    assert_eq!(state.body_count, 1);
+    assert_eq!(state.collider_count, 1);
+    assert_eq!(state.single_body_type, Some(FxActorBodyType::Dynamic));
+    assert!(state.single_body_handle.is_some());
+    assert!(state.single_collider_handle.is_some());
+    assert!(state.occupied_voxel_count >= 1);
+
+    let child_state = world.read_family_state(child_family).unwrap();
+    assert_eq!(child_state.family_id, child_family);
+    assert_eq!(child_state.actor_count, 1);
+    assert_eq!(child_state.body_count, 1);
+    assert_eq!(child_state.collider_count, 1);
+    assert_eq!(child_state.single_body_type, Some(FxActorBodyType::Dynamic));
+    assert!(child_state.single_body_handle.is_some());
+    assert!(child_state.single_collider_handle.is_some());
+    assert!(child_state.occupied_voxel_count >= 1);
+    assert_eq!(
+        state.occupied_voxel_count + child_state.occupied_voxel_count,
+        3
+    );
 }
 
 fn two_by_two_four_node_asset() -> fracture_voxel::AuthoredVoxelAsset {
@@ -1515,7 +1568,16 @@ fn fracture_field_radius_and_family_filter_apply() {
             .all(|event| event.family == FxFamilyId(2))
     );
     assert_eq!(world.family(FxFamilyId(1)).unwrap().actor_count(), 1);
-    assert_eq!(world.family(FxFamilyId(2)).unwrap().actor_count(), 2);
+    assert_eq!(world.family(FxFamilyId(2)).unwrap().actor_count(), 1);
+    let created = step
+        .report
+        .family_deltas
+        .iter()
+        .find(|delta| {
+            delta.kind == FxFamilyDeltaKind::Created && delta.parent_family_id == FxFamilyId(2)
+        })
+        .expect("split should promote the child fragment to a new family");
+    assert_eq!(world.family(created.family_id).unwrap().actor_count(), 1);
 }
 
 #[test]
@@ -2611,8 +2673,16 @@ fn same_step_split_sync() {
     assert_eq!(event.kept_actor, FxActorId(0));
     assert_eq!(event.created_children, vec![FxActorId(1)]);
 
+    let created = report
+        .report
+        .family_deltas
+        .iter()
+        .find(|delta| {
+            delta.kind == FxFamilyDeltaKind::Created && delta.parent_family_id == FxFamilyId(1)
+        })
+        .expect("split should promote the child fragment to a new family");
     let kept = world.actor_handles(FxFamilyId(1), event.kept_actor);
-    let child = world.actor_handles(FxFamilyId(1), FxActorId(1));
+    let child = world.actor_handles(created.family_id, FxActorId(1));
     assert!(
         kept.is_some(),
         "kept actor has Rapier handles before return"
@@ -2686,6 +2756,57 @@ fn split_remaps_impulse_joint_endpoint_to_child_fragment() {
     assert!(world.impulse_joints().contains(replacement.new));
     let kept = world.actor_handles(family, FxActorId(0)).unwrap();
     let child = world.actor_handles(family, FxActorId(1)).unwrap();
+    assert_eq!(kept.body, parent.body);
+    let joints = world.impulse_joints().iter().collect::<Vec<_>>();
+    assert_eq!(joints.len(), 1);
+    let (new_joint, joint) = joints[0];
+    assert_eq!(new_joint, replacement.new);
+    assert_eq!(joint.body1, child.body);
+    assert_eq!(joint.body2, anchor);
+    assert_ne!(joint.body1, kept.body);
+    assert_vector_close(joint.data.local_anchor1(), Vector::ZERO);
+    assert_vector_close(joint.data.local_anchor2(), Vector::ZERO);
+}
+
+#[test]
+fn voxel_update_split_remaps_impulse_joint_endpoint_to_promoted_family() {
+    let family = FxFamilyId(1);
+    let mut world = FxRapierWorld2D::new();
+    world.set_gravity(Vector::ZERO);
+    world
+        .add_destructible(family, line_asset_from_occupancy(&[true, true, true, true]))
+        .unwrap();
+    let parent = world.actor_handles(family, FxActorId(0)).unwrap();
+    let anchor =
+        world.insert_rigid_body(RigidBodyBuilder::fixed().translation(Vector::new(3.5, 0.5)));
+    let old_joint = world.insert_impulse_joint(
+        parent.body,
+        anchor,
+        FixedJointBuilder::new()
+            .local_anchor1(Vector::new(-1.5, 0.0))
+            .local_anchor2(Vector::ZERO),
+        true,
+    );
+
+    let (sync_report, deltas) = world
+        .update_destructible_from_voxels(
+            family,
+            line_asset_from_occupancy(&[true, false, true, true]),
+        )
+        .unwrap();
+    let child_family = deltas
+        .iter()
+        .find(|delta| delta.kind == FxFamilyDeltaKind::Created)
+        .expect("voxel update split should promote a child family")
+        .family_id;
+
+    assert_eq!(sync_report.impulse_joint_handle_replacements.len(), 1);
+    let replacement = sync_report.impulse_joint_handle_replacements[0];
+    assert_eq!(replacement.old, old_joint);
+    assert!(!world.impulse_joints().contains(old_joint));
+    assert!(world.impulse_joints().contains(replacement.new));
+    let kept = world.actor_handles(family, FxActorId(0)).unwrap();
+    let child = world.actor_handles(child_family, FxActorId(1)).unwrap();
     assert_eq!(kept.body, parent.body);
     let joints = world.impulse_joints().iter().collect::<Vec<_>>();
     assert_eq!(joints.len(), 1);

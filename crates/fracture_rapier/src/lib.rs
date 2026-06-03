@@ -37,15 +37,17 @@ pub use impulse_readback::{
 };
 pub use joint_feedback::JointFeedbackStress;
 pub use pipeline::{
-    ACTIVE_BODY_BUDGET, FxGlobalStressCapReport, FxPerformanceBudgetReport, FxStepDiagnostics,
-    FxStepReport, FxStepWithDiagnostics, OCCUPIED_VOXEL_BUDGET, SUPPORT_NODE_BUDGET,
+    ACTIVE_BODY_BUDGET, FxFamilyBodyMode, FxFamilyDelta, FxFamilyDeltaKind,
+    FxGlobalStressCapReport, FxPerformanceBudgetReport, FxStepDiagnostics, FxStepReport,
+    FxStepWithDiagnostics, OCCUPIED_VOXEL_BUDGET, SUPPORT_NODE_BUDGET,
 };
 pub use replay::{
     FxRapierReplayCommand, FxRapierReplayTickReport, ReplayTrace, ReplayTraceActorBody,
 };
 pub use snapshot::{FxRapierSnapshotError, SnapshotReplayMode};
 pub use world::{
-    FractureField2D, FractureFieldEffect, FractureFieldMode, FxRapierError, FxRapierWorld2D,
+    FractureField2D, FractureFieldEffect, FractureFieldMode, FxActorBodyType, FxRapierError,
+    FxRapierWorld2D,
 };
 
 #[cfg(test)]

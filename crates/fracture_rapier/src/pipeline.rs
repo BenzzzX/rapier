@@ -1,4 +1,4 @@
-use fracture_core::{FractureEvent, SplitEvent, StressInput, StressProfile};
+use fracture_core::{FractureEvent, FxFamilyId, SplitEvent, StressInput, StressProfile};
 
 use crate::{
     ContactImpulseInput, FractureFieldEffect, FxPhysicsSyncReport, ImpulseJointHandleReplacement,
@@ -36,7 +36,48 @@ pub struct FxStepReport {
     pub stress_inputs: Vec<StressInput>,
     pub fracture_events: Vec<FractureEvent>,
     pub split_events: Vec<SplitEvent>,
+    pub family_deltas: Vec<FxFamilyDelta>,
     pub impulse_joint_handle_replacements: Vec<ImpulseJointHandleReplacement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxFamilyDeltaKind {
+    Created = 0,
+    Updated = 1,
+    Destroyed = 2,
+}
+
+impl Default for FxFamilyDeltaKind {
+    fn default() -> Self {
+        Self::Updated
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxFamilyBodyMode {
+    Dynamic = 0,
+    AttachedStatic = 1,
+    Fixed = 2,
+    KinematicVelocityBased = 3,
+    KinematicPositionBased = 4,
+    Destroyed = 5,
+}
+
+impl Default for FxFamilyBodyMode {
+    fn default() -> Self {
+        Self::Dynamic
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FxFamilyDelta {
+    pub delta_id: u64,
+    pub kind: FxFamilyDeltaKind,
+    pub family_id: FxFamilyId,
+    pub parent_family_id: FxFamilyId,
+    pub body_mode: FxFamilyBodyMode,
+    pub occupied_voxel_count: usize,
+    pub actor_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

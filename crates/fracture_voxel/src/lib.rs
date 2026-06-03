@@ -7,9 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fracture_core::{
-    BondId, BondRuntimeState, Chunk2D, ChunkId, FxActorId, FxAsset, FxAssetDesc, FxFamily,
-    FxFamilyId, GridAabb, GridCoord, NodeRuntimeState, RepairError, RepairPlan, SplitEvent,
-    SupportNodeId, ValidationError, Vec2,
+    BondId, BondRuntimeState, Chunk2D, ChunkId, FamilyExtractError, FxActorId, FxAsset,
+    FxAssetDesc, FxFamily, FxFamilyId, GridAabb, GridCoord, NodeRuntimeState, RepairError,
+    RepairPlan, SplitEvent, SupportNodeId, ValidationError, Vec2,
 };
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -466,6 +466,15 @@ pub struct VoxelRuntime {
     last_repair: Option<RepairReport>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtractedVoxelRuntime {
+    pub runtime: VoxelRuntime,
+    pub moved_actor: FxActorId,
+    pub moved_nodes: Vec<SupportNodeId>,
+    pub moved_external_bonds: Vec<fracture_core::ExternalBondId>,
+    pub moved_dynamic_connections: Vec<fracture_core::ConnectionId>,
+}
+
 impl VoxelRuntime {
     pub fn instantiate(family_id: FxFamilyId, asset: AuthoredVoxelAsset) -> Self {
         let family = FxFamily::instantiate(family_id, asset.core.clone());
@@ -528,6 +537,38 @@ impl VoxelRuntime {
 
     pub fn split_dirty_actors(&mut self) -> Vec<SplitEvent> {
         fracture_core::split_dirty_actors(&mut self.family)
+    }
+
+    pub fn extract_actor_as_runtime(
+        &mut self,
+        actor: FxActorId,
+        new_family_id: FxFamilyId,
+    ) -> Result<ExtractedVoxelRuntime, VoxelError> {
+        let old_asset = self.asset.clone();
+        let old_node_lineage = self.node_lineage.clone();
+        let extraction = self.family.extract_actor_as_family(actor, new_family_id)?;
+
+        self.asset = authored_asset_from_core(self.family.asset().clone(), &old_asset)?;
+        self.voxel_owner = voxel_owner_from_family(&self.asset, &self.family);
+        self.node_lineage =
+            filter_node_lineage(&old_node_lineage, self.asset.core().support_nodes());
+        self.last_repair = None;
+
+        let child_asset = authored_asset_from_core(extraction.family.asset().clone(), &old_asset)?;
+        let mut child_runtime = VoxelRuntime::from_family(child_asset, extraction.family);
+        child_runtime.node_lineage = filter_node_lineage(
+            &old_node_lineage,
+            child_runtime.asset.core().support_nodes(),
+        );
+        child_runtime.last_repair = None;
+
+        Ok(ExtractedVoxelRuntime {
+            runtime: child_runtime,
+            moved_actor: extraction.moved_actor,
+            moved_nodes: extraction.moved_nodes,
+            moved_external_bonds: extraction.moved_external_bonds,
+            moved_dynamic_connections: extraction.moved_dynamic_connections,
+        })
     }
 
     pub fn apply_asset_update(
@@ -883,6 +924,68 @@ impl VoxelRuntime {
             Err(VoxelError::CoordinateOutOfBounds(coord))
         }
     }
+}
+
+fn authored_asset_from_core(
+    core: FxAsset,
+    metadata_source: &AuthoredVoxelAsset,
+) -> Result<AuthoredVoxelAsset, VoxelError> {
+    let asset = AuthoredVoxelAsset {
+        summaries: node_summaries(
+            &core,
+            &metadata_source.contact_material,
+            &metadata_source.external_id,
+            metadata_source.width,
+        ),
+        bond_summaries: bond_summaries(
+            &core,
+            &metadata_source.contact_material,
+            &metadata_source.external_id,
+            metadata_source.width,
+            metadata_source.height,
+        ),
+        core,
+        width: metadata_source.width,
+        height: metadata_source.height,
+        contact_material: metadata_source.contact_material.clone(),
+        fracture_material: metadata_source.fracture_material.clone(),
+        external_id: metadata_source.external_id.clone(),
+        orientation: metadata_source.orientation.clone(),
+        default_bond_health: metadata_source.default_bond_health,
+        default_tension_limit: metadata_source.default_tension_limit,
+        default_shear_limit: metadata_source.default_shear_limit,
+    };
+    asset.validate_exact_cover()?;
+    Ok(asset)
+}
+
+fn voxel_owner_from_family(
+    asset: &AuthoredVoxelAsset,
+    family: &FxFamily,
+) -> Vec<Option<FxActorId>> {
+    let mut voxel_owner = vec![None; cell_count(asset.width, asset.height)];
+    for coord in all_coords(asset.width, asset.height) {
+        let idx = index(asset.width, coord);
+        if let Some(node) = asset.core.node_at(coord) {
+            voxel_owner[idx] = family.node_owner(node);
+        }
+    }
+    voxel_owner
+}
+
+fn filter_node_lineage(
+    old_lineage: &BTreeMap<SupportNodeId, SupportNodeId>,
+    nodes: &[fracture_core::SupportNode2D],
+) -> BTreeMap<SupportNodeId, SupportNodeId> {
+    nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id,
+                old_lineage.get(&node.id).copied().unwrap_or(node.id),
+            )
+        })
+        .collect()
 }
 
 pub fn author_voxel_asset(input: VoxelAuthoringInput) -> Result<AuthoredVoxelAsset, VoxelError> {
@@ -2428,6 +2531,8 @@ pub enum VoxelError {
     CoreValidation(#[from] ValidationError),
     #[error(transparent)]
     CoreRepair(#[from] RepairError),
+    #[error(transparent)]
+    CoreExtract(#[from] FamilyExtractError),
 }
 
 #[cfg(test)]

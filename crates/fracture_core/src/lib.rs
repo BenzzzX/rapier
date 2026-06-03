@@ -957,6 +957,15 @@ pub struct MergeActorsResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ExtractActorAsFamilyResult {
+    pub family: FxFamily,
+    pub moved_actor: FxActorId,
+    pub moved_nodes: Vec<SupportNodeId>,
+    pub moved_external_bonds: Vec<ExternalBondId>,
+    pub moved_dynamic_connections: Vec<ConnectionId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeRuntimeState {
     pub health: f32,
     pub accumulated_damage: f32,
@@ -1324,6 +1333,162 @@ impl FxFamily {
         })
     }
 
+    pub fn extract_actor_as_family(
+        &mut self,
+        actor: FxActorId,
+        new_family_id: FxFamilyId,
+    ) -> Result<ExtractActorAsFamilyResult, FamilyExtractError> {
+        let moved_actor = self
+            .actors
+            .get(&actor)
+            .ok_or(FamilyExtractError::UnknownActor(actor))?
+            .clone();
+        if self.actors.len() <= 1 {
+            return Err(FamilyExtractError::CannotExtractOnlyActor(actor));
+        }
+
+        let moved_nodes = moved_actor
+            .owned_nodes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let parent_nodes = self
+            .asset
+            .support_nodes()
+            .iter()
+            .map(|node| node.id)
+            .filter(|node| !moved_nodes.contains(node))
+            .collect::<BTreeSet<_>>();
+        if parent_nodes.is_empty() {
+            return Err(FamilyExtractError::ParentWouldBeEmpty(actor));
+        }
+
+        for bond in self.dynamic_structural_bonds.values() {
+            let a_moved = moved_nodes.contains(&bond.node_a);
+            let b_moved = moved_nodes.contains(&bond.node_b);
+            if a_moved != b_moved {
+                return Err(FamilyExtractError::CrossFamilyDynamicConnection {
+                    connection: bond.id,
+                    node_a: bond.node_a,
+                    node_b: bond.node_b,
+                });
+            }
+        }
+
+        let parent_asset = build_asset_node_subset(&self.asset, &parent_nodes)?;
+        let child_asset = build_asset_node_subset(&self.asset, &moved_nodes)?;
+        let parent_bond_states = remap_bond_states(&self.asset, &parent_asset, &self.bond_states)?;
+        let child_bond_states = remap_bond_states(&self.asset, &child_asset, &self.bond_states)?;
+
+        let mut parent_actors = BTreeMap::new();
+        let mut parent_node_owner = BTreeMap::new();
+        for (actor_id, old_actor) in &self.actors {
+            if *actor_id == actor {
+                continue;
+            }
+            let nodes = old_actor
+                .owned_nodes
+                .iter()
+                .copied()
+                .filter(|node| parent_nodes.contains(node))
+                .collect::<Vec<_>>();
+            if nodes.is_empty() {
+                continue;
+            }
+            let rebuilt = build_actor(*actor_id, &nodes, &parent_asset);
+            for node in &rebuilt.owned_nodes {
+                parent_node_owner.insert(*node, *actor_id);
+            }
+            parent_actors.insert(*actor_id, rebuilt);
+        }
+
+        let mut child_node_owner = BTreeMap::new();
+        let child_actor = build_actor(actor, &moved_actor.owned_nodes, &child_asset);
+        for node in &child_actor.owned_nodes {
+            child_node_owner.insert(*node, actor);
+        }
+        let mut child_actors = BTreeMap::new();
+        child_actors.insert(actor, child_actor);
+
+        let mut moved_external_bonds = Vec::new();
+        let mut parent_external_bonds = BTreeMap::new();
+        let mut child_external_bonds = BTreeMap::new();
+        for (id, bond) in &self.external_bonds {
+            if moved_nodes.contains(&bond.node) {
+                moved_external_bonds.push(*id);
+                child_external_bonds.insert(*id, bond.clone());
+            } else {
+                parent_external_bonds.insert(*id, bond.clone());
+            }
+        }
+
+        let mut moved_dynamic_connections = Vec::new();
+        let mut parent_dynamic_structural_bonds = BTreeMap::new();
+        let mut child_dynamic_structural_bonds = BTreeMap::new();
+        for (id, bond) in &self.dynamic_structural_bonds {
+            if moved_nodes.contains(&bond.node_a) {
+                moved_dynamic_connections.push(*id);
+                child_dynamic_structural_bonds.insert(*id, bond.clone());
+            } else {
+                parent_dynamic_structural_bonds.insert(*id, bond.clone());
+            }
+        }
+
+        let parent_node_states = self
+            .node_states
+            .iter()
+            .filter_map(|(node, state)| {
+                parent_nodes
+                    .contains(node)
+                    .then_some((*node, state.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let child_node_states = self
+            .node_states
+            .iter()
+            .filter_map(|(node, state)| {
+                moved_nodes.contains(node).then_some((*node, state.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let parent_chunk_states = subset_chunk_states(&parent_asset, &self.chunk_states)?;
+        let child_chunk_states = subset_chunk_states(&child_asset, &self.chunk_states)?;
+
+        self.asset = parent_asset;
+        self.actors = parent_actors;
+        self.node_owner = parent_node_owner;
+        self.node_states = parent_node_states;
+        self.chunk_states = parent_chunk_states;
+        self.bond_states = parent_bond_states;
+        self.external_bonds = parent_external_bonds;
+        self.dynamic_structural_bonds = parent_dynamic_structural_bonds;
+        self.dirty_actors.remove(&actor);
+
+        let child_family = FxFamily {
+            id: new_family_id,
+            asset: child_asset,
+            actors: child_actors,
+            node_owner: child_node_owner,
+            node_states: child_node_states,
+            chunk_states: child_chunk_states,
+            bond_states: child_bond_states,
+            external_bonds: child_external_bonds,
+            dynamic_structural_bonds: child_dynamic_structural_bonds,
+            dirty_actors: BTreeSet::new(),
+            next_actor_id: actor.0.saturating_add(1),
+            next_event_id: 0,
+        };
+        self.asset.validate()?;
+        child_family.asset.validate()?;
+
+        Ok(ExtractActorAsFamilyResult {
+            family: child_family,
+            moved_actor: actor,
+            moved_nodes: moved_nodes.iter().copied().collect(),
+            moved_external_bonds,
+            moved_dynamic_connections,
+        })
+    }
+
     fn has_unbroken_graph_connection_between(
         &self,
         actor_a_nodes: &[SupportNodeId],
@@ -1675,6 +1840,124 @@ impl FxFamily {
     }
 }
 
+fn build_asset_node_subset(
+    source: &FxAsset,
+    nodes: &BTreeSet<SupportNodeId>,
+) -> Result<FxAsset, ValidationError> {
+    let mut occupancy = source.occupancy.cells().to_vec();
+    let mut voxel_to_node = source.voxel_to_node.clone();
+    for (idx, owner) in voxel_to_node.iter_mut().enumerate() {
+        if owner.is_none_or(|node| !nodes.contains(&node)) {
+            *owner = None;
+            occupancy[idx] = false;
+        }
+    }
+
+    let mut support_nodes = Vec::new();
+    for node in &source.support_nodes {
+        if nodes.contains(&node.id) {
+            support_nodes.push(node.clone());
+        }
+    }
+
+    let source_chunks = source
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.id, chunk))
+        .collect::<BTreeMap<_, _>>();
+    let mut included_chunks = BTreeSet::new();
+    for chunk in &source.chunks {
+        if chunk.support_nodes.iter().any(|node| nodes.contains(node)) {
+            let mut current = Some(chunk.id);
+            while let Some(chunk_id) = current {
+                if !included_chunks.insert(chunk_id) {
+                    break;
+                }
+                current = source_chunks.get(&chunk_id).and_then(|chunk| chunk.parent);
+            }
+        }
+    }
+    let chunks = source
+        .chunks
+        .iter()
+        .filter(|chunk| included_chunks.contains(&chunk.id))
+        .map(|chunk| Chunk2D {
+            id: chunk.id,
+            support_nodes: chunk
+                .support_nodes
+                .iter()
+                .copied()
+                .filter(|node| nodes.contains(node))
+                .collect(),
+            parent: chunk.parent,
+        })
+        .collect::<Vec<_>>();
+    let mut internal_bonds = Vec::new();
+    for bond in &source.internal_bonds {
+        if nodes.contains(&bond.node_a) && nodes.contains(&bond.node_b) {
+            let mut bond = bond.clone();
+            bond.id = BondId(internal_bonds.len() as u32);
+            internal_bonds.push(bond);
+        }
+    }
+
+    let asset = FxAsset {
+        id: source.id,
+        voxel_size: source.voxel_size,
+        occupancy: DenseOccupancy::new(source.occupancy.width, source.occupancy.height, occupancy)?,
+        support_nodes,
+        chunks,
+        internal_bonds,
+        voxel_to_node,
+    };
+    asset.validate()?;
+    Ok(asset)
+}
+
+fn remap_bond_states(
+    old_asset: &FxAsset,
+    new_asset: &FxAsset,
+    old_states: &[BondRuntimeState],
+) -> Result<Vec<BondRuntimeState>, FamilyExtractError> {
+    let old_by_nodes = old_asset
+        .internal_bonds()
+        .iter()
+        .enumerate()
+        .map(|(idx, bond)| ((bond.node_a, bond.node_b), idx))
+        .collect::<BTreeMap<_, _>>();
+    let mut out = Vec::with_capacity(new_asset.internal_bonds().len());
+    for bond in new_asset.internal_bonds() {
+        let Some(old_index) = old_by_nodes.get(&(bond.node_a, bond.node_b)).copied() else {
+            return Err(FamilyExtractError::MissingBondRuntimeState {
+                node_a: bond.node_a,
+                node_b: bond.node_b,
+            });
+        };
+        let Some(state) = old_states.get(old_index).cloned() else {
+            return Err(FamilyExtractError::MissingBondRuntimeState {
+                node_a: bond.node_a,
+                node_b: bond.node_b,
+            });
+        };
+        out.push(state);
+    }
+    Ok(out)
+}
+
+fn subset_chunk_states(
+    new_asset: &FxAsset,
+    old_states: &BTreeMap<ChunkId, ChunkRuntimeState>,
+) -> Result<BTreeMap<ChunkId, ChunkRuntimeState>, FamilyExtractError> {
+    let mut out = BTreeMap::new();
+    for chunk in new_asset.chunks() {
+        let Some(state) = old_states.get(&chunk.id).cloned() else {
+            return Err(FamilyExtractError::MissingChunkRuntimeState(chunk.id));
+        };
+        out.insert(chunk.id, state);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepairPlan {
     pub asset: FxAsset,
@@ -1688,6 +1971,33 @@ pub struct RepairPlan {
 pub struct RepairCommitSummary {
     pub dirty_actors: Vec<FxActorId>,
     pub actor_order: Vec<FxActorId>,
+}
+
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum FamilyExtractError {
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+    #[error("unknown actor {0:?}")]
+    UnknownActor(FxActorId),
+    #[error("cannot extract the only actor {0:?} from a family")]
+    CannotExtractOnlyActor(FxActorId),
+    #[error("extracting actor {0:?} would leave the parent family empty")]
+    ParentWouldBeEmpty(FxActorId),
+    #[error(
+        "dynamic connection {connection:?} crosses extracted family boundary between {node_a:?} and {node_b:?}"
+    )]
+    CrossFamilyDynamicConnection {
+        connection: ConnectionId,
+        node_a: SupportNodeId,
+        node_b: SupportNodeId,
+    },
+    #[error("missing runtime state for extracted bond between {node_a:?} and {node_b:?}")]
+    MissingBondRuntimeState {
+        node_a: SupportNodeId,
+        node_b: SupportNodeId,
+    },
+    #[error("missing runtime state for extracted chunk {0:?}")]
+    MissingChunkRuntimeState(ChunkId),
 }
 
 #[derive(Error, Debug, Clone, PartialEq)]
