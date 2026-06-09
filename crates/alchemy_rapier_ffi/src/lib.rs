@@ -290,6 +290,10 @@ pub struct AlchemyRapierVoxelColliderDesc {
     pub voxel_size: AlchemyRapierVec2,
     pub cells: *const AlchemyRapierVoxelCell,
     pub cell_count: usize,
+    pub query_source_kind: AlchemyRapierQuerySourceKind,
+    pub terrain_chunk_x: i32,
+    pub terrain_chunk_y: i32,
+    pub terrain_revision: i64,
 }
 
 #[repr(C)]
@@ -723,6 +727,13 @@ struct VoxelCellMetadata {
     source_cell_id: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VoxelTerrainSourceMetadata {
+    chunk_x: i32,
+    chunk_y: i32,
+    revision: i64,
+}
+
 struct PendingSplitEvent {
     row: AlchemyRapierSplitEventRow,
     source_cell_indices: Vec<i32>,
@@ -751,6 +762,7 @@ struct AlchemyRapierWorldInner {
     pixel_rigidbodies: HashMap<RigidBodyHandle, PixelRigidbodyState>,
     contact_materials: HashMap<u16, ContactMaterial>,
     voxel_colliders: HashMap<(u32, u32), HashMap<u32, VoxelCellMetadata>>,
+    voxel_terrain_sources: HashMap<ColliderHandle, VoxelTerrainSourceMetadata>,
     pending_split_events: Vec<PendingSplitEvent>,
     previous_active_contact_pairs: HashSet<(u64, u64)>,
 }
@@ -776,6 +788,7 @@ impl AlchemyRapierWorldInner {
             pixel_rigidbodies: HashMap::new(),
             contact_materials: HashMap::new(),
             voxel_colliders: HashMap::new(),
+            voxel_terrain_sources: HashMap::new(),
             pending_split_events: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
         }
@@ -1264,6 +1277,30 @@ fn voxel_metadata(
         .get(&collider_key(handle))
         .and_then(|metadata| metadata.get(&subshape))
         .copied()
+}
+
+fn update_voxel_terrain_source_metadata(
+    world: &mut AlchemyRapierWorldInner,
+    handle: ColliderHandle,
+    desc: AlchemyRapierVoxelColliderDesc,
+) {
+    if desc.query_source_kind == AlchemyRapierQuerySourceKind::StaticTerrain {
+        world.voxel_terrain_sources.insert(
+            handle,
+            VoxelTerrainSourceMetadata {
+                chunk_x: desc.terrain_chunk_x,
+                chunk_y: desc.terrain_chunk_y,
+                revision: desc.terrain_revision,
+            },
+        );
+    } else {
+        world.voxel_terrain_sources.remove(&handle);
+    }
+}
+
+fn remove_voxel_collider_metadata(world: &mut AlchemyRapierWorldInner, handle: ColliderHandle) {
+    world.voxel_colliders.remove(&collider_key(handle));
+    world.voxel_terrain_sources.remove(&handle);
 }
 
 struct AlchemyContactHooks<'a> {
@@ -2519,6 +2556,7 @@ enum QueryTarget {
     Dynamic(RigidBodyHandle),
     TerrainChunk(TerrainKey),
     TerrainFractureActor(i64),
+    VoxelStaticTerrain(VoxelTerrainSourceMetadata),
 }
 
 fn query_target(
@@ -2542,6 +2580,9 @@ fn query_target(
             .get(&collider_handle)
         {
             return Some(QueryTarget::TerrainFractureActor(*actor_key));
+        }
+        if let Some(source) = world.voxel_terrain_sources.get(&collider_handle) {
+            return Some(QueryTarget::VoxelStaticTerrain(*source));
         }
     }
     None
@@ -2636,6 +2677,35 @@ fn make_terrain_actor_query_hit(
     })
 }
 
+fn make_voxel_terrain_query_hit(
+    world: &AlchemyRapierWorldInner,
+    source: VoxelTerrainSourceMetadata,
+    collider_handle: ColliderHandle,
+    point: Vector,
+    normal: Vector,
+    distance: f32,
+    fraction: f32,
+) -> Option<AlchemyRapierQueryHit> {
+    let collider = world.colliders.get(collider_handle)?;
+    Some(AlchemyRapierQueryHit {
+        source_kind: AlchemyRapierQuerySourceKind::StaticTerrain,
+        body_packed_id: 0,
+        collider_packed_id: pack_collider_handle(collider_handle),
+        terrain_chunk_x: source.chunk_x,
+        terrain_chunk_y: source.chunk_y,
+        terrain_revision: source.revision,
+        terrain_actor_key: 0,
+        world_cell_x: point.x.floor() as i32,
+        world_cell_y: point.y.floor() as i32,
+        point: ffi_vec(point),
+        normal: ffi_vec(normalized_or_zero(normal)),
+        local_point: ffi_vec(collider.position().inverse_transform_point(point)),
+        point_velocity: AlchemyRapierVec2::default(),
+        distance,
+        fraction,
+    })
+}
+
 fn make_query_hit(
     world: &AlchemyRapierWorldInner,
     target: QueryTarget,
@@ -2667,6 +2737,15 @@ fn make_query_hit(
         QueryTarget::TerrainFractureActor(actor_key) => make_terrain_actor_query_hit(
             world,
             actor_key,
+            collider_handle,
+            point,
+            normal,
+            distance,
+            fraction,
+        ),
+        QueryTarget::VoxelStaticTerrain(source) => make_voxel_terrain_query_hit(
+            world,
+            source,
             collider_handle,
             point,
             normal,
@@ -3050,7 +3129,7 @@ pub extern "C" fn alchemy_rapier_clear_body_colliders(
         world.pixel_rigidbodies.remove(&body_handle);
         let colliders = body.colliders().to_vec();
         for collider in colliders {
-            world.voxel_colliders.remove(&collider_key(collider));
+            remove_voxel_collider_metadata(world, collider);
             let _ = world
                 .colliders
                 .remove(collider, &mut world.islands, &mut world.bodies, true);
@@ -3373,6 +3452,7 @@ pub extern "C" fn alchemy_rapier_create_voxel_collider(
             }
         }
         world.voxel_colliders.insert(collider_key(handle), metadata);
+        update_voxel_terrain_source_metadata(world, handle, desc);
         AlchemyRapierCreateColliderResult {
             status: AlchemyRapierStatus::Ok,
             handle: collider_handle_to_ffi(handle),
@@ -3439,6 +3519,7 @@ pub extern "C" fn alchemy_rapier_update_voxel_collider_by_id(
             }
         }
         world.voxel_colliders.insert(collider_key(handle), metadata);
+        update_voxel_terrain_source_metadata(world, handle, desc);
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -3463,7 +3544,7 @@ pub extern "C" fn alchemy_rapier_destroy_collider(
         if let Some(body) = stale_pixel_body {
             world.pixel_rigidbodies.remove(&body);
         }
-        world.voxel_colliders.remove(&collider_key(handle));
+        remove_voxel_collider_metadata(world, handle);
         if world
             .colliders
             .remove(handle, &mut world.islands, &mut world.bodies, true)
@@ -3489,7 +3570,7 @@ pub extern "C" fn alchemy_rapier_destroy_collider_by_id(
             return AlchemyRapierStatus::NullPointer;
         };
         let handle = collider_handle_from_packed(packed_id);
-        world.voxel_colliders.remove(&collider_key(handle));
+        remove_voxel_collider_metadata(world, handle);
         if world
             .colliders
             .remove(handle, &mut world.islands, &mut world.bodies, true)
@@ -4241,6 +4322,109 @@ pub extern "C" fn alchemy_rapier_query_cast_segment(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_cast_capsule(
+    world: *mut AlchemyRapierWorld,
+    from_origin: AlchemyRapierVec2,
+    to_origin: AlchemyRapierVec2,
+    radius: f32,
+    half_height: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 || !half_height.is_finite() || half_height < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let from_origin = vector(from_origin);
+        let to_origin = vector(to_origin);
+        let delta = to_origin - from_origin;
+        let distance = delta.length();
+        if !distance.is_finite() || distance <= 0.000001 {
+            return AlchemyRapierQueryResult {
+                status: AlchemyRapierStatus::Ok,
+                hit_count: 0,
+                written_count: 0,
+                candidate_count: 0,
+            };
+        }
+
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let capsule = Capsule::new_y(half_height, radius.max(0.000001));
+        let capsule_pose = pose_translation(from_origin);
+        let options = ShapeCastOptions {
+            max_time_of_impact: 1.0,
+            target_distance: 0.0,
+            stop_at_penetration: true,
+            compute_impact_geometry_on_penetration: true,
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
+                continue;
+            };
+            candidate_count += 1;
+            let pos12 = collider.position().inv_mul(&capsule_pose);
+            let local_vel12 = collider.position().inverse_transform_vector(delta);
+            let Ok(Some(shape_hit)) =
+                dispatcher.cast_shapes(&pos12, local_vel12, collider.shape(), &capsule, options)
+            else {
+                continue;
+            };
+            let fraction = shape_hit.time_of_impact.clamp(0.0, 1.0);
+            let impact_pose = pose_translation(from_origin + delta * fraction);
+            let point = impact_pose.transform_point(shape_hit.witness2);
+            let normal = collider.position().rotation * shape_hit.normal1;
+            if let Some(hit) = make_query_hit(
+                world,
+                target,
+                collider_handle,
+                point,
+                normal,
+                fraction * distance,
+                fraction,
+            ) {
+                write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_query_overlap_capsule(
     world: *mut AlchemyRapierWorld,
     origin: AlchemyRapierVec2,
@@ -4414,6 +4598,10 @@ pub extern "C" fn alchemy_rapier_query_surface_anchor(
                         .copied()
                     {
                         QueryTarget::TerrainFractureActor(actor_key)
+                    } else if let Some(source) =
+                        world.voxel_terrain_sources.get(&collider_handle).copied()
+                    {
+                        QueryTarget::VoxelStaticTerrain(source)
                     } else {
                         continue;
                     };
