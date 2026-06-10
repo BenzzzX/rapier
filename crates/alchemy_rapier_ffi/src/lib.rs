@@ -290,10 +290,15 @@ pub struct AlchemyRapierVoxelColliderDesc {
     pub voxel_size: AlchemyRapierVec2,
     pub cells: *const AlchemyRapierVoxelCell,
     pub cell_count: usize,
-    pub query_source_kind: AlchemyRapierQuerySourceKind,
-    pub terrain_chunk_x: i32,
-    pub terrain_chunk_y: i32,
-    pub terrain_revision: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierStaticTerrainVoxelColliderDesc {
+    pub voxel: AlchemyRapierVoxelColliderDesc,
+    pub chunk_x: i32,
+    pub chunk_y: i32,
+    pub collision_revision: i64,
 }
 
 #[repr(C)]
@@ -1279,23 +1284,18 @@ fn voxel_metadata(
         .copied()
 }
 
-fn update_voxel_terrain_source_metadata(
-    world: &mut AlchemyRapierWorldInner,
-    handle: ColliderHandle,
-    desc: AlchemyRapierVoxelColliderDesc,
-) {
-    if desc.query_source_kind == AlchemyRapierQuerySourceKind::StaticTerrain {
-        world.voxel_terrain_sources.insert(
-            handle,
-            VoxelTerrainSourceMetadata {
-                chunk_x: desc.terrain_chunk_x,
-                chunk_y: desc.terrain_chunk_y,
-                revision: desc.terrain_revision,
-            },
-        );
-    } else {
-        world.voxel_terrain_sources.remove(&handle);
+fn voxel_terrain_source_metadata(
+    desc: AlchemyRapierStaticTerrainVoxelColliderDesc,
+) -> Result<VoxelTerrainSourceMetadata, AlchemyRapierStatus> {
+    if desc.collision_revision < 0 {
+        return Err(AlchemyRapierStatus::InvalidArgument);
     }
+
+    Ok(VoxelTerrainSourceMetadata {
+        chunk_x: desc.chunk_x,
+        chunk_y: desc.chunk_y,
+        revision: desc.collision_revision,
+    })
 }
 
 fn remove_voxel_collider_metadata(world: &mut AlchemyRapierWorldInner, handle: ColliderHandle) {
@@ -1517,6 +1517,14 @@ fn empty_pixel_rigidbody_result(status: AlchemyRapierStatus) -> AlchemyRapierPix
         local_center_of_mass: AlchemyRapierVec2::default(),
         mass: 0.0,
         inertia: 0.0,
+    }
+}
+
+fn empty_create_collider_result(status: AlchemyRapierStatus) -> AlchemyRapierCreateColliderResult {
+    AlchemyRapierCreateColliderResult {
+        status,
+        handle: AlchemyRapierColliderHandle::default(),
+        packed_id: 0,
     }
 }
 
@@ -3398,6 +3406,76 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
     }
 }
 
+fn build_voxel_collider_shape_and_metadata(
+    desc: AlchemyRapierVoxelColliderDesc,
+) -> Result<(SharedShape, HashMap<u32, VoxelCellMetadata>), AlchemyRapierStatus> {
+    if !desc.translation.x.is_finite()
+        || !desc.translation.y.is_finite()
+        || !desc.voxel_size.x.is_finite()
+        || !desc.voxel_size.y.is_finite()
+        || desc.voxel_size.x <= 0.0
+        || desc.voxel_size.y <= 0.0
+        || desc.cells.is_null()
+        || desc.cell_count == 0
+    {
+        return Err(AlchemyRapierStatus::InvalidArgument);
+    }
+
+    let source = unsafe { slice::from_raw_parts(desc.cells, desc.cell_count) };
+    let coords = source
+        .iter()
+        .map(|cell| IVector::new(cell.coord.x, cell.coord.y))
+        .collect::<Vec<_>>();
+    let voxels = Voxels::new(vector(desc.voxel_size), &coords);
+    let mut metadata = HashMap::with_capacity(source.len());
+    for cell in source {
+        let coord = IVector::new(cell.coord.x, cell.coord.y);
+        if let Some(index) = voxels.linear_index(coord) {
+            metadata.insert(
+                index.flat_id() as u32,
+                VoxelCellMetadata {
+                    material_id: cell.material_id,
+                    source_cell_id: cell.source_cell_id,
+                },
+            );
+        }
+    }
+
+    Ok((SharedShape::new(voxels), metadata))
+}
+
+fn create_voxel_collider_inner(
+    world: &mut AlchemyRapierWorldInner,
+    desc: AlchemyRapierVoxelColliderDesc,
+) -> Result<ColliderHandle, AlchemyRapierStatus> {
+    let (shape, metadata) = build_voxel_collider_shape_and_metadata(desc)?;
+    let collider = ColliderBuilder::new(shape)
+        .translation(vector(desc.translation))
+        .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
+        .build();
+    let handle = world.colliders.insert(collider);
+    world.voxel_colliders.insert(collider_key(handle), metadata);
+    Ok(handle)
+}
+
+fn update_voxel_collider_inner(
+    world: &mut AlchemyRapierWorldInner,
+    packed_id: u64,
+    desc: AlchemyRapierVoxelColliderDesc,
+) -> Result<ColliderHandle, AlchemyRapierStatus> {
+    let (shape, metadata) = build_voxel_collider_shape_and_metadata(desc)?;
+    let handle = collider_handle_from_packed(packed_id);
+    let Some(collider) = world.colliders.get_mut(handle) else {
+        return Err(AlchemyRapierStatus::InvalidHandle);
+    };
+
+    collider.set_shape(shape);
+    collider.set_translation(vector(desc.translation));
+    collider.set_active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
+    world.voxel_colliders.insert(collider_key(handle), metadata);
+    Ok(handle)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_create_voxel_collider(
     world: *mut AlchemyRapierWorld,
@@ -3405,66 +3483,49 @@ pub extern "C" fn alchemy_rapier_create_voxel_collider(
 ) -> AlchemyRapierCreateColliderResult {
     match catch_unwind(AssertUnwindSafe(|| {
         let Ok(world) = to_inner(world) else {
-            return AlchemyRapierCreateColliderResult {
-                status: AlchemyRapierStatus::NullPointer,
-                handle: AlchemyRapierColliderHandle::default(),
-                packed_id: 0,
-            };
+            return empty_create_collider_result(AlchemyRapierStatus::NullPointer);
         };
-        if !desc.translation.x.is_finite()
-            || !desc.translation.y.is_finite()
-            || !desc.voxel_size.x.is_finite()
-            || !desc.voxel_size.y.is_finite()
-            || desc.voxel_size.x <= 0.0
-            || desc.voxel_size.y <= 0.0
-            || desc.cells.is_null()
-            || desc.cell_count == 0
-        {
-            return AlchemyRapierCreateColliderResult {
-                status: AlchemyRapierStatus::InvalidArgument,
-                handle: AlchemyRapierColliderHandle::default(),
-                packed_id: 0,
-            };
-        }
-
-        let source = unsafe { slice::from_raw_parts(desc.cells, desc.cell_count) };
-        let coords = source
-            .iter()
-            .map(|cell| IVector::new(cell.coord.x, cell.coord.y))
-            .collect::<Vec<_>>();
-        let voxels = Voxels::new(vector(desc.voxel_size), &coords);
-        let collider = ColliderBuilder::new(SharedShape::new(voxels.clone()))
-            .translation(vector(desc.translation))
-            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
-            .build();
-        let handle = world.colliders.insert(collider);
-        let mut metadata = HashMap::with_capacity(source.len());
-        for cell in source {
-            let coord = IVector::new(cell.coord.x, cell.coord.y);
-            if let Some(index) = voxels.linear_index(coord) {
-                metadata.insert(
-                    index.flat_id() as u32,
-                    VoxelCellMetadata {
-                        material_id: cell.material_id,
-                        source_cell_id: cell.source_cell_id,
-                    },
-                );
-            }
-        }
-        world.voxel_colliders.insert(collider_key(handle), metadata);
-        update_voxel_terrain_source_metadata(world, handle, desc);
-        AlchemyRapierCreateColliderResult {
-            status: AlchemyRapierStatus::Ok,
-            handle: collider_handle_to_ffi(handle),
-            packed_id: pack_collider_handle(handle),
+        match create_voxel_collider_inner(world, desc) {
+            Ok(handle) => AlchemyRapierCreateColliderResult {
+                status: AlchemyRapierStatus::Ok,
+                handle: collider_handle_to_ffi(handle),
+                packed_id: pack_collider_handle(handle),
+            },
+            Err(status) => empty_create_collider_result(status),
         }
     })) {
         Ok(result) => result,
-        Err(_) => AlchemyRapierCreateColliderResult {
-            status: AlchemyRapierStatus::Panic,
-            handle: AlchemyRapierColliderHandle::default(),
-            packed_id: 0,
-        },
+        Err(_) => empty_create_collider_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_create_static_terrain_voxel_collider(
+    world: *mut AlchemyRapierWorld,
+    desc: AlchemyRapierStaticTerrainVoxelColliderDesc,
+) -> AlchemyRapierCreateColliderResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_create_collider_result(AlchemyRapierStatus::NullPointer);
+        };
+        let source = match voxel_terrain_source_metadata(desc) {
+            Ok(source) => source,
+            Err(status) => return empty_create_collider_result(status),
+        };
+        match create_voxel_collider_inner(world, desc.voxel) {
+            Ok(handle) => {
+                world.voxel_terrain_sources.insert(handle, source);
+                AlchemyRapierCreateColliderResult {
+                    status: AlchemyRapierStatus::Ok,
+                    handle: collider_handle_to_ffi(handle),
+                    packed_id: pack_collider_handle(handle),
+                }
+            }
+            Err(status) => empty_create_collider_result(status),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_create_collider_result(AlchemyRapierStatus::Panic),
     }
 }
 
@@ -3478,49 +3539,40 @@ pub extern "C" fn alchemy_rapier_update_voxel_collider_by_id(
         let Ok(world) = to_inner(world) else {
             return AlchemyRapierStatus::NullPointer;
         };
-        if !desc.translation.x.is_finite()
-            || !desc.translation.y.is_finite()
-            || !desc.voxel_size.x.is_finite()
-            || !desc.voxel_size.y.is_finite()
-            || desc.voxel_size.x <= 0.0
-            || desc.voxel_size.y <= 0.0
-            || desc.cells.is_null()
-            || desc.cell_count == 0
-        {
-            return AlchemyRapierStatus::InvalidArgument;
-        }
-
-        let handle = collider_handle_from_packed(packed_id);
-        let Some(collider) = world.colliders.get_mut(handle) else {
-            return AlchemyRapierStatus::InvalidHandle;
-        };
-
-        let source = unsafe { slice::from_raw_parts(desc.cells, desc.cell_count) };
-        let coords = source
-            .iter()
-            .map(|cell| IVector::new(cell.coord.x, cell.coord.y))
-            .collect::<Vec<_>>();
-        let voxels = Voxels::new(vector(desc.voxel_size), &coords);
-        collider.set_shape(SharedShape::new(voxels.clone()));
-        collider.set_translation(vector(desc.translation));
-        collider.set_active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
-
-        let mut metadata = HashMap::with_capacity(source.len());
-        for cell in source {
-            let coord = IVector::new(cell.coord.x, cell.coord.y);
-            if let Some(index) = voxels.linear_index(coord) {
-                metadata.insert(
-                    index.flat_id() as u32,
-                    VoxelCellMetadata {
-                        material_id: cell.material_id,
-                        source_cell_id: cell.source_cell_id,
-                    },
-                );
+        match update_voxel_collider_inner(world, packed_id, desc) {
+            Ok(handle) => {
+                world.voxel_terrain_sources.remove(&handle);
+                AlchemyRapierStatus::Ok
             }
+            Err(status) => status,
         }
-        world.voxel_colliders.insert(collider_key(handle), metadata);
-        update_voxel_terrain_source_metadata(world, handle, desc);
-        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_update_static_terrain_voxel_collider_by_id(
+    world: *mut AlchemyRapierWorld,
+    packed_id: u64,
+    desc: AlchemyRapierStaticTerrainVoxelColliderDesc,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let source = match voxel_terrain_source_metadata(desc) {
+            Ok(source) => source,
+            Err(status) => return status,
+        };
+        match update_voxel_collider_inner(world, packed_id, desc.voxel) {
+            Ok(handle) => {
+                world.voxel_terrain_sources.insert(handle, source);
+                AlchemyRapierStatus::Ok
+            }
+            Err(status) => status,
+        }
     })) {
         Ok(status) => status,
         Err(_) => AlchemyRapierStatus::Panic,
