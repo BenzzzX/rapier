@@ -1113,8 +1113,15 @@ fn joint_handle_from_ffi(handle: AlchemyRapierJointHandle) -> ImpulseJointHandle
     ImpulseJointHandle::from_raw_parts(handle.index, handle.generation)
 }
 
-fn collider_handle_from_packed(packed_id: u64) -> ColliderHandle {
-    ColliderHandle::from_raw_parts(packed_id as u32, (packed_id >> 32) as u32)
+fn collider_handle_from_packed(packed_id: u64) -> Option<ColliderHandle> {
+    let packed_index = packed_id as u32;
+    if packed_index == 0 {
+        return None;
+    }
+    Some(ColliderHandle::from_raw_parts(
+        packed_index - 1,
+        (packed_id >> 32) as u32,
+    ))
 }
 
 fn handle_to_ffi(handle: RigidBodyHandle) -> AlchemyRapierRigidBodyHandle {
@@ -1133,7 +1140,7 @@ fn joint_handle_to_ffi(handle: ImpulseJointHandle) -> AlchemyRapierJointHandle {
 }
 
 fn pack_parts(index: u32, generation: u32) -> u64 {
-    u64::from(index) | (u64::from(generation) << 32)
+    (u64::from(index) + 1) | (u64::from(generation) << 32)
 }
 
 fn pack_body_handle(handle: RigidBodyHandle) -> u64 {
@@ -2872,6 +2879,26 @@ pub extern "C" fn alchemy_rapier_destroy_world(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_gravity(
+    world: *mut AlchemyRapierWorld,
+    gravity: AlchemyRapierVec2,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !gravity.x.is_finite() || !gravity.y.is_finite() {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        world.gravity = Vector::new(gravity.x, gravity.y);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_step(
     world: *mut AlchemyRapierWorld,
     time_step: f32,
@@ -3464,7 +3491,9 @@ fn update_voxel_collider_inner(
     desc: AlchemyRapierVoxelColliderDesc,
 ) -> Result<ColliderHandle, AlchemyRapierStatus> {
     let (shape, metadata) = build_voxel_collider_shape_and_metadata(desc)?;
-    let handle = collider_handle_from_packed(packed_id);
+    let Some(handle) = collider_handle_from_packed(packed_id) else {
+        return Err(AlchemyRapierStatus::InvalidHandle);
+    };
     let Some(collider) = world.colliders.get_mut(handle) else {
         return Err(AlchemyRapierStatus::InvalidHandle);
     };
@@ -3621,7 +3650,9 @@ pub extern "C" fn alchemy_rapier_destroy_collider_by_id(
         let Ok(world) = to_inner(world) else {
             return AlchemyRapierStatus::NullPointer;
         };
-        let handle = collider_handle_from_packed(packed_id);
+        let Some(handle) = collider_handle_from_packed(packed_id) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
         remove_voxel_collider_metadata(world, handle);
         if world
             .colliders
