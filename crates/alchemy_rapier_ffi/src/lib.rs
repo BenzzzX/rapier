@@ -4456,8 +4456,10 @@ pub extern "C" fn alchemy_rapier_joint_impulse(
         AlchemyRapierJointImpulseResult {
             status: AlchemyRapierStatus::Ok,
             linear_impulse: AlchemyRapierVec2 {
-                x: joint.impulses[0],
-                y: joint.impulses[1],
+                x: joint.impulses[JointAxis::LinX as usize]
+                    + joint.data.limits[JointAxis::LinX as usize].impulse,
+                y: joint.impulses[JointAxis::LinY as usize]
+                    + joint.data.limits[JointAxis::LinY as usize].impulse,
             },
             angular_impulse: joint.impulses[2],
         }
