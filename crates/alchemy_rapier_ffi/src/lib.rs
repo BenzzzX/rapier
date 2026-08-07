@@ -19,6 +19,7 @@ use std::slice;
 const QUERY_SOURCE_TERRAIN: u32 = 1;
 const QUERY_SOURCE_DYNAMIC_RIGIDBODY: u32 = 1 << 1;
 const INVALID_SOURCE_CELL_ID: u32 = u32::MAX;
+const SELF_COLLISION_FILTER_TAG: u128 = 1 << 127;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,9 +531,14 @@ pub struct AlchemyRapierGenericJointDesc {
     pub body2: AlchemyRapierRigidBodyHandle,
     pub local_anchor1: AlchemyRapierVec2,
     pub local_anchor2: AlchemyRapierVec2,
+    pub local_rotation1: f32,
+    pub local_rotation2: f32,
     pub natural_frequency: f32,
     pub damping_ratio: f32,
+    pub limit_min: f32,
+    pub limit_max: f32,
     pub locked_axes: u8,
+    pub limit_enabled: u8,
     pub contacts_enabled: u8,
     pub wake_up: u8,
 }
@@ -1359,6 +1365,28 @@ impl AlchemyContactHooks<'_> {
 }
 
 impl PhysicsHooks for AlchemyContactHooks<'_> {
+    fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
+        let group1 = context
+            .colliders
+            .get(context.collider1)
+            .and_then(|collider| {
+                (collider.user_data & SELF_COLLISION_FILTER_TAG != 0)
+                    .then_some(collider.user_data as u64)
+            });
+        let group2 = context
+            .colliders
+            .get(context.collider2)
+            .and_then(|collider| {
+                (collider.user_data & SELF_COLLISION_FILTER_TAG != 0)
+                    .then_some(collider.user_data as u64)
+            });
+        if group1.is_some() && group1 == group2 {
+            None
+        } else {
+            Some(SolverFlags::COMPUTE_IMPULSES)
+        }
+    }
+
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
         let material1 = self.material_for(context, context.collider1, context.manifold.subshape1);
         let material2 = self.material_for(context, context.collider2, context.manifold.subshape2);
@@ -3318,6 +3346,44 @@ pub extern "C" fn alchemy_rapier_create_convex_collider(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_collider_collision_filter(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierColliderHandle,
+    memberships: u32,
+    filter: u32,
+    self_collision_group: u64,
+    self_collision_enabled: u8,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if memberships == 0 || self_collision_group == 0 || self_collision_enabled > 1 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let Some(collider) = world.colliders.get_mut(collider_handle_from_ffi(handle)) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        collider.set_collision_groups(InteractionGroups::new(
+            Group::from_bits_retain(memberships),
+            Group::from_bits_retain(filter),
+            InteractionTestMode::And,
+        ));
+        collider.user_data = SELF_COLLISION_FILTER_TAG | self_collision_group as u128;
+        let mut active_hooks = collider.active_hooks();
+        active_hooks.set(
+            ActiveHooks::FILTER_CONTACT_PAIRS,
+            self_collision_enabled == 0,
+        );
+        collider.set_active_hooks(active_hooks);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody(
     world: *mut AlchemyRapierWorld,
     body_handle: AlchemyRapierRigidBodyHandle,
@@ -4114,10 +4180,16 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
             || !desc.local_anchor1.y.is_finite()
             || !desc.local_anchor2.x.is_finite()
             || !desc.local_anchor2.y.is_finite()
+            || !desc.local_rotation1.is_finite()
+            || !desc.local_rotation2.is_finite()
             || !desc.natural_frequency.is_finite()
             || !desc.damping_ratio.is_finite()
+            || !desc.limit_min.is_finite()
+            || !desc.limit_max.is_finite()
             || desc.natural_frequency < 0.0
             || desc.damping_ratio < 0.0
+            || desc.limit_enabled > 1
+            || (desc.limit_enabled != 0 && desc.limit_min > desc.limit_max)
         {
             return empty_create_joint_result(AlchemyRapierStatus::InvalidArgument);
         }
@@ -4132,14 +4204,23 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
             return empty_create_joint_result(AlchemyRapierStatus::InvalidHandle);
         }
 
-        let joint = GenericJointBuilder::new(locked_axes)
-            .local_anchor1(vector(desc.local_anchor1))
-            .local_anchor2(vector(desc.local_anchor2))
+        let mut joint = GenericJointBuilder::new(locked_axes)
+            .local_frame1(Pose::from_parts(
+                vector(desc.local_anchor1),
+                Rotation::new(desc.local_rotation1),
+            ))
+            .local_frame2(Pose::from_parts(
+                vector(desc.local_anchor2),
+                Rotation::new(desc.local_rotation2),
+            ))
             .contacts_enabled(desc.contacts_enabled != 0)
             .softness(SpringCoefficients::new(
                 desc.natural_frequency,
                 desc.damping_ratio,
             ));
+        if desc.limit_enabled != 0 {
+            joint = joint.limits(JointAxis::AngX, [desc.limit_min, desc.limit_max]);
+        }
         let handle = world
             .impulse_joints
             .insert(body1, body2, joint, desc.wake_up != 0);
