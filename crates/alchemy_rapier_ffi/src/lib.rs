@@ -1,18 +1,18 @@
 use fracture_core::{
-    snapshot::SnapshotMode, DamageSource, FxActorId, FxFamilyId, GridCoord, SplitEvent, Vec2,
+    DamageSource, FxActorId, FxFamilyId, GridCoord, SplitEvent, Vec2, snapshot::SnapshotMode,
 };
 use fracture_rapier::{
     FractureField2D, FxActorBodyType, FxFamilyBodyMode, FxFamilyDeltaKind, FxRapierError,
     FxRapierWorld2D, FxStepWithDiagnostics,
 };
 use fracture_voxel::{
-    author_voxel_asset, AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime,
+    AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
 };
 use rapier2d::parry::query::ShapeCastOptions;
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_char, c_void};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
@@ -20,6 +20,7 @@ const QUERY_SOURCE_TERRAIN: u32 = 1;
 const QUERY_SOURCE_DYNAMIC_RIGIDBODY: u32 = 1 << 1;
 const INVALID_SOURCE_CELL_ID: u32 = u32::MAX;
 const SELF_COLLISION_FILTER_TAG: u128 = 1 << 127;
+const MAX_RAGDOLL_MOTOR_BATCH_COUNT: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,6 +419,27 @@ pub struct AlchemyRapierBodyStateResult {
     pub angular_damping: f32,
     pub can_sleep: u8,
     pub is_awake: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierRagdollMotorDesc {
+    pub body_a: AlchemyRapierRigidBodyHandle,
+    pub body_b: AlchemyRapierRigidBodyHandle,
+    pub target_relative_angle: f32,
+    pub target_relative_angular_velocity: f32,
+    pub reference_relative_angle: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+    pub max_torque: f32,
+    pub delta_seconds: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierRagdollMotorResult {
+    pub angle_error: f32,
+    pub applied_torque: f32,
 }
 
 #[repr(C)]
@@ -1412,6 +1434,24 @@ impl PhysicsHooks for AlchemyContactHooks<'_> {
 
 fn pose_translation(value: Vector) -> Pose {
     Pose::from_parts(value, Rotation::identity())
+}
+
+fn ragdoll_motor_desc_is_valid(motor: AlchemyRapierRagdollMotorDesc) -> bool {
+    motor.target_relative_angle.is_finite()
+        && motor.target_relative_angular_velocity.is_finite()
+        && motor.reference_relative_angle.is_finite()
+        && motor.stiffness.is_finite()
+        && motor.stiffness >= 0.0
+        && motor.damping.is_finite()
+        && motor.damping >= 0.0
+        && motor.max_torque.is_finite()
+        && motor.max_torque >= 0.0
+        && motor.delta_seconds.is_finite()
+        && motor.delta_seconds > 0.0
+}
+
+fn normalize_ragdoll_angle(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
 fn normalized_or_zero(value: Vector) -> Vector {
@@ -3346,6 +3386,37 @@ pub extern "C" fn alchemy_rapier_create_convex_collider(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_collider_material(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierColliderHandle,
+    friction: f32,
+    restitution: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if !friction.is_finite()
+            || friction < 0.0
+            || !restitution.is_finite()
+            || !(0.0..=1.0).contains(&restitution)
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let handle = collider_handle_from_ffi(handle);
+        let Some(collider) = world.colliders.get_mut(handle) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        collider.set_friction(friction);
+        collider.set_restitution(restitution);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_set_collider_collision_filter(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierColliderHandle,
@@ -4597,6 +4668,109 @@ pub extern "C" fn alchemy_rapier_apply_body_torque_impulse(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_apply_ragdoll_motor_batch(
+    world: *mut AlchemyRapierWorld,
+    motors: *const AlchemyRapierRagdollMotorDesc,
+    motor_count: usize,
+    results: *mut AlchemyRapierRagdollMotorResult,
+    result_capacity: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if motor_count > MAX_RAGDOLL_MOTOR_BATCH_COUNT
+            || result_capacity < motor_count
+            || (motor_count > 0 && (motors.is_null() || results.is_null()))
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if motor_count == 0 {
+            return AlchemyRapierStatus::Ok;
+        }
+        let motors = unsafe { slice::from_raw_parts(motors, motor_count) };
+
+        // Validate all descriptors and body handles before applying any impulse.
+        for motor in motors {
+            if !ragdoll_motor_desc_is_valid(*motor) {
+                return AlchemyRapierStatus::InvalidArgument;
+            }
+            let body_a = handle_from_ffi(motor.body_a);
+            let body_b = handle_from_ffi(motor.body_b);
+            if body_a == body_b {
+                return AlchemyRapierStatus::InvalidArgument;
+            }
+            if !world.bodies.contains(body_a) || !world.bodies.contains(body_b) {
+                return AlchemyRapierStatus::InvalidHandle;
+            }
+        }
+
+        let mut solved_results =
+            [AlchemyRapierRagdollMotorResult::default(); MAX_RAGDOLL_MOTOR_BATCH_COUNT];
+        let mut torque_impulses = [0.0; MAX_RAGDOLL_MOTOR_BATCH_COUNT];
+
+        // Sample the full batch before changing any body state. Shared bodies
+        // therefore see the same velocity snapshot regardless of joint order.
+        for (index, motor) in motors.iter().enumerate() {
+            let body_a_handle = handle_from_ffi(motor.body_a);
+            let body_b_handle = handle_from_ffi(motor.body_b);
+            let (body_a_rotation, body_a_velocity) = {
+                let body = world
+                    .bodies
+                    .get(body_a_handle)
+                    .expect("validated body handle");
+                (body.rotation().angle(), body.angvel())
+            };
+            let (body_b_rotation, body_b_velocity) = {
+                let body = world
+                    .bodies
+                    .get(body_b_handle)
+                    .expect("validated body handle");
+                (body.rotation().angle(), body.angvel())
+            };
+            let current_angle = normalize_ragdoll_angle(
+                body_a_rotation - body_b_rotation - motor.reference_relative_angle,
+            );
+            let angle_error = normalize_ragdoll_angle(motor.target_relative_angle - current_angle);
+            let requested_torque = motor.stiffness * angle_error
+                + motor.damping
+                    * (motor.target_relative_angular_velocity
+                        - (body_a_velocity - body_b_velocity));
+            let applied_torque = requested_torque.clamp(-motor.max_torque, motor.max_torque);
+            solved_results[index] = AlchemyRapierRagdollMotorResult {
+                angle_error,
+                applied_torque,
+            };
+            torque_impulses[index] = applied_torque * motor.delta_seconds;
+        }
+
+        // Apply the precomputed opposing impulses, then publish diagnostics.
+        for (index, motor) in motors.iter().enumerate() {
+            let body_a_handle = handle_from_ffi(motor.body_a);
+            let body_b_handle = handle_from_ffi(motor.body_b);
+            let torque_impulse = torque_impulses[index];
+            world
+                .bodies
+                .get_mut(body_a_handle)
+                .expect("validated body handle")
+                .apply_torque_impulse(torque_impulse, true);
+            world
+                .bodies
+                .get_mut(body_b_handle)
+                .expect("validated body handle")
+                .apply_torque_impulse(-torque_impulse, true);
+            unsafe {
+                *results.add(index) = solved_results[index];
+            }
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_query_cast_segment(
     world: *mut AlchemyRapierWorld,
     from: AlchemyRapierVec2,
@@ -5582,4 +5756,408 @@ pub extern "C" fn alchemy_rapier_version_string() -> *const c_char {
     concat!("alchemy_rapier_ffi ", env!("CARGO_PKG_VERSION"), "\0")
         .as_ptr()
         .cast::<c_char>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_body_desc(rotation: f32) -> AlchemyRapierBodyDesc {
+        AlchemyRapierBodyDesc {
+            body_type: AlchemyRapierBodyType::Dynamic,
+            position: AlchemyRapierVec2::default(),
+            rotation,
+            linear_velocity: AlchemyRapierVec2::default(),
+            angular_velocity: 0.0,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            gravity_scale: 0.0,
+            local_center_of_mass: AlchemyRapierVec2::default(),
+            mass: 1.0,
+            inertia: 1.0,
+            fixed_rotation: 0,
+            can_sleep: 0,
+            write_transform: 1,
+            write_velocity: 1,
+            wake_up: 1,
+            sleep: 0,
+            use_collider_mass: 0,
+            user_data: 0,
+        }
+    }
+
+    fn test_motor(
+        body_a: AlchemyRapierRigidBodyHandle,
+        body_b: AlchemyRapierRigidBodyHandle,
+    ) -> AlchemyRapierRagdollMotorDesc {
+        AlchemyRapierRagdollMotorDesc {
+            body_a,
+            body_b,
+            target_relative_angle: 0.5,
+            target_relative_angular_velocity: 0.0,
+            reference_relative_angle: 0.0,
+            stiffness: 10.0,
+            damping: 0.0,
+            max_torque: 2.0,
+            delta_seconds: 0.25,
+        }
+    }
+
+    fn create_motor_test_body(
+        world: *mut AlchemyRapierWorld,
+        rotation: f32,
+        angular_velocity: f32,
+    ) -> AlchemyRapierRigidBodyHandle {
+        let mut desc = test_body_desc(rotation);
+        desc.angular_velocity = angular_velocity;
+        let body = alchemy_rapier_create_body(world, desc);
+        assert_eq!(body.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_create_capsule_collider(world, body.handle, 0.5, 0.5).status,
+            AlchemyRapierStatus::Ok
+        );
+        body.handle
+    }
+
+    fn solve_shared_body_motors(
+        reverse_order: bool,
+    ) -> ([AlchemyRapierRagdollMotorResult; 2], [f32; 3]) {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let left = create_motor_test_body(world.world, 0.1, 0.7);
+        let center = create_motor_test_body(world.world, -0.2, -0.45);
+        let right = create_motor_test_body(world.world, 0.05, 0.25);
+
+        let mut left_motor = test_motor(left, center);
+        left_motor.target_relative_angle = 0.35;
+        left_motor.target_relative_angular_velocity = 0.2;
+        left_motor.stiffness = 12.0;
+        left_motor.damping = 8.0;
+        left_motor.max_torque = 100.0;
+        let mut right_motor = test_motor(center, right);
+        right_motor.target_relative_angle = -0.4;
+        right_motor.target_relative_angular_velocity = -0.1;
+        right_motor.stiffness = 9.0;
+        right_motor.damping = 6.0;
+        right_motor.max_torque = 100.0;
+        let motors = if reverse_order {
+            [right_motor, left_motor]
+        } else {
+            [left_motor, right_motor]
+        };
+        let mut batch_results = [AlchemyRapierRagdollMotorResult::default(); 2];
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                motors.as_ptr(),
+                motors.len(),
+                batch_results.as_mut_ptr(),
+                batch_results.len(),
+            ),
+            AlchemyRapierStatus::Ok
+        );
+
+        let mut results_by_joint = [AlchemyRapierRagdollMotorResult::default(); 2];
+        for (motor, result) in motors.iter().zip(batch_results) {
+            let joint_index = if motor.body_a == left { 0 } else { 1 };
+            results_by_joint[joint_index] = result;
+        }
+        let angular_velocities = [
+            alchemy_rapier_body_state(world.world, left).angular_velocity,
+            alchemy_rapier_body_state(world.world, center).angular_velocity,
+            alchemy_rapier_body_state(world.world, right).angular_velocity,
+        ];
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+        (results_by_joint, angular_velocities)
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_applies_clamped_opposing_impulses() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let body_a = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let body_b = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        assert_eq!(body_a.status, AlchemyRapierStatus::Ok);
+        assert_eq!(body_b.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_create_capsule_collider(world.world, body_a.handle, 0.5, 0.5).status,
+            AlchemyRapierStatus::Ok
+        );
+        assert_eq!(
+            alchemy_rapier_create_capsule_collider(world.world, body_b.handle, 0.5, 0.5).status,
+            AlchemyRapierStatus::Ok
+        );
+
+        let motor = test_motor(body_a.handle, body_b.handle);
+        let mut result = AlchemyRapierRagdollMotorResult::default();
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(world.world, &motor, 1, &mut result, 1),
+            AlchemyRapierStatus::Ok
+        );
+        assert!((result.angle_error - 0.5).abs() < 0.0001);
+        assert!((result.applied_torque - 2.0).abs() < 0.0001);
+        assert_eq!(
+            alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status,
+            AlchemyRapierStatus::Ok
+        );
+
+        let state_a = alchemy_rapier_body_state(world.world, body_a.handle);
+        let state_b = alchemy_rapier_body_state(world.world, body_b.handle);
+        assert!(
+            state_a.angular_velocity > 0.0,
+            "expected positive angular velocity, got {}",
+            state_a.angular_velocity
+        );
+        assert!(
+            state_b.angular_velocity < 0.0,
+            "expected negative angular velocity, got {}",
+            state_b.angular_velocity
+        );
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_rejects_invalid_handle_without_partial_impulses() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let body_a = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let body_b = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        assert_eq!(body_a.status, AlchemyRapierStatus::Ok);
+        assert_eq!(body_b.status, AlchemyRapierStatus::Ok);
+
+        let valid_motor = test_motor(body_a.handle, body_b.handle);
+        let invalid_motor = test_motor(
+            body_a.handle,
+            AlchemyRapierRigidBodyHandle {
+                index: u32::MAX,
+                generation: u32::MAX,
+            },
+        );
+        let motors = [valid_motor, invalid_motor];
+        let mut results = [AlchemyRapierRagdollMotorResult::default(); 2];
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                motors.as_ptr(),
+                motors.len(),
+                results.as_mut_ptr(),
+                results.len(),
+            ),
+            AlchemyRapierStatus::InvalidHandle
+        );
+
+        let state_a = alchemy_rapier_body_state(world.world, body_a.handle);
+        let state_b = alchemy_rapier_body_state(world.world, body_b.handle);
+        assert!(state_a.angular_velocity.abs() < 0.0001);
+        assert!(state_b.angular_velocity.abs() < 0.0001);
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_is_order_independent_for_shared_bodies() {
+        let (forward_results, forward_velocities) = solve_shared_body_motors(false);
+        let (reverse_results, reverse_velocities) = solve_shared_body_motors(true);
+
+        for joint_index in 0..forward_results.len() {
+            assert!(
+                (forward_results[joint_index].angle_error
+                    - reverse_results[joint_index].angle_error)
+                    .abs()
+                    < 0.000001
+            );
+            assert!(
+                (forward_results[joint_index].applied_torque
+                    - reverse_results[joint_index].applied_torque)
+                    .abs()
+                    < 0.000001
+            );
+        }
+        for body_index in 0..forward_velocities.len() {
+            assert!(
+                (forward_velocities[body_index] - reverse_velocities[body_index]).abs() < 0.00001
+            );
+        }
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_accepts_zero_and_exact_maximum_counts() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+            ),
+            AlchemyRapierStatus::Ok
+        );
+
+        let body_a = create_motor_test_body(world.world, 0.0, 0.0);
+        let body_b = create_motor_test_body(world.world, 0.0, 0.0);
+        let motors = [test_motor(body_a, body_b); MAX_RAGDOLL_MOTOR_BATCH_COUNT];
+        let mut results =
+            [AlchemyRapierRagdollMotorResult::default(); MAX_RAGDOLL_MOTOR_BATCH_COUNT];
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                motors.as_ptr(),
+                motors.len(),
+                results.as_mut_ptr(),
+                results.len(),
+            ),
+            AlchemyRapierStatus::Ok
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.applied_torque.is_finite())
+        );
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_rejects_oversized_and_insufficient_result_capacity() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                ptr::null(),
+                MAX_RAGDOLL_MOTOR_BATCH_COUNT + 1,
+                ptr::null_mut(),
+                0,
+            ),
+            AlchemyRapierStatus::InvalidArgument
+        );
+
+        let body_a = create_motor_test_body(world.world, 0.0, 0.0);
+        let body_b = create_motor_test_body(world.world, 0.0, 0.0);
+        let motor = test_motor(body_a, body_b);
+        let mut sentinel = AlchemyRapierRagdollMotorResult {
+            angle_error: 17.0,
+            applied_torque: 19.0,
+        };
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(world.world, &motor, 1, &mut sentinel, 0),
+            AlchemyRapierStatus::InvalidArgument
+        );
+        assert_eq!(sentinel.angle_error, 17.0);
+        assert_eq!(sentinel.applied_torque, 19.0);
+        assert!(
+            alchemy_rapier_body_state(world.world, body_a)
+                .angular_velocity
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            alchemy_rapier_body_state(world.world, body_b)
+                .angular_velocity
+                .abs()
+                < 0.0001
+        );
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn ragdoll_motor_batch_rejects_nan_without_side_effects() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let body_a = create_motor_test_body(world.world, 0.0, 0.0);
+        let body_b = create_motor_test_body(world.world, 0.0, 0.0);
+        let mut invalid_motor = test_motor(body_a, body_b);
+        invalid_motor.damping = f32::NAN;
+        let motors = [test_motor(body_a, body_b), invalid_motor];
+        let mut results = [AlchemyRapierRagdollMotorResult {
+            angle_error: 17.0,
+            applied_torque: 19.0,
+        }; 2];
+        assert_eq!(
+            alchemy_rapier_apply_ragdoll_motor_batch(
+                world.world,
+                motors.as_ptr(),
+                motors.len(),
+                results.as_mut_ptr(),
+                results.len(),
+            ),
+            AlchemyRapierStatus::InvalidArgument
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| { result.angle_error == 17.0 && result.applied_torque == 19.0 })
+        );
+        assert!(
+            alchemy_rapier_body_state(world.world, body_a)
+                .angular_velocity
+                .abs()
+                < 0.0001
+        );
+        assert!(
+            alchemy_rapier_body_state(world.world, body_b)
+                .angular_velocity
+                .abs()
+                < 0.0001
+        );
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn contact_material_setter_writes_authored_values() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let materials = [AlchemyRapierContactMaterialDesc {
+            material_id: 42,
+            friction: 0.75,
+            restitution: 0.2,
+            friction_combine_rule: AlchemyRapierCoefficientCombineRule::Multiply,
+            restitution_combine_rule: AlchemyRapierCoefficientCombineRule::Max,
+            hardness: 3.5,
+        }];
+        assert_eq!(
+            alchemy_rapier_set_contact_materials(world.world, materials.as_ptr(), materials.len()),
+            AlchemyRapierStatus::Ok
+        );
+        {
+            let inner = to_inner(world.world).expect("world remains valid");
+            let material = inner
+                .contact_materials
+                .get(&42)
+                .expect("authored material must be stored");
+            assert_eq!(material.friction, 0.75);
+            assert_eq!(material.restitution, 0.2);
+            assert_eq!(
+                material.friction_combine_rule,
+                CoefficientCombineRule::Multiply
+            );
+            assert_eq!(
+                material.restitution_combine_rule,
+                CoefficientCombineRule::Max
+            );
+            assert_eq!(material.hardness, 3.5);
+        }
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
 }
