@@ -1515,6 +1515,14 @@ fn body_builder(desc: AlchemyRapierBodyDesc) -> RigidBodyBuilder {
     builder.user_data(desc.user_data as u128)
 }
 
+fn joint_softness(natural_frequency: f32, damping_ratio: f32) -> SpringCoefficients<f32> {
+    if natural_frequency == 0.0 {
+        SpringCoefficients::joint_defaults()
+    } else {
+        SpringCoefficients::new(natural_frequency, damping_ratio)
+    }
+}
+
 fn body_can_sleep(body: &RigidBody) -> bool {
     body.activation().normalized_linear_threshold >= 0.0
 }
@@ -2993,6 +3001,26 @@ pub extern "C" fn alchemy_rapier_set_gravity(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_max_ccd_substeps(
+    world: *mut AlchemyRapierWorld,
+    max_ccd_substeps: u32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if max_ccd_substeps == 0 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        world.integration_parameters.max_ccd_substeps = max_ccd_substeps as usize;
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_step(
     world: *mut AlchemyRapierWorld,
     time_step: f32,
@@ -3173,6 +3201,27 @@ pub extern "C" fn alchemy_rapier_set_body_user_data(
             return AlchemyRapierStatus::InvalidHandle;
         };
         body.user_data = user_data as u128;
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_ccd_enabled(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    enabled: u8,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let Some(body) = world.bodies.get_mut(handle_from_ffi(handle)) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        body.enable_ccd(enabled != 0);
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -4285,10 +4334,7 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
                 Rotation::new(desc.local_rotation2),
             ))
             .contacts_enabled(desc.contacts_enabled != 0)
-            .softness(SpringCoefficients::new(
-                desc.natural_frequency,
-                desc.damping_ratio,
-            ));
+            .softness(joint_softness(desc.natural_frequency, desc.damping_ratio));
         if desc.limit_enabled != 0 {
             joint = joint.limits(JointAxis::AngX, [desc.limit_min, desc.limit_max]);
         }
@@ -4331,7 +4377,7 @@ pub extern "C" fn alchemy_rapier_set_generic_joint_softness(
         };
         let _ = joint
             .data
-            .set_softness(SpringCoefficients::new(natural_frequency, damping_ratio));
+            .set_softness(joint_softness(natural_frequency, damping_ratio));
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -4403,10 +4449,7 @@ pub extern "C" fn alchemy_rapier_create_revolute_joint(
             .local_anchor1(vector(desc.local_anchor1))
             .local_anchor2(vector(desc.local_anchor2))
             .contacts_enabled(desc.contacts_enabled != 0)
-            .softness(SpringCoefficients::new(
-                desc.natural_frequency,
-                desc.damping_ratio,
-            ));
+            .softness(joint_softness(desc.natural_frequency, desc.damping_ratio));
         let handle = world
             .impulse_joints
             .insert(body1, body2, joint, desc.wake_up != 0);
@@ -4446,7 +4489,7 @@ pub extern "C" fn alchemy_rapier_set_revolute_joint_softness(
         };
         let _ = joint
             .data
-            .set_softness(SpringCoefficients::new(natural_frequency, damping_ratio));
+            .set_softness(joint_softness(natural_frequency, damping_ratio));
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -6155,6 +6198,71 @@ mod tests {
             );
             assert_eq!(material.hardness, 3.5);
         }
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
+
+    #[test]
+    fn zero_frequency_revolute_joint_uses_finite_hard_defaults() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(world.status, AlchemyRapierStatus::Ok);
+        let mut left_desc = test_body_desc(0.0);
+        left_desc.position.x = -0.5;
+        let mut right_desc = test_body_desc(0.0);
+        right_desc.position.x = 0.5;
+        let left = alchemy_rapier_create_body(world.world, left_desc);
+        let right = alchemy_rapier_create_body(world.world, right_desc);
+        assert_eq!(left.status, AlchemyRapierStatus::Ok);
+        assert_eq!(right.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_set_max_ccd_substeps(world.world, 0),
+            AlchemyRapierStatus::InvalidArgument
+        );
+        assert_eq!(
+            alchemy_rapier_set_max_ccd_substeps(world.world, 8),
+            AlchemyRapierStatus::Ok
+        );
+        assert_eq!(
+            alchemy_rapier_set_body_ccd_enabled(world.world, right.handle, 1),
+            AlchemyRapierStatus::Ok
+        );
+
+        let joint = alchemy_rapier_create_revolute_joint(
+            world.world,
+            AlchemyRapierRevoluteJointDesc {
+                body1: left.handle,
+                body2: right.handle,
+                local_anchor1: AlchemyRapierVec2 { x: 0.5, y: 0.0 },
+                local_anchor2: AlchemyRapierVec2 { x: -0.5, y: 0.0 },
+                natural_frequency: 0.0,
+                damping_ratio: 0.0,
+                contacts_enabled: 0,
+                wake_up: 1,
+            },
+        );
+        assert_eq!(joint.status, AlchemyRapierStatus::Ok);
+        assert_eq!(
+            alchemy_rapier_apply_body_linear_impulse(
+                world.world,
+                right.handle,
+                AlchemyRapierVec2 { x: 2.0, y: 0.0 },
+                1,
+            ),
+            AlchemyRapierStatus::Ok
+        );
+        assert_eq!(
+            alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status,
+            AlchemyRapierStatus::Ok
+        );
+
+        let left_state = alchemy_rapier_body_state(world.world, left.handle);
+        let right_state = alchemy_rapier_body_state(world.world, right.handle);
+        assert!(left_state.position.x.is_finite());
+        assert!(left_state.linear_velocity.x.is_finite());
+        assert!(right_state.position.x.is_finite());
+        assert!(right_state.linear_velocity.x.is_finite());
         assert_eq!(
             alchemy_rapier_destroy_world(world.world),
             AlchemyRapierStatus::Ok
