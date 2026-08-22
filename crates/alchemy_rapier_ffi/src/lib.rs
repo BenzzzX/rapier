@@ -3230,6 +3230,28 @@ pub extern "C" fn alchemy_rapier_set_body_ccd_enabled(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_additional_solver_iterations(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    additional_iterations: u32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let Some(body) = world.bodies.get_mut(handle_from_ffi(handle)) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        body.set_additional_solver_iterations(additional_iterations as usize);
+        body.wake_up(true);
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_set_body_next_kinematic_position(
     world: *mut AlchemyRapierWorld,
     handle: AlchemyRapierRigidBodyHandle,
