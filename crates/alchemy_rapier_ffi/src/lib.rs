@@ -493,6 +493,23 @@ pub struct AlchemyRapierQueryHit {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierSegmentCapsuleQuery {
+    pub from_start: AlchemyRapierVec2,
+    pub from_end: AlchemyRapierVec2,
+    pub to_start: AlchemyRapierVec2,
+    pub to_end: AlchemyRapierVec2,
+    pub radius: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierSegmentCapsuleQueryOutput {
+    pub hit: AlchemyRapierQueryHit,
+    pub has_hit: u8,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlchemyRapierQueryResult {
     pub status: AlchemyRapierStatus,
@@ -2670,6 +2687,7 @@ fn alchemy_rigidbody_query_body(
     }
 }
 
+#[derive(Clone, Copy)]
 enum QueryTarget {
     Dynamic(RigidBodyHandle),
     TerrainChunk(TerrainKey),
@@ -2897,6 +2915,13 @@ struct DeformingCapsuleContact {
     segment_fraction: f32,
 }
 
+#[derive(Clone, Copy)]
+struct SegmentCapsuleBroadPhaseCandidate {
+    collider_handle: ColliderHandle,
+    target: QueryTarget,
+    aabb: Aabb,
+}
+
 impl DeformingCapsuleMotion {
     fn new(from_start: Vector, from_end: Vector, to_start: Vector, to_end: Vector) -> Self {
         Self {
@@ -2958,6 +2983,43 @@ impl DeformingCapsuleMotion {
         ) + Vector::splat(radius);
         Aabb::new(mins, maxs)
     }
+}
+
+fn segment_capsule_query_motion(
+    query: &AlchemyRapierSegmentCapsuleQuery,
+) -> DeformingCapsuleMotion {
+    DeformingCapsuleMotion::new(
+        vector(query.from_start),
+        vector(query.from_end),
+        vector(query.to_start),
+        vector(query.to_end),
+    )
+}
+
+fn segment_capsule_overlap_motion(
+    query: &AlchemyRapierSegmentCapsuleQuery,
+) -> DeformingCapsuleMotion {
+    let start = vector(query.to_start);
+    let end = vector(query.to_end);
+    DeformingCapsuleMotion::new(start, end, start, end)
+}
+
+fn segment_capsule_query_is_valid(query: &AlchemyRapierSegmentCapsuleQuery) -> bool {
+    query.radius.is_finite()
+        && query.radius >= 0.0
+        && [
+            query.from_start,
+            query.from_end,
+            query.to_start,
+            query.to_end,
+        ]
+        .iter()
+        .all(|point| point.x.is_finite() && point.y.is_finite())
+}
+
+fn merge_aabb(left: &mut Aabb, right: &Aabb) {
+    left.mins = left.mins.min(right.mins);
+    left.maxs = left.maxs.max(right.maxs);
 }
 
 fn aabbs_intersect(left: &Aabb, right: &Aabb) -> bool {
@@ -3266,6 +3328,38 @@ fn overlap_deforming_capsule_against_collider<D: QueryDispatcher + ?Sized>(
         motion,
         radius,
     )
+}
+
+fn collect_segment_capsule_broad_phase_candidates(
+    world: &AlchemyRapierWorldInner,
+    query_aabb: &Aabb,
+    ignored_body: Option<RigidBodyHandle>,
+    source_mask: u32,
+) -> Vec<SegmentCapsuleBroadPhaseCandidate> {
+    world
+        .colliders
+        .iter_enabled()
+        .filter_map(|(collider_handle, collider)| {
+            let target = query_target(world, collider_handle, collider, ignored_body, source_mask)?;
+            let aabb = collider.shape().compute_aabb(collider.position());
+            aabbs_intersect(query_aabb, &aabb).then_some(SegmentCapsuleBroadPhaseCandidate {
+                collider_handle,
+                target,
+                aabb,
+            })
+        })
+        .collect()
+}
+
+fn segment_capsule_batch_input_valid(
+    queries: *const AlchemyRapierSegmentCapsuleQuery,
+    query_count: usize,
+    outputs: *mut AlchemyRapierSegmentCapsuleQueryOutput,
+    output_capacity: usize,
+) -> bool {
+    (query_count == 0 || !queries.is_null())
+        && (query_count == 0 || !outputs.is_null())
+        && output_capacity >= query_count
 }
 
 fn write_query_hit(
@@ -5775,6 +5869,262 @@ pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
             hit_count,
             written_count,
             candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_cast_segment_capsules(
+    world: *mut AlchemyRapierWorld,
+    queries: *const AlchemyRapierSegmentCapsuleQuery,
+    query_count: usize,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    outputs: *mut AlchemyRapierSegmentCapsuleQueryOutput,
+    output_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !segment_capsule_batch_input_valid(queries, query_count, outputs, output_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if query_count == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let queries = unsafe { slice::from_raw_parts(queries, query_count) };
+        let outputs = unsafe { slice::from_raw_parts_mut(outputs, query_count) };
+        outputs.fill(AlchemyRapierSegmentCapsuleQueryOutput::default());
+        if queries
+            .iter()
+            .any(|query| !segment_capsule_query_is_valid(query))
+        {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return AlchemyRapierQueryResult {
+                status: AlchemyRapierStatus::Ok,
+                hit_count: 0,
+                written_count: query_count,
+                candidate_count: 0,
+            };
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let first_motion = segment_capsule_query_motion(&queries[0]);
+        let mut batch_aabb = first_motion
+            .swept_aabb(queries[0].radius.max(0.000001) + DEFORMING_CAPSULE_TARGET_DISTANCE);
+        for query in &queries[1..] {
+            let motion = segment_capsule_query_motion(query);
+            merge_aabb(
+                &mut batch_aabb,
+                &motion.swept_aabb(query.radius.max(0.000001) + DEFORMING_CAPSULE_TARGET_DISTANCE),
+            );
+        }
+
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let candidates = collect_segment_capsule_broad_phase_candidates(
+            world,
+            &batch_aabb,
+            ignored_body,
+            source_mask,
+        );
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut hit_count = 0;
+        for (query_index, query) in queries.iter().enumerate() {
+            let motion = segment_capsule_query_motion(query);
+            let query_radius = query.radius.max(0.000001);
+            let query_aabb = motion.swept_aabb(query_radius + DEFORMING_CAPSULE_TARGET_DISTANCE);
+            let maximum_motion = motion.maximum_motion();
+            let mut earliest_hit: Option<AlchemyRapierQueryHit> = None;
+            for candidate in &candidates {
+                if !aabbs_intersect(&query_aabb, &candidate.aabb) {
+                    continue;
+                }
+                let Some(collider) = world.colliders.get(candidate.collider_handle) else {
+                    continue;
+                };
+                let contact = match cast_deforming_capsule_against_collider(
+                    dispatcher,
+                    collider,
+                    &motion,
+                    query_radius,
+                ) {
+                    Ok(contact) => contact,
+                    Err(_) => return empty_query_result(AlchemyRapierStatus::Unsupported),
+                };
+                let Some(contact) = contact else {
+                    continue;
+                };
+                let Some(mut hit) = make_query_hit(
+                    world,
+                    candidate.target,
+                    candidate.collider_handle,
+                    contact.point,
+                    contact.normal,
+                    contact.time * maximum_motion,
+                    contact.time,
+                ) else {
+                    continue;
+                };
+                hit.segment_fraction = contact.segment_fraction;
+                if earliest_hit
+                    .as_ref()
+                    .is_none_or(|current| hit.fraction < current.fraction)
+                {
+                    earliest_hit = Some(hit);
+                }
+            }
+            if let Some(hit) = earliest_hit {
+                outputs[query_index].hit = hit;
+                outputs[query_index].has_hit = 1;
+                hit_count += 1;
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count: query_count,
+            candidate_count: candidates.len(),
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_overlap_segment_capsules(
+    world: *mut AlchemyRapierWorld,
+    queries: *const AlchemyRapierSegmentCapsuleQuery,
+    query_count: usize,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    outputs: *mut AlchemyRapierSegmentCapsuleQueryOutput,
+    output_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !segment_capsule_batch_input_valid(queries, query_count, outputs, output_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if query_count == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let queries = unsafe { slice::from_raw_parts(queries, query_count) };
+        let outputs = unsafe { slice::from_raw_parts_mut(outputs, query_count) };
+        outputs.fill(AlchemyRapierSegmentCapsuleQueryOutput::default());
+        if queries
+            .iter()
+            .any(|query| !segment_capsule_query_is_valid(query))
+        {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return AlchemyRapierQueryResult {
+                status: AlchemyRapierStatus::Ok,
+                hit_count: 0,
+                written_count: query_count,
+                candidate_count: 0,
+            };
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let first_motion = segment_capsule_overlap_motion(&queries[0]);
+        let mut batch_aabb = first_motion.swept_aabb(queries[0].radius.max(0.000001));
+        for query in &queries[1..] {
+            let motion = segment_capsule_overlap_motion(query);
+            merge_aabb(
+                &mut batch_aabb,
+                &motion.swept_aabb(query.radius.max(0.000001)),
+            );
+        }
+
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let candidates = collect_segment_capsule_broad_phase_candidates(
+            world,
+            &batch_aabb,
+            ignored_body,
+            source_mask,
+        );
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut hit_count = 0;
+        for (query_index, query) in queries.iter().enumerate() {
+            let motion = segment_capsule_overlap_motion(query);
+            let query_radius = query.radius.max(0.000001);
+            let query_aabb = motion.swept_aabb(query_radius);
+            let mut deepest_hit: Option<AlchemyRapierQueryHit> = None;
+            for candidate in &candidates {
+                if !aabbs_intersect(&query_aabb, &candidate.aabb) {
+                    continue;
+                }
+                let Some(collider) = world.colliders.get(candidate.collider_handle) else {
+                    continue;
+                };
+                let contact = match overlap_deforming_capsule_against_collider(
+                    dispatcher,
+                    collider,
+                    &motion,
+                    query_radius,
+                ) {
+                    Ok(contact) => contact,
+                    Err(_) => return empty_query_result(AlchemyRapierStatus::Unsupported),
+                };
+                let Some(contact) = contact else {
+                    continue;
+                };
+                let Some(mut hit) = make_query_hit(
+                    world,
+                    candidate.target,
+                    candidate.collider_handle,
+                    contact.point,
+                    contact.normal,
+                    contact.distance,
+                    0.0,
+                ) else {
+                    continue;
+                };
+                hit.segment_fraction = contact.segment_fraction;
+                if deepest_hit
+                    .as_ref()
+                    .is_none_or(|current| hit.distance < current.distance)
+                {
+                    deepest_hit = Some(hit);
+                }
+            }
+            if let Some(hit) = deepest_hit {
+                outputs[query_index].hit = hit;
+                outputs[query_index].has_hit = 1;
+                hit_count += 1;
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count: query_count,
+            candidate_count: candidates.len(),
         }
     })) {
         Ok(result) => result,
