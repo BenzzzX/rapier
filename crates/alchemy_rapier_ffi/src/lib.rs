@@ -8,7 +8,7 @@ use fracture_rapier::{
 use fracture_voxel::{
     AuthoredVoxelAsset, RuntimeEdit, VoxelAuthoringInput, VoxelRuntime, author_voxel_asset,
 };
-use rapier2d::parry::query::ShapeCastOptions;
+use rapier2d::parry::query::{QueryDispatcher, ShapeCastOptions, Unsupported};
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_char, c_void};
@@ -489,6 +489,7 @@ pub struct AlchemyRapierQueryHit {
     pub point_velocity: AlchemyRapierVec2,
     pub distance: f32,
     pub fraction: f32,
+    pub segment_fraction: f32,
 }
 
 #[repr(C)]
@@ -2731,6 +2732,7 @@ fn make_dynamic_query_hit(
         point_velocity: ffi_vec(body.velocity_at_point(point)),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2761,6 +2763,7 @@ fn make_terrain_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2791,6 +2794,7 @@ fn make_terrain_actor_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2820,6 +2824,7 @@ fn make_voxel_terrain_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2870,6 +2875,397 @@ fn make_query_hit(
             fraction,
         ),
     }
+}
+
+const DEFORMING_CAPSULE_TARGET_DISTANCE: f32 = 0.0001;
+const DEFORMING_CAPSULE_TIME_TOLERANCE: f32 = 0.000001;
+
+#[derive(Clone, Copy)]
+struct DeformingCapsuleMotion {
+    from_start: Vector,
+    from_end: Vector,
+    start_motion: Vector,
+    end_motion: Vector,
+}
+
+#[derive(Clone, Copy)]
+struct DeformingCapsuleContact {
+    point: Vector,
+    normal: Vector,
+    distance: f32,
+    time: f32,
+    segment_fraction: f32,
+}
+
+impl DeformingCapsuleMotion {
+    fn new(from_start: Vector, from_end: Vector, to_start: Vector, to_end: Vector) -> Self {
+        Self {
+            from_start,
+            from_end,
+            start_motion: to_start - from_start,
+            end_motion: to_end - from_end,
+        }
+    }
+
+    fn transformed_by_inverse(&self, pose: &Pose) -> Self {
+        let to_start = self.from_start + self.start_motion;
+        let to_end = self.from_end + self.end_motion;
+        Self::new(
+            pose.inverse_transform_point(self.from_start),
+            pose.inverse_transform_point(self.from_end),
+            pose.inverse_transform_point(to_start),
+            pose.inverse_transform_point(to_end),
+        )
+    }
+
+    fn segment_at_time(&self, time: f32) -> (Vector, Vector) {
+        (
+            self.from_start + self.start_motion * time,
+            self.from_end + self.end_motion * time,
+        )
+    }
+
+    fn maximum_motion(&self) -> f32 {
+        self.start_motion.length().max(self.end_motion.length())
+    }
+
+    fn swept_aabb(&self, radius: f32) -> Aabb {
+        let to_start = self.from_start + self.start_motion;
+        let to_end = self.from_end + self.end_motion;
+        let mins = Vector::new(
+            self.from_start
+                .x
+                .min(self.from_end.x)
+                .min(to_start.x)
+                .min(to_end.x),
+            self.from_start
+                .y
+                .min(self.from_end.y)
+                .min(to_start.y)
+                .min(to_end.y),
+        ) - Vector::splat(radius);
+        let maxs = Vector::new(
+            self.from_start
+                .x
+                .max(self.from_end.x)
+                .max(to_start.x)
+                .max(to_end.x),
+            self.from_start
+                .y
+                .max(self.from_end.y)
+                .max(to_start.y)
+                .max(to_end.y),
+        ) + Vector::splat(radius);
+        Aabb::new(mins, maxs)
+    }
+}
+
+fn aabbs_intersect(left: &Aabb, right: &Aabb) -> bool {
+    left.maxs.x >= right.mins.x
+        && left.maxs.y >= right.mins.y
+        && left.mins.x <= right.maxs.x
+        && left.mins.y <= right.maxs.y
+}
+
+fn segment_axis_fraction(start: Vector, end: Vector, point: Vector) -> f32 {
+    let axis = end - start;
+    let axis_length_squared = axis.length_squared();
+    if axis_length_squared <= 0.0000000001 {
+        0.0
+    } else {
+        ((point - start).dot(axis) / axis_length_squared).clamp(0.0, 1.0)
+    }
+}
+
+fn deforming_capsule_contact_at_time<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    static_shape: &dyn Shape,
+    motion: &DeformingCapsuleMotion,
+    radius: f32,
+    time: f32,
+    prediction: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    let (start, end) = motion.segment_at_time(time);
+    let capsule = Capsule::new(start, end, radius);
+    let Some(contact) =
+        dispatcher.contact(&Pose::identity(), static_shape, &capsule, prediction)?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(DeformingCapsuleContact {
+        point: contact.point1,
+        normal: contact.normal1,
+        distance: contact.dist,
+        time,
+        segment_fraction: segment_axis_fraction(start, end, contact.point2),
+    }))
+}
+
+// Conservative advancement for a capsule whose two axis endpoints move
+// independently. At each iterate the Parry contact normal is a separating
+// axis. The fastest endpoint motion toward that fixed axis gives a lower bound
+// on the next possible impact time. Tangential or separating motion therefore
+// resolves to a verified miss instead of consuming an arbitrary iteration cap.
+fn cast_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    static_shape: &dyn Shape,
+    motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    if static_shape.as_support_map().is_none() {
+        return Err(Unsupported);
+    }
+
+    let maximum_motion = motion.maximum_motion();
+    let mut time = 0.0;
+    loop {
+        let maximum_reachable_distance =
+            maximum_motion * (1.0 - time) + DEFORMING_CAPSULE_TARGET_DISTANCE;
+        let Some(contact) = deforming_capsule_contact_at_time(
+            dispatcher,
+            static_shape,
+            motion,
+            radius,
+            time,
+            maximum_reachable_distance,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        if contact.distance <= DEFORMING_CAPSULE_TARGET_DISTANCE {
+            return Ok(Some(contact));
+        }
+
+        let normal = contact.normal;
+        let closing_speed = (-motion.start_motion.dot(normal))
+            .max(-motion.end_motion.dot(normal))
+            .max(0.0);
+        if closing_speed <= f32::EPSILON {
+            return Ok(None);
+        }
+
+        let advance = (contact.distance - DEFORMING_CAPSULE_TARGET_DISTANCE) / closing_speed;
+        if advance > 1.0 - time {
+            return Ok(None);
+        }
+        if advance <= DEFORMING_CAPSULE_TIME_TOLERANCE {
+            return Ok(Some(contact));
+        }
+
+        time += advance;
+    }
+}
+
+fn overlap_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    static_shape: &dyn Shape,
+    motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    if static_shape.as_support_map().is_none() {
+        return Err(Unsupported);
+    }
+    deforming_capsule_contact_at_time(dispatcher, static_shape, motion, radius, 0.0, 0.0)
+        .map(|contact| contact.filter(|contact| contact.distance < 0.0))
+}
+
+fn transform_contact_to_world(
+    pose: &Pose,
+    contact: DeformingCapsuleContact,
+) -> DeformingCapsuleContact {
+    DeformingCapsuleContact {
+        point: pose.transform_point(contact.point),
+        normal: pose.rotation * contact.normal,
+        ..contact
+    }
+}
+
+fn select_earlier_contact(
+    best: &mut Option<DeformingCapsuleContact>,
+    candidate: Option<DeformingCapsuleContact>,
+) {
+    if let Some(candidate) = candidate {
+        if best
+            .as_ref()
+            .is_none_or(|best_contact| candidate.time < best_contact.time)
+        {
+            *best = Some(candidate);
+        }
+    }
+}
+
+fn select_deeper_contact(
+    best: &mut Option<DeformingCapsuleContact>,
+    candidate: Option<DeformingCapsuleContact>,
+) {
+    if let Some(candidate) = candidate {
+        if best
+            .as_ref()
+            .is_none_or(|best_contact| candidate.distance < best_contact.distance)
+        {
+            *best = Some(candidate);
+        }
+    }
+}
+
+fn cast_deforming_capsule_against_primitive<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    primitive_pose: &Pose,
+    primitive_shape: &dyn Shape,
+    world_motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    let local_motion = world_motion.transformed_by_inverse(primitive_pose);
+    if !aabbs_intersect(
+        &local_motion.swept_aabb(radius + DEFORMING_CAPSULE_TARGET_DISTANCE),
+        &primitive_shape.compute_local_aabb(),
+    ) {
+        return Ok(None);
+    }
+    cast_deforming_capsule_against_convex(dispatcher, primitive_shape, &local_motion, radius)
+        .map(|contact| contact.map(|contact| transform_contact_to_world(primitive_pose, contact)))
+}
+
+fn overlap_deforming_capsule_against_primitive<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    primitive_pose: &Pose,
+    primitive_shape: &dyn Shape,
+    world_motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    let local_motion = world_motion.transformed_by_inverse(primitive_pose);
+    if !aabbs_intersect(
+        &local_motion.swept_aabb(radius),
+        &primitive_shape.compute_local_aabb(),
+    ) {
+        return Ok(None);
+    }
+    overlap_deforming_capsule_against_convex(dispatcher, primitive_shape, &local_motion, radius)
+        .map(|contact| contact.map(|contact| transform_contact_to_world(primitive_pose, contact)))
+}
+
+fn cast_deforming_capsule_against_collider<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    collider: &Collider,
+    motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    let collider_pose = *collider.position();
+    let mut best = None;
+
+    if let Some(compound) = collider.shape().as_compound() {
+        let local_motion = motion.transformed_by_inverse(&collider_pose);
+        let query_aabb = local_motion.swept_aabb(radius + DEFORMING_CAPSULE_TARGET_DISTANCE);
+        for part_id in compound.bvh().intersect_aabb(&query_aabb) {
+            let (child_pose, child_shape) = &compound.shapes()[part_id as usize];
+            let primitive_pose = collider_pose * *child_pose;
+            select_earlier_contact(
+                &mut best,
+                cast_deforming_capsule_against_primitive(
+                    dispatcher,
+                    &primitive_pose,
+                    child_shape.as_ref(),
+                    motion,
+                    radius,
+                )?,
+            );
+        }
+        return Ok(best);
+    }
+
+    if let Some(voxels) = collider.shape().as_voxels() {
+        let local_motion = motion.transformed_by_inverse(&collider_pose);
+        let query_aabb = local_motion.swept_aabb(radius + DEFORMING_CAPSULE_TARGET_DISTANCE);
+        let cuboid = Cuboid::new(voxels.voxel_size() * 0.5);
+        for voxel in voxels.voxels_intersecting_local_aabb(&query_aabb) {
+            if voxel.state.is_empty() {
+                continue;
+            }
+            let primitive_pose = collider_pose * Pose::from_translation(voxel.center);
+            select_earlier_contact(
+                &mut best,
+                cast_deforming_capsule_against_primitive(
+                    dispatcher,
+                    &primitive_pose,
+                    &cuboid,
+                    motion,
+                    radius,
+                )?,
+            );
+        }
+        return Ok(best);
+    }
+
+    cast_deforming_capsule_against_primitive(
+        dispatcher,
+        &collider_pose,
+        collider.shape(),
+        motion,
+        radius,
+    )
+}
+
+fn overlap_deforming_capsule_against_collider<D: QueryDispatcher + ?Sized>(
+    dispatcher: &D,
+    collider: &Collider,
+    motion: &DeformingCapsuleMotion,
+    radius: f32,
+) -> Result<Option<DeformingCapsuleContact>, Unsupported> {
+    let collider_pose = *collider.position();
+    let mut best = None;
+
+    if let Some(compound) = collider.shape().as_compound() {
+        let local_motion = motion.transformed_by_inverse(&collider_pose);
+        let query_aabb = local_motion.swept_aabb(radius);
+        for part_id in compound.bvh().intersect_aabb(&query_aabb) {
+            let (child_pose, child_shape) = &compound.shapes()[part_id as usize];
+            let primitive_pose = collider_pose * *child_pose;
+            select_deeper_contact(
+                &mut best,
+                overlap_deforming_capsule_against_primitive(
+                    dispatcher,
+                    &primitive_pose,
+                    child_shape.as_ref(),
+                    motion,
+                    radius,
+                )?,
+            );
+        }
+        return Ok(best);
+    }
+
+    if let Some(voxels) = collider.shape().as_voxels() {
+        let local_motion = motion.transformed_by_inverse(&collider_pose);
+        let query_aabb = local_motion.swept_aabb(radius);
+        let cuboid = Cuboid::new(voxels.voxel_size() * 0.5);
+        for voxel in voxels.voxels_intersecting_local_aabb(&query_aabb) {
+            if voxel.state.is_empty() {
+                continue;
+            }
+            let primitive_pose = collider_pose * Pose::from_translation(voxel.center);
+            select_deeper_contact(
+                &mut best,
+                overlap_deforming_capsule_against_primitive(
+                    dispatcher,
+                    &primitive_pose,
+                    &cuboid,
+                    motion,
+                    radius,
+                )?,
+            );
+        }
+        return Ok(best);
+    }
+
+    overlap_deforming_capsule_against_primitive(
+        dispatcher,
+        &collider_pose,
+        collider.shape(),
+        motion,
+        radius,
+    )
 }
 
 fn write_query_hit(
@@ -5156,6 +5552,237 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
+    world: *mut AlchemyRapierWorld,
+    from_start: AlchemyRapierVec2,
+    from_end: AlchemyRapierVec2,
+    to_start: AlchemyRapierVec2,
+    to_end: AlchemyRapierVec2,
+    radius: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        let endpoints = [from_start, from_end, to_start, to_end];
+        if endpoints
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let motion = DeformingCapsuleMotion::new(
+            vector(from_start),
+            vector(from_end),
+            vector(to_start),
+            vector(to_end),
+        );
+        let query_radius = radius.max(0.000001);
+        let query_aabb = motion.swept_aabb(query_radius + DEFORMING_CAPSULE_TARGET_DISTANCE);
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let maximum_motion = motion.maximum_motion();
+        let mut earliest_hit: Option<AlchemyRapierQueryHit> = None;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
+                continue;
+            };
+            candidate_count += 1;
+            if !aabbs_intersect(
+                &query_aabb,
+                &collider.shape().compute_aabb(collider.position()),
+            ) {
+                continue;
+            }
+
+            let contact = match cast_deforming_capsule_against_collider(
+                dispatcher,
+                collider,
+                &motion,
+                query_radius,
+            ) {
+                Ok(contact) => contact,
+                Err(_) => return empty_query_result(AlchemyRapierStatus::Unsupported),
+            };
+            let Some(contact) = contact else {
+                continue;
+            };
+
+            if let Some(mut hit) = make_query_hit(
+                world,
+                target,
+                collider_handle,
+                contact.point,
+                contact.normal,
+                contact.time * maximum_motion,
+                contact.time,
+            ) {
+                hit.segment_fraction = contact.segment_fraction;
+                if earliest_hit
+                    .as_ref()
+                    .is_none_or(|current| hit.fraction < current.fraction)
+                {
+                    earliest_hit = Some(hit);
+                }
+            }
+        }
+
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        if let Some(hit) = earliest_hit {
+            write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
+    world: *mut AlchemyRapierWorld,
+    start: AlchemyRapierVec2,
+    end: AlchemyRapierVec2,
+    radius: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite()
+            || radius < 0.0
+            || !start.x.is_finite()
+            || !start.y.is_finite()
+            || !end.x.is_finite()
+            || !end.y.is_finite()
+        {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let start = vector(start);
+        let end = vector(end);
+        let motion = DeformingCapsuleMotion::new(start, end, start, end);
+        let query_radius = radius.max(0.000001);
+        let query_aabb = motion.swept_aabb(query_radius);
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut deepest_hit: Option<AlchemyRapierQueryHit> = None;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
+                continue;
+            };
+            candidate_count += 1;
+            if !aabbs_intersect(
+                &query_aabb,
+                &collider.shape().compute_aabb(collider.position()),
+            ) {
+                continue;
+            }
+
+            let contact = match overlap_deforming_capsule_against_collider(
+                dispatcher,
+                collider,
+                &motion,
+                query_radius,
+            ) {
+                Ok(contact) => contact,
+                Err(_) => return empty_query_result(AlchemyRapierStatus::Unsupported),
+            };
+            let Some(contact) = contact else {
+                continue;
+            };
+
+            if let Some(mut hit) = make_query_hit(
+                world,
+                target,
+                collider_handle,
+                contact.point,
+                contact.normal,
+                contact.distance,
+                0.0,
+            ) {
+                hit.segment_fraction = contact.segment_fraction;
+                if deepest_hit
+                    .as_ref()
+                    .is_none_or(|current| hit.distance < current.distance)
+                {
+                    deepest_hit = Some(hit);
+                }
+            }
+        }
+
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        if let Some(hit) = deepest_hit {
+            write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_query_surface_anchor(
     world: *mut AlchemyRapierWorld,
     source_kind: AlchemyRapierQuerySourceKind,
@@ -5826,6 +6453,7 @@ pub extern "C" fn alchemy_rapier_version_string() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rapier2d::parry::query::DefaultQueryDispatcher;
 
     fn test_body_desc(rotation: f32) -> AlchemyRapierBodyDesc {
         AlchemyRapierBodyDesc {
@@ -5882,6 +6510,58 @@ mod tests {
             AlchemyRapierStatus::Ok
         );
         body.handle
+    }
+
+    #[test]
+    fn deforming_capsule_tangential_motion_is_a_verified_miss() {
+        let dispatcher = DefaultQueryDispatcher;
+        let cuboid = Cuboid::new(Vector::splat(0.5));
+        let edge_y = 1.0002;
+        let motion = DeformingCapsuleMotion::new(
+            Vector::new(-2.0, edge_y),
+            Vector::new(2.0, edge_y),
+            Vector::new(-1.9, edge_y),
+            Vector::new(2.1, edge_y),
+        );
+
+        let hit = cast_deforming_capsule_against_convex(&dispatcher, &cuboid, &motion, 0.5)
+            .expect("cuboid/capsule query is supported");
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn deforming_capsule_detects_small_normal_closure() {
+        let dispatcher = DefaultQueryDispatcher;
+        let cuboid = Cuboid::new(Vector::splat(0.5));
+        let motion = DeformingCapsuleMotion::new(
+            Vector::new(-2.0, 1.0002),
+            Vector::new(2.0, 1.0002),
+            Vector::new(-1.9, 0.999),
+            Vector::new(2.1, 0.999),
+        );
+
+        let hit = cast_deforming_capsule_against_convex(&dispatcher, &cuboid, &motion, 0.5)
+            .expect("cuboid/capsule query is supported")
+            .expect("the edge closes the initial gap");
+        assert!(hit.time >= 0.0 && hit.time <= 1.0);
+        assert!(hit.normal.y > 0.9);
+    }
+
+    #[test]
+    fn deforming_capsule_detects_rotation_between_clear_endpoints() {
+        let dispatcher = DefaultQueryDispatcher;
+        let cuboid = Cuboid::new(Vector::splat(0.5));
+        let motion = DeformingCapsuleMotion::new(
+            Vector::new(-2.0, 1.2),
+            Vector::new(2.0, 1.2),
+            Vector::new(0.8, -2.0),
+            Vector::new(0.8, 2.0),
+        );
+
+        let hit = cast_deforming_capsule_against_convex(&dispatcher, &cuboid, &motion, 0.1)
+            .expect("cuboid/capsule query is supported")
+            .expect("the rotating edge crosses the cuboid");
+        assert!(hit.time > 0.0 && hit.time < 1.0);
     }
 
     fn solve_shared_body_motors(
