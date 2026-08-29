@@ -5242,7 +5242,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
                 let start = interpolate_segment_endpoint(from_start, to_start, fraction);
                 let end = interpolate_segment_endpoint(from_end, to_end, fraction);
                 let (capsule, capsule_pose) = segment_capsule_pose(start, end, radius);
-                let position = collider.position().inv_mul(&capsule_pose);
+                let position = capsule_pose.inv_mul(collider.position());
                 let Ok(intersects) =
                     dispatcher.intersection_test(&position, &capsule, collider.shape())
                 else {
@@ -5262,7 +5262,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
                     let midpoint_end = interpolate_segment_endpoint(from_end, to_end, midpoint);
                     let (midpoint_capsule, midpoint_pose) =
                         segment_capsule_pose(midpoint_start, midpoint_end, radius);
-                    let midpoint_position = collider.position().inv_mul(&midpoint_pose);
+                    let midpoint_position = midpoint_pose.inv_mul(collider.position());
                     let Ok(intersects) = dispatcher.intersection_test(
                         &midpoint_position,
                         &midpoint_capsule,
@@ -5362,7 +5362,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
                 continue;
             };
             candidate_count += 1;
-            let position = collider.position().inv_mul(&capsule_pose);
+            let position = capsule_pose.inv_mul(collider.position());
             let Ok(intersects) =
                 dispatcher.intersection_test(&position, &capsule, collider.shape())
             else {
