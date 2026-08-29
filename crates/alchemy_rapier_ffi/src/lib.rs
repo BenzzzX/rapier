@@ -2999,9 +2999,9 @@ fn segment_capsule_overlap_hit_point(
 
     let distance = best_distance_squared.max(0.0).sqrt();
     let normal = if distance > 0.000001 {
-        (best_point - best_axis_point) / distance
+        (best_axis_point - best_point) / distance
     } else {
-        let normal = aabb_center - best_axis_point;
+        let normal = best_axis_point - aabb_center;
         let normalized = normalized_or_zero(normal);
         if normalized.length_squared() > 0.0 {
             normalized
