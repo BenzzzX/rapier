@@ -489,6 +489,7 @@ pub struct AlchemyRapierQueryHit {
     pub point_velocity: AlchemyRapierVec2,
     pub distance: f32,
     pub fraction: f32,
+    pub segment_fraction: f32,
 }
 
 #[repr(C)]
@@ -2723,6 +2724,7 @@ fn make_dynamic_query_hit(
         point_velocity: ffi_vec(body.velocity_at_point(point)),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2753,6 +2755,7 @@ fn make_terrain_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2783,6 +2786,7 @@ fn make_terrain_actor_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2812,6 +2816,7 @@ fn make_voxel_terrain_query_hit(
         point_velocity: AlchemyRapierVec2::default(),
         distance,
         fraction,
+        segment_fraction: 0.0,
     })
 }
 
@@ -2940,6 +2945,92 @@ fn capsule_overlap_hit_point(
         Vector::ZERO
     };
     (best_point, normal, distance)
+}
+
+const MAX_SEGMENT_CAPSULE_SWEEP_SUBSTEPS: usize = 64;
+
+fn segment_capsule_pose(start: Vector, end: Vector, radius: f32) -> (Capsule, Pose) {
+    let center = (start + end) * 0.5;
+    (
+        Capsule::new(start - center, end - center, radius.max(0.000001)),
+        pose_translation(center),
+    )
+}
+
+fn segment_axis_point(point: Vector, start: Vector, end: Vector) -> (Vector, f32) {
+    let axis = end - start;
+    let axis_length_squared = axis.length_squared();
+    if axis_length_squared <= 0.00000001 {
+        return (start, 0.0);
+    }
+    let fraction = ((point - start).dot(axis) / axis_length_squared).clamp(0.0, 1.0);
+    (start + axis * fraction, fraction)
+}
+
+fn segment_capsule_overlap_hit_point(
+    collider: &Collider,
+    start: Vector,
+    end: Vector,
+    radius: f32,
+) -> (Vector, Vector, f32, f32) {
+    let aabb = collider.shape().compute_aabb(collider.position());
+    let aabb_center = (aabb.mins + aabb.maxs) * 0.5;
+    let (axis_center, _) = segment_axis_point(aabb_center, start, end);
+    let samples = [start, end, (start + end) * 0.5, axis_center];
+
+    let mut best_point = samples[0];
+    let mut best_axis_point = samples[0];
+    let mut best_segment_fraction = 0.0;
+    let mut best_distance_squared = f32::INFINITY;
+    for sample in samples {
+        let projection = collider
+            .shape()
+            .project_point(collider.position(), sample, true);
+        let shape_point = projection.point;
+        let (axis_point, segment_fraction) = segment_axis_point(shape_point, start, end);
+        let distance_squared = (shape_point - axis_point).length_squared();
+        if distance_squared < best_distance_squared {
+            best_distance_squared = distance_squared;
+            best_point = shape_point;
+            best_axis_point = axis_point;
+            best_segment_fraction = segment_fraction;
+        }
+    }
+
+    let distance = best_distance_squared.max(0.0).sqrt();
+    let normal = if distance > 0.000001 {
+        (best_point - best_axis_point) / distance
+    } else {
+        let normal = aabb_center - best_axis_point;
+        let normalized = normalized_or_zero(normal);
+        if normalized.length_squared() > 0.0 {
+            normalized
+        } else {
+            Vector::Y
+        }
+    };
+    (best_point, normal, distance - radius, best_segment_fraction)
+}
+
+fn interpolate_segment_endpoint(from: Vector, to: Vector, fraction: f32) -> Vector {
+    from + (to - from) * fraction
+}
+
+fn segment_capsule_sweep_substeps(
+    from_start: Vector,
+    from_end: Vector,
+    to_start: Vector,
+    to_end: Vector,
+    radius: f32,
+) -> usize {
+    let maximum_endpoint_distance = (to_start - from_start)
+        .length()
+        .max((to_end - from_end).length());
+    let maximum_step_distance = (radius * 0.5).max(0.05);
+    ((maximum_endpoint_distance / maximum_step_distance)
+        .ceil()
+        .max(1.0) as usize)
+        .min(MAX_SEGMENT_CAPSULE_SWEEP_SUBSTEPS)
 }
 
 #[unsafe(no_mangle)]
@@ -5074,6 +5165,218 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
             if let Some(hit) =
                 make_query_hit(world, target, collider_handle, point, normal, distance, 0.0)
             {
+                write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
+    world: *mut AlchemyRapierWorld,
+    from_start: AlchemyRapierVec2,
+    from_end: AlchemyRapierVec2,
+    to_start: AlchemyRapierVec2,
+    to_end: AlchemyRapierVec2,
+    radius: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let from_start = vector(from_start);
+        let from_end = vector(from_end);
+        let to_start = vector(to_start);
+        let to_end = vector(to_end);
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let substep_count =
+            segment_capsule_sweep_substeps(from_start, from_end, to_start, to_end, radius);
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
+                continue;
+            };
+            candidate_count += 1;
+
+            let mut previous_fraction = 0.0;
+            let mut found_fraction = None;
+            for step in 0..=substep_count {
+                let fraction = step as f32 / substep_count as f32;
+                let start = interpolate_segment_endpoint(from_start, to_start, fraction);
+                let end = interpolate_segment_endpoint(from_end, to_end, fraction);
+                let (capsule, capsule_pose) = segment_capsule_pose(start, end, radius);
+                let position = collider.position().inv_mul(&capsule_pose);
+                let Ok(intersects) =
+                    dispatcher.intersection_test(&position, &capsule, collider.shape())
+                else {
+                    continue;
+                };
+                if !intersects {
+                    previous_fraction = fraction;
+                    continue;
+                }
+
+                let mut lower = previous_fraction;
+                let mut upper = fraction;
+                for _ in 0..8 {
+                    let midpoint = (lower + upper) * 0.5;
+                    let midpoint_start =
+                        interpolate_segment_endpoint(from_start, to_start, midpoint);
+                    let midpoint_end = interpolate_segment_endpoint(from_end, to_end, midpoint);
+                    let (midpoint_capsule, midpoint_pose) =
+                        segment_capsule_pose(midpoint_start, midpoint_end, radius);
+                    let midpoint_position = collider.position().inv_mul(&midpoint_pose);
+                    let Ok(intersects) = dispatcher.intersection_test(
+                        &midpoint_position,
+                        &midpoint_capsule,
+                        collider.shape(),
+                    ) else {
+                        lower = midpoint;
+                        continue;
+                    };
+                    if intersects {
+                        upper = midpoint;
+                    } else {
+                        lower = midpoint;
+                    }
+                }
+                found_fraction = Some(upper);
+                break;
+            }
+
+            let Some(fraction) = found_fraction else {
+                continue;
+            };
+            let start = interpolate_segment_endpoint(from_start, to_start, fraction);
+            let end = interpolate_segment_endpoint(from_end, to_end, fraction);
+            let (point, normal, _, segment_fraction) =
+                segment_capsule_overlap_hit_point(collider, start, end, radius);
+            if let Some(mut hit) = make_query_hit(
+                world,
+                target,
+                collider_handle,
+                point,
+                normal,
+                fraction,
+                fraction,
+            ) {
+                hit.segment_fraction = segment_fraction;
+                write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+            }
+        }
+
+        AlchemyRapierQueryResult {
+            status: AlchemyRapierStatus::Ok,
+            hit_count,
+            written_count,
+            candidate_count,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_query_result(AlchemyRapierStatus::Panic),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
+    world: *mut AlchemyRapierWorld,
+    start: AlchemyRapierVec2,
+    end: AlchemyRapierVec2,
+    radius: f32,
+    ignored_body: AlchemyRapierRigidBodyHandle,
+    has_ignored_body: u8,
+    source_mask: u32,
+    hits: *mut AlchemyRapierQueryHit,
+    hit_capacity: usize,
+) -> AlchemyRapierQueryResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !query_output_valid(hits, hit_capacity) {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        }
+        if !radius.is_finite() || radius < 0.0 {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
+        if source_mask == 0 {
+            return empty_query_result(AlchemyRapierStatus::Ok);
+        }
+        let Ok(world) = to_inner(world) else {
+            return empty_query_result(AlchemyRapierStatus::NullPointer);
+        };
+        world
+            .bodies
+            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+
+        let start = vector(start);
+        let end = vector(end);
+        let (capsule, capsule_pose) = segment_capsule_pose(start, end, radius);
+        let ignored_body = if has_ignored_body != 0 {
+            Some(handle_from_ffi(ignored_body))
+        } else {
+            None
+        };
+        let dispatcher = world.narrow_phase.query_dispatcher();
+        let mut hit_count = 0;
+        let mut written_count = 0;
+        let mut candidate_count = 0;
+        for (collider_handle, collider) in world.colliders.iter_enabled() {
+            let Some(target) =
+                query_target(world, collider_handle, collider, ignored_body, source_mask)
+            else {
+                continue;
+            };
+            candidate_count += 1;
+            let position = collider.position().inv_mul(&capsule_pose);
+            let Ok(intersects) =
+                dispatcher.intersection_test(&position, &capsule, collider.shape())
+            else {
+                continue;
+            };
+            if !intersects {
+                continue;
+            }
+            let (point, normal, distance, segment_fraction) =
+                segment_capsule_overlap_hit_point(collider, start, end, radius);
+            if let Some(mut hit) =
+                make_query_hit(world, target, collider_handle, point, normal, distance, 0.0)
+            {
+                hit.segment_fraction = segment_fraction;
                 write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
             }
         }
