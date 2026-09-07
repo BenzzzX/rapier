@@ -578,6 +578,7 @@ pub struct AlchemyRapierGenericJointDesc {
     pub limit_min: f32,
     pub limit_max: f32,
     pub locked_axes: u8,
+    pub limit_axis: u8,
     pub limit_enabled: u8,
     pub contacts_enabled: u8,
     pub wake_up: u8,
@@ -4821,6 +4822,7 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
             || desc.natural_frequency < 0.0
             || desc.damping_ratio < 0.0
             || desc.limit_enabled > 1
+            || desc.limit_axis > 2
             || (desc.limit_enabled != 0 && desc.limit_min > desc.limit_max)
         {
             return empty_create_joint_result(AlchemyRapierStatus::InvalidArgument);
@@ -4848,7 +4850,12 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
             .contacts_enabled(desc.contacts_enabled != 0)
             .softness(joint_softness(desc.natural_frequency, desc.damping_ratio));
         if desc.limit_enabled != 0 {
-            joint = joint.limits(JointAxis::AngX, [desc.limit_min, desc.limit_max]);
+            let axis = match desc.limit_axis {
+                0 => JointAxis::LinX,
+                1 => JointAxis::LinY,
+                _ => JointAxis::AngX,
+            };
+            joint = joint.limits(axis, [desc.limit_min, desc.limit_max]);
         }
         let handle = world
             .impulse_joints
@@ -6804,6 +6811,65 @@ pub extern "C" fn alchemy_rapier_version_string() -> *const c_char {
 mod tests {
     use super::*;
     use rapier2d::parry::query::DefaultQueryDispatcher;
+
+    #[test]
+    fn generic_joint_layout_matches_cpp() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<AlchemyRapierGenericJointDesc>(), 64);
+        assert_eq!(offset_of!(AlchemyRapierGenericJointDesc, limit_axis), 57);
+        assert_eq!(offset_of!(AlchemyRapierGenericJointDesc, limit_enabled), 58);
+        assert_eq!(offset_of!(AlchemyRapierGenericJointDesc, wake_up), 60);
+    }
+
+    #[test]
+    fn generic_joint_limits_select_axis_and_reject_invalid_axis() {
+        let world = alchemy_rapier_create_world();
+        let body1 = create_motor_test_body(world.world, 0.0, 0.0);
+        let body2 = create_motor_test_body(world.world, 0.0, 0.0);
+        for axis in 0..=3 {
+            let result = alchemy_rapier_create_generic_joint(
+                world.world,
+                AlchemyRapierGenericJointDesc {
+                    body1,
+                    body2,
+                    local_anchor1: AlchemyRapierVec2::default(),
+                    local_anchor2: AlchemyRapierVec2::default(),
+                    local_rotation1: 0.0,
+                    local_rotation2: 0.0,
+                    natural_frequency: 0.0,
+                    damping_ratio: 0.0,
+                    limit_min: -0.25,
+                    limit_max: 0.5,
+                    locked_axes: 0,
+                    limit_axis: axis,
+                    limit_enabled: 1,
+                    contacts_enabled: 0,
+                    wake_up: 1,
+                },
+            );
+            if axis == 3 {
+                assert_eq!(result.status, AlchemyRapierStatus::InvalidArgument);
+            } else {
+                assert_eq!(result.status, AlchemyRapierStatus::Ok);
+                let inner = to_inner(world.world).unwrap();
+                let joint = inner
+                    .impulse_joints
+                    .get(joint_handle_from_ffi(result.handle))
+                    .unwrap();
+                assert_eq!(joint.data.limit_axes.bits(), 1 << axis);
+                assert_eq!(joint.data.limits[axis as usize].min, -0.25);
+                assert_eq!(joint.data.limits[axis as usize].max, 0.5);
+                assert_eq!(
+                    alchemy_rapier_destroy_joint(world.world, result.handle, 1),
+                    AlchemyRapierStatus::Ok
+                );
+            }
+        }
+        assert_eq!(
+            alchemy_rapier_destroy_world(world.world),
+            AlchemyRapierStatus::Ok
+        );
+    }
 
     fn test_body_desc(rotation: f32) -> AlchemyRapierBodyDesc {
         AlchemyRapierBodyDesc {
