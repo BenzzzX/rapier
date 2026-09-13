@@ -2674,6 +2674,21 @@ fn alchemy_rigidbody_query_body(
     if ignored_body == Some(body_handle) {
         return None;
     }
+    // Query exclusion follows the same compound-body group as contact filtering.
+    // A carried character's limbs must not obstruct its own capsule or carrier.
+    if collider.user_data & SELF_COLLISION_FILTER_TAG != 0 {
+        if let Some(ignored) = ignored_body.and_then(|handle| world.bodies.get(handle)) {
+            if ignored.colliders().iter().any(|handle| {
+                world.colliders.get(*handle).is_some_and(|other| {
+                    other.user_data == collider.user_data
+                        && (other.active_hooks().contains(ActiveHooks::FILTER_CONTACT_PAIRS)
+                            || collider.active_hooks().contains(ActiveHooks::FILTER_CONTACT_PAIRS))
+                })
+            }) {
+                return None;
+            }
+        }
+    }
     let body = world.bodies.get(body_handle)?;
     let body_type = body.body_type();
     if is_alchemy_rigidbody_query_body_type(body_type) {
@@ -4871,6 +4886,134 @@ pub extern "C" fn alchemy_rapier_create_generic_joint(
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AlchemyRapierControlDriveDesc {
+    pub only_control_child: u32,
+    pub target_position: AlchemyRapierVec2,
+    pub target_velocity: AlchemyRapierVec2,
+    pub target_angle: f32,
+    pub target_angular_velocity: f32,
+    pub linear_stiffness: f32,
+    pub linear_damping: f32,
+    pub angular_stiffness: f32,
+    pub angular_damping: f32,
+    pub max_force: f32,
+    pub max_torque: f32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_control_drive(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+    desc: AlchemyRapierControlDriveDesc,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        let targets = [
+            desc.target_position.x,
+            desc.target_position.y,
+            desc.target_velocity.x,
+            desc.target_velocity.y,
+            desc.target_angle,
+            desc.target_angular_velocity,
+        ];
+        let coefficients = [
+            desc.linear_stiffness,
+            desc.linear_damping,
+            desc.angular_stiffness,
+            desc.angular_damping,
+            desc.max_force,
+            desc.max_torque,
+        ];
+        if desc.only_control_child > 1
+            || targets.iter().any(|v| !v.is_finite())
+            || coefficients.iter().any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let handle = joint_handle_from_ffi(handle);
+        let Some(previous) = world.impulse_joints.get(handle) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        // Wake active drives and the transition to disabled, but let persistent
+        // disabled controls sleep instead of resetting their sleep timer each tick.
+        let active = coefficients[..4].iter().any(|v| *v > 0.0);
+        let wake = active || !previous.data.motor_axes.is_empty();
+        let joint = world.impulse_joints.get_mut(handle, wake).unwrap();
+        joint.data.dominance = if desc.only_control_child != 0 { 1 } else { 0 };
+        joint.data.motor_axes = JointAxesMask::empty();
+        for (axis, position, velocity, stiffness, damping, limit) in [
+            (
+                JointAxis::LinX,
+                desc.target_position.x,
+                desc.target_velocity.x,
+                desc.linear_stiffness,
+                desc.linear_damping,
+                desc.max_force,
+            ),
+            (
+                JointAxis::LinY,
+                desc.target_position.y,
+                desc.target_velocity.y,
+                desc.linear_stiffness,
+                desc.linear_damping,
+                desc.max_force,
+            ),
+            (
+                JointAxis::AngX,
+                desc.target_angle,
+                desc.target_angular_velocity,
+                desc.angular_stiffness,
+                desc.angular_damping,
+                desc.max_torque,
+            ),
+        ] {
+            if stiffness > 0.0 || damping > 0.0 {
+                joint
+                    .data
+                    .set_motor_model(axis, MotorModel::AccelerationBased)
+                    .set_motor(axis, position, velocity, stiffness, damping)
+                    .set_motor_max_force(axis, if limit > 0.0 { limit } else { f32::MAX });
+            } else {
+                joint.data.motors[axis as usize].impulse = 0.0;
+            }
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_control_drive_impulse(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierJointHandle,
+) -> AlchemyRapierJointImpulseResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return empty_joint_impulse_result(AlchemyRapierStatus::NullPointer);
+        };
+        let Some(joint) = world.impulse_joints.get(joint_handle_from_ffi(handle)) else {
+            return empty_joint_impulse_result(AlchemyRapierStatus::InvalidHandle);
+        };
+        AlchemyRapierJointImpulseResult {
+            status: AlchemyRapierStatus::Ok,
+            linear_impulse: AlchemyRapierVec2 {
+                x: joint.data.motors[0].impulse,
+                y: joint.data.motors[1].impulse,
+            },
+            angular_impulse: joint.data.motors[2].impulse,
+        }
+    })) {
+        Ok(result) => result,
+        Err(_) => empty_joint_impulse_result(AlchemyRapierStatus::Panic),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alchemy_rapier_set_generic_joint_softness(
     world: *mut AlchemyRapierWorld,
@@ -6811,6 +6954,137 @@ pub extern "C" fn alchemy_rapier_version_string() -> *const c_char {
 mod tests {
     use super::*;
     use rapier2d::parry::query::DefaultQueryDispatcher;
+
+    #[test]
+    fn control_drive_validates_before_updating_and_disables_motors() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<AlchemyRapierControlDriveDesc>(), 52);
+        assert_eq!(offset_of!(AlchemyRapierControlDriveDesc, max_force), 44);
+        let world = alchemy_rapier_create_world();
+        let body1 = create_motor_test_body(world.world, 0.0, 0.0);
+        let body2 = create_motor_test_body(world.world, 0.0, 0.0);
+        let inner = to_inner(world.world).unwrap();
+        let handle = inner.impulse_joints.insert(
+            handle_from_ffi(body1),
+            handle_from_ffi(body2),
+            GenericJoint::new(JointAxesMask::empty()),
+            true,
+        );
+        let ffi_handle = joint_handle_to_ffi(handle);
+        let mut desc = AlchemyRapierControlDriveDesc {
+            only_control_child: 1,
+            target_position: AlchemyRapierVec2 { x: 1.0, y: 2.0 },
+            target_velocity: AlchemyRapierVec2::default(),
+            target_angle: 0.5,
+            target_angular_velocity: 0.0,
+            linear_stiffness: 100.0,
+            linear_damping: 20.0,
+            angular_stiffness: 100.0,
+            angular_damping: 20.0,
+            max_force: 3.0,
+            max_torque: 0.0,
+        };
+        assert_eq!(
+            alchemy_rapier_set_control_drive(world.world, ffi_handle, desc),
+            AlchemyRapierStatus::Ok
+        );
+        let initial = to_inner(world.world)
+            .unwrap()
+            .impulse_joints
+            .get(handle)
+            .unwrap()
+            .data;
+        assert_eq!(
+            initial.motor_axes,
+            JointAxesMask::LIN_AXES | JointAxesMask::ANG_AXES
+        );
+        assert_eq!(initial.dominance, 1);
+        assert_eq!(initial.motors[0].max_force, 3.0);
+        assert_eq!(initial.motors[2].max_force, f32::MAX);
+        desc.target_angle = f32::NAN;
+        assert_eq!(
+            alchemy_rapier_set_control_drive(world.world, ffi_handle, desc),
+            AlchemyRapierStatus::InvalidArgument
+        );
+        assert_eq!(
+            to_inner(world.world)
+                .unwrap()
+                .impulse_joints
+                .get(handle)
+                .unwrap()
+                .data,
+            initial
+        );
+        desc.target_angle = 0.0;
+        desc.linear_stiffness = 0.0;
+        desc.linear_damping = 0.0;
+        desc.angular_stiffness = 0.0;
+        desc.angular_damping = 0.0;
+        assert_eq!(
+            alchemy_rapier_set_control_drive(world.world, ffi_handle, desc),
+            AlchemyRapierStatus::Ok
+        );
+        assert!(
+            to_inner(world.world)
+                .unwrap()
+                .impulse_joints
+                .get(handle)
+                .unwrap()
+                .data
+                .motor_axes
+                .is_empty()
+        );
+        assert_eq!(
+            alchemy_rapier_control_drive_impulse(world.world, ffi_handle).angular_impulse,
+            0.0
+        );
+        // Let the disable transition settle, then make both bodies sleep.
+        alchemy_rapier_step(world.world, 1.0 / 60.0, 1);
+        for body in [body1, body2] {
+            to_inner(world.world)
+                .unwrap()
+                .bodies
+                .get_mut(handle_from_ffi(body))
+                .unwrap()
+                .sleep();
+        }
+        for _ in 0..120 {
+            assert_eq!(
+                alchemy_rapier_set_control_drive(world.world, ffi_handle, desc),
+                AlchemyRapierStatus::Ok
+            );
+            assert_eq!(
+                alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status,
+                AlchemyRapierStatus::Ok
+            );
+            for body in [body1, body2] {
+                assert!(
+                    to_inner(world.world)
+                        .unwrap()
+                        .bodies
+                        .get(handle_from_ffi(body))
+                        .unwrap()
+                        .is_sleeping()
+                );
+            }
+        }
+        desc.angular_stiffness = 100.0;
+        desc.angular_damping = 20.0;
+        assert_eq!(
+            alchemy_rapier_set_control_drive(world.world, ffi_handle, desc),
+            AlchemyRapierStatus::Ok
+        );
+        alchemy_rapier_step(world.world, 1.0 / 60.0, 1);
+        assert!(
+            !to_inner(world.world)
+                .unwrap()
+                .bodies
+                .get(handle_from_ffi(body2))
+                .unwrap()
+                .is_sleeping()
+        );
+        alchemy_rapier_destroy_world(world.world);
+    }
 
     #[test]
     fn generic_joint_layout_matches_cpp() {

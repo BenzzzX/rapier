@@ -137,6 +137,19 @@ impl JointConstraint<Real, 1> {
         joint: &GenericJoint,
         out: &mut [Self],
     ) -> usize {
+        // Keep the shared solver-velocity indices and geometric Jacobians. Only the
+        // impulse response/effective mass changes for this particular constraint.
+        let mut response1 = *body1;
+        let mut response2 = *body2;
+        if joint.dominance > 0 {
+            response1.im = Default::default();
+            response1.ii = Default::default();
+        } else if joint.dominance < 0 {
+            response2.im = Default::default();
+            response2.ii = Default::default();
+        }
+        let body1 = &response1;
+        let body2 = &response2;
         let mut len = 0;
         let locked_axes = joint.locked_axes.bits();
         let motor_axes = joint.motor_axes.bits() & !locked_axes;

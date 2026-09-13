@@ -291,6 +291,11 @@ pub struct GenericJoint {
     pub contacts_enabled: bool,
     /// Whether the joint is enabled.
     pub enabled: JointEnabled,
+    /// Dominant side for rigid-body impulse joints: positive = body1, negative = body2.
+    /// Its velocity still enters the constraint, but this joint cannot change it.
+    /// Zero preserves the ordinary two-way response. Not used by multibody joints.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub dominance: i8,
     /// User-defined data associated to this joint.
     pub user_data: u128,
 }
@@ -309,6 +314,7 @@ impl Default for GenericJoint {
             softness: SpringCoefficients::joint_defaults(),
             contacts_enabled: true,
             enabled: JointEnabled::Enabled,
+            dominance: 0,
             user_data: 0,
         }
     }
@@ -324,7 +330,7 @@ impl GenericJoint {
     #[cfg(feature = "simd-is-enabled")]
     /// Can this joint use SIMD-accelerated constraint formulations?
     pub(crate) fn supports_simd_constraints(&self) -> bool {
-        self.limit_axes.is_empty() && self.motor_axes.is_empty()
+        self.limit_axes.is_empty() && self.motor_axes.is_empty() && self.dominance == 0
     }
 
     #[doc(hidden)]
@@ -551,6 +557,7 @@ impl GenericJoint {
     /// Flips the orientation of the joint, including limits and motors.
     pub fn flip(&mut self) {
         core::mem::swap(&mut self.local_frame1, &mut self.local_frame2);
+        self.dominance = -self.dominance.signum();
 
         let coupled_bits = self.coupled_axes.bits();
 
