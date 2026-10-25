@@ -1,3 +1,4 @@
+mod brittle_rock;
 use fracture_core::{
     DamageSource, FxActorId, FxFamilyId, GridCoord, SplitEvent, Vec2, snapshot::SnapshotMode,
 };
@@ -4502,6 +4503,43 @@ pub extern "C" fn alchemy_rapier_body_mass(
             mass: 0.0,
             inertia: 0.0,
         },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_pixel_mass_per_cell(
+    world: *mut AlchemyRapierWorld,
+    body: AlchemyRapierRigidBodyHandle,
+    collider: AlchemyRapierColliderHandle,
+    mass_per_cell: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else {
+            return AlchemyRapierStatus::NullPointer;
+        };
+        if !mass_per_cell.is_finite() || mass_per_cell <= 0.0 {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let body_handle = handle_from_ffi(body);
+        let collider_handle = collider_handle_from_ffi(collider);
+        if !world.bodies.contains(body_handle) {
+            return AlchemyRapierStatus::InvalidHandle;
+        }
+        let Some(collider) = world.colliders.get_mut(collider_handle) else {
+            return AlchemyRapierStatus::InvalidHandle;
+        };
+        if collider.parent() != Some(body_handle) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        collider.set_density(mass_per_cell);
+        if let Some(body) = world.bodies.get_mut(body_handle) {
+            body.set_additional_mass(0.0, true);
+            body.recompute_mass_properties_from_colliders(&world.colliders);
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(result) => result,
+        Err(_) => AlchemyRapierStatus::Panic,
     }
 }
 
