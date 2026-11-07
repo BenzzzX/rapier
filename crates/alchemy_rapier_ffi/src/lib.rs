@@ -831,6 +831,9 @@ struct AlchemyRapierWorldInner {
     narrow_phase: NarrowPhase,
     bodies: RigidBodySet,
     colliders: ColliderSet,
+    // Colliders changed after the last physics step are not yet in the
+    // broad-phase tree. Include only these explicitly in scene queries.
+    query_pending_colliders: HashSet<ColliderHandle>,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
@@ -857,6 +860,7 @@ impl AlchemyRapierWorldInner {
             narrow_phase: NarrowPhase::new(),
             bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
+            query_pending_colliders: HashSet::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
@@ -893,6 +897,13 @@ impl AlchemyRapierWorldInner {
             &hooks,
             &(),
         );
+        self.query_pending_colliders.clear();
+    }
+
+    fn mark_query_body_pending(&mut self, body: RigidBodyHandle) {
+        if let Some(body) = self.bodies.get(body) {
+            self.query_pending_colliders.extend(body.colliders().iter().copied());
+        }
     }
 }
 
@@ -2260,6 +2271,7 @@ fn try_apply_dirty_pixel_split(
         world
             .colliders
             .insert_with_parent(source_collider, body_handle, &mut world.bodies);
+    world.query_pending_colliders.insert(source_collider_handle);
     if let Some(body) = world.bodies.get_mut(body_handle) {
         body.set_additional_mass(0.0, true);
         body.recompute_mass_properties_from_colliders(&world.colliders);
@@ -2395,6 +2407,7 @@ fn create_pending_split_events(
             world
                 .colliders
                 .insert_with_parent(child_collider, child_body, &mut world.bodies);
+        world.query_pending_colliders.insert(child_collider_handle);
         if let Some(body) = world.bodies.get_mut(child_body) {
             body.set_additional_mass(0.0, true);
             body.recompute_mass_properties_from_colliders(&world.colliders);
@@ -3084,8 +3097,10 @@ fn deforming_capsule_contact_at_time<D: QueryDispatcher + ?Sized>(
 // Conservative advancement for a capsule whose two axis endpoints move
 // independently. At each iterate the Parry contact normal is a separating
 // axis. The fastest endpoint motion toward that fixed axis gives a lower bound
-// on the next possible impact time. Tangential or separating motion therefore
-// resolves to a verified miss instead of consuming an arbitrary iteration cap.
+// on the next possible impact time. Tangential or separating motion resolves
+// to a verified miss. If finite-precision advancement converges too slowly,
+// return the last separating contact conservatively: the caller must not move
+// through a region whose remaining path was not proved clear.
 fn cast_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
     dispatcher: &D,
     static_shape: &dyn Shape,
@@ -3098,7 +3113,14 @@ fn cast_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
 
     let maximum_motion = motion.maximum_motion();
     let mut time = 0.0;
-    loop {
+    const MAX_ADVANCEMENT_STEPS: usize = 64;
+    // Contact distances come from f32 geometry. Near the target distance,
+    // numerical noise can prevent advancement even while time increases.
+    // Conservatively absorb that uncertainty at the scale of this query.
+    let geometry_scale = motion.from_start.abs().max(motion.from_end.abs()).max_element()
+        .max(radius).max(1.0);
+    let distance_tolerance = 4.0 * f32::EPSILON * geometry_scale;
+    for iteration in 0..MAX_ADVANCEMENT_STEPS {
         let maximum_reachable_distance =
             maximum_motion * (1.0 - time) + DEFORMING_CAPSULE_TARGET_DISTANCE;
         let Some(contact) = deforming_capsule_contact_at_time(
@@ -3113,7 +3135,7 @@ fn cast_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
             return Ok(None);
         };
 
-        if contact.distance <= DEFORMING_CAPSULE_TARGET_DISTANCE {
+        if contact.distance <= DEFORMING_CAPSULE_TARGET_DISTANCE + distance_tolerance {
             return Ok(Some(contact));
         }
 
@@ -3133,8 +3155,17 @@ fn cast_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
             return Ok(Some(contact));
         }
 
+        if iteration + 1 == MAX_ADVANCEMENT_STEPS {
+            if std::env::var_os("ALCHEMY_REPORT_ROPE_CCD_FALLBACK").is_some() {
+                eprintln!("Alchemy rope CCD conservative fallback: from=({:?},{:?}) motion=({:?},{:?}) radius={radius} time={time} distance={} closing_speed={closing_speed}",
+                    motion.from_start, motion.from_end, motion.start_motion, motion.end_motion, contact.distance);
+            }
+            return Ok(Some(contact));
+        }
+
         time += advance;
     }
+    unreachable!()
 }
 
 fn overlap_deforming_capsule_against_convex<D: QueryDispatcher + ?Sized>(
@@ -3353,19 +3384,38 @@ fn collect_segment_capsule_broad_phase_candidates(
     ignored_body: Option<RigidBodyHandle>,
     source_mask: u32,
 ) -> Vec<SegmentCapsuleBroadPhaseCandidate> {
-    world
-        .colliders
-        .iter_enabled()
-        .filter_map(|(collider_handle, collider)| {
-            let target = query_target(world, collider_handle, collider, ignored_body, source_mask)?;
-            let aabb = collider.shape().compute_aabb(collider.position());
-            aabbs_intersect(query_aabb, &aabb).then_some(SegmentCapsuleBroadPhaseCandidate {
-                collider_handle,
-                target,
-                aabb,
-            })
-        })
-        .collect()
+    let pipeline = world.broad_phase.as_query_pipeline(
+        world.narrow_phase.query_dispatcher(), &world.bodies, &world.colliders,
+        QueryFilter::default(),
+    );
+    let mut candidates = Vec::new();
+    let mut append = |collider_handle: ColliderHandle, collider: &Collider| {
+        if !collider.is_enabled() {
+            return;
+        }
+        let Some(target) = query_target(world, collider_handle, collider, ignored_body, source_mask) else {
+            return;
+        };
+        let aabb = collider.shape().compute_aabb(collider.position());
+        if aabbs_intersect(query_aabb, &aabb) {
+            candidates.push(SegmentCapsuleBroadPhaseCandidate { collider_handle, target, aabb });
+        }
+    };
+    for (handle, collider) in pipeline.intersect_aabb_conservative(*query_aabb) {
+        if !world.query_pending_colliders.contains(&handle) {
+            append(handle, collider);
+        }
+    }
+    // Created or moved since the last physics step; the simulation BVH has not
+    // incorporated these changes yet. Removed handles are ignored by get().
+    for handle in &world.query_pending_colliders {
+        if let Some(collider) = world.colliders.get(*handle) {
+            append(*handle, collider);
+        }
+    }
+    // Match ColliderSet arena order for deterministic ties at equal TOI.
+    candidates.sort_unstable_by_key(|candidate| candidate.collider_handle.into_raw_parts().0);
+    candidates
 }
 
 fn segment_capsule_batch_input_valid(
@@ -3684,8 +3734,11 @@ pub extern "C" fn alchemy_rapier_update_body(
         let Some(body) = world.bodies.get_mut(handle) else {
             return AlchemyRapierStatus::InvalidHandle;
         };
+        let moved = desc.write_transform != 0 &&
+            *body.position() != Pose::from_parts(vector(desc.position), Rotation::new(desc.rotation));
         apply_body_desc(body, desc);
         body.recompute_mass_properties_from_colliders(&world.colliders);
+        if moved { world.mark_query_body_pending(handle); }
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -3885,6 +3938,7 @@ pub extern "C" fn alchemy_rapier_create_capsule_collider(
         let handle = world
             .colliders
             .insert_with_parent(collider, body_handle, &mut world.bodies);
+        world.query_pending_colliders.insert(handle);
         recompute_body_mass(world, body_handle);
         AlchemyRapierCreateColliderResult {
             status: AlchemyRapierStatus::Ok,
@@ -3947,6 +4001,7 @@ pub extern "C" fn alchemy_rapier_create_convex_collider(
         let handle = world
             .colliders
             .insert_with_parent(collider, body_handle, &mut world.bodies);
+        world.query_pending_colliders.insert(handle);
         recompute_body_mass(world, body_handle);
         AlchemyRapierCreateColliderResult {
             status: AlchemyRapierStatus::Ok,
@@ -4073,6 +4128,7 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody(
             world
                 .colliders
                 .insert_with_parent(collider, body_handle, &mut world.bodies);
+        world.query_pending_colliders.insert(collider_handle);
         if let Some(body) = world.bodies.get_mut(body_handle) {
             body.set_additional_mass(0.0, true);
             body.recompute_mass_properties_from_colliders(&world.colliders);
@@ -4148,6 +4204,7 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
             world
                 .colliders
                 .insert_with_parent(collider, body_handle, &mut world.bodies);
+        world.query_pending_colliders.insert(collider_handle);
         if let Some(body) = world.bodies.get_mut(body_handle) {
             body.set_additional_mass(0.0, true);
             body.recompute_mass_properties_from_colliders(&world.colliders);
@@ -4222,6 +4279,7 @@ fn create_voxel_collider_inner(
         .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
         .build();
     let handle = world.colliders.insert(collider);
+    world.query_pending_colliders.insert(handle);
     world.voxel_colliders.insert(collider_key(handle), metadata);
     Ok(handle)
 }
@@ -4242,6 +4300,7 @@ fn update_voxel_collider_inner(
     collider.set_shape(shape);
     collider.set_translation(vector(desc.translation));
     collider.set_active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
+    world.query_pending_colliders.insert(handle);
     world.voxel_colliders.insert(collider_key(handle), metadata);
     Ok(handle)
 }
@@ -5887,20 +5946,14 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
         let dispatcher = world.narrow_phase.query_dispatcher();
         let maximum_motion = motion.maximum_motion();
         let mut earliest_hit: Option<AlchemyRapierQueryHit> = None;
-        let mut candidate_count = 0;
-        for (collider_handle, collider) in world.colliders.iter_enabled() {
-            let Some(target) =
-                query_target(world, collider_handle, collider, ignored_body, source_mask)
-            else {
+        let candidates = collect_segment_capsule_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
+        let candidate_count = candidates.len();
+        for candidate in candidates {
+            let collider_handle = candidate.collider_handle;
+            let target = candidate.target;
+            let Some(collider) = world.colliders.get(collider_handle) else {
                 continue;
             };
-            candidate_count += 1;
-            if !aabbs_intersect(
-                &query_aabb,
-                &collider.shape().compute_aabb(collider.position()),
-            ) {
-                continue;
-            }
 
             let contact = match cast_deforming_capsule_against_collider(
                 dispatcher,
@@ -5999,20 +6052,14 @@ pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
         };
         let dispatcher = world.narrow_phase.query_dispatcher();
         let mut deepest_hit: Option<AlchemyRapierQueryHit> = None;
-        let mut candidate_count = 0;
-        for (collider_handle, collider) in world.colliders.iter_enabled() {
-            let Some(target) =
-                query_target(world, collider_handle, collider, ignored_body, source_mask)
-            else {
+        let candidates = collect_segment_capsule_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
+        let candidate_count = candidates.len();
+        for candidate in candidates {
+            let collider_handle = candidate.collider_handle;
+            let target = candidate.target;
+            let Some(collider) = world.colliders.get(collider_handle) else {
                 continue;
             };
-            candidate_count += 1;
-            if !aabbs_intersect(
-                &query_aabb,
-                &collider.shape().compute_aabb(collider.position()),
-            ) {
-                continue;
-            }
 
             let contact = match overlap_deforming_capsule_against_collider(
                 dispatcher,
@@ -6355,7 +6402,27 @@ pub extern "C" fn alchemy_rapier_query_surface_anchor(
 
         if source_kind == AlchemyRapierQuerySourceKind::DynamicPixelRigidbody {
             if has_target_body == 0 {
-                return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+                // Query nearby dynamic shapes through the physics broad phase;
+                // callers may filter individual bodies after projecting them.
+                let radius = Vector::splat(max_distance);
+                let query_aabb = Aabb::new(anchor - radius, anchor + radius);
+                let candidates = collect_segment_capsule_broad_phase_candidates(
+                    world, &query_aabb, None, 1 << 1,
+                );
+                candidate_count = candidates.len();
+                for candidate in candidates {
+                    let Some(collider) = world.colliders.get(candidate.collider_handle) else { continue };
+                    let projection = collider.shape().project_point(collider.position(), anchor, true);
+                    let point = projection.point;
+                    let distance = if projection.is_inside { 0.0 } else { (anchor - point).length() };
+                    if distance > max_distance { continue; }
+                    let normal = if projection.is_inside { Vector::ZERO } else { normalized_or_zero(anchor - point) };
+                    if let Some(hit) = make_query_hit(world, candidate.target, candidate.collider_handle,
+                        point, normal, distance, 0.0) {
+                        write_query_hit(hit, hits, hit_capacity, &mut hit_count, &mut written_count);
+                    }
+                }
+                return AlchemyRapierQueryResult { status: AlchemyRapierStatus::Ok, hit_count, written_count, candidate_count };
             }
             let target_body = handle_from_ffi(target_body);
             let Some(body) = world.bodies.get(target_body) else {
@@ -7255,6 +7322,25 @@ mod tests {
         let hit = cast_deforming_capsule_against_convex(&dispatcher, &cuboid, &motion, 0.5)
             .expect("cuboid/capsule query is supported");
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn deforming_capsule_near_contact_roundoff_is_conservative() {
+        // Captured from a 160-pixel hanging lamp rope as it brushes a voxel.
+        // Previously contact-distance roundoff made advancement take seconds.
+        let dispatcher = DefaultQueryDispatcher;
+        let cuboid = Cuboid::new(Vector::splat(0.5));
+        let motion = DeformingCapsuleMotion::new(
+            Vector::new(-1.0, 0.51000977),
+            Vector::new(-1.0115967, 4.416687),
+            Vector::new(-1.0, 0.51000977),
+            Vector::new(-1.0114136, 4.416687),
+        );
+        let hit = cast_deforming_capsule_against_convex(&dispatcher, &cuboid, &motion, 0.5)
+            .expect("cuboid/capsule query is supported")
+            .expect("an unresolved floating-point gap is conservatively blocked");
+        assert!((0.0..=1.0).contains(&hit.time));
+        assert!(hit.distance <= DEFORMING_CAPSULE_TARGET_DISTANCE + 0.00001);
     }
 
     #[test]
