@@ -806,6 +806,27 @@ struct VoxelCellMetadata {
     source_cell_id: u32,
 }
 
+enum VoxelColliderMetadata {
+    Dense(Vec<Option<VoxelCellMetadata>>),
+    Sparse(HashMap<u32, VoxelCellMetadata>),
+}
+
+impl VoxelColliderMetadata {
+    fn get(&self, index: u32) -> Option<&VoxelCellMetadata> {
+        match self {
+            Self::Dense(cells) => cells.get(index as usize).and_then(Option::as_ref),
+            Self::Sparse(cells) => cells.get(&index),
+        }
+    }
+}
+
+// Full unit-sized terrain chunks share their immutable geometry. Material and
+// source-cell metadata remain per collider because adjacent chunks can differ.
+struct FullTerrainShapeCache {
+    shape: SharedShape,
+    flat_id_by_cell: Vec<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct VoxelTerrainSourceMetadata {
     chunk_x: i32,
@@ -834,6 +855,7 @@ struct AlchemyRapierWorldInner {
     // Colliders changed after the last physics step are not yet in the
     // broad-phase tree. Include only these explicitly in scene queries.
     query_pending_colliders: HashSet<ColliderHandle>,
+    query_candidate_scratch: Vec<QueryBroadPhaseCandidate>,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
@@ -843,7 +865,8 @@ struct AlchemyRapierWorldInner {
     terrain_fracture_actor_by_collider: HashMap<ColliderHandle, i64>,
     pixel_rigidbodies: HashMap<RigidBodyHandle, PixelRigidbodyState>,
     contact_materials: HashMap<u16, ContactMaterial>,
-    voxel_colliders: HashMap<(u32, u32), HashMap<u32, VoxelCellMetadata>>,
+    voxel_colliders: HashMap<(u32, u32), VoxelColliderMetadata>,
+    full_terrain_shape: Option<FullTerrainShapeCache>,
     voxel_terrain_sources: HashMap<ColliderHandle, VoxelTerrainSourceMetadata>,
     pending_split_events: Vec<PendingSplitEvent>,
     previous_active_contact_pairs: HashSet<(u64, u64)>,
@@ -861,6 +884,7 @@ impl AlchemyRapierWorldInner {
             bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
             query_pending_colliders: HashSet::new(),
+            query_candidate_scratch: Vec::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
@@ -871,17 +895,22 @@ impl AlchemyRapierWorldInner {
             pixel_rigidbodies: HashMap::new(),
             contact_materials: HashMap::new(),
             voxel_colliders: HashMap::new(),
+            full_terrain_shape: None,
             voxel_terrain_sources: HashMap::new(),
             pending_split_events: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
         }
     }
 
-    fn step_once(&mut self, dt: f32) {
+    fn step_once(&mut self, dt: f32, friction_callback: AlchemyRapierFrictionScaleCallback, friction_data: usize) {
         self.integration_parameters.dt = dt;
         let hooks = AlchemyContactHooks {
             contact_materials: &self.contact_materials,
             voxel_colliders: &self.voxel_colliders,
+            pixel_rigidbodies: &self.pixel_rigidbodies,
+            voxel_terrain_sources: &self.voxel_terrain_sources,
+            friction_callback,
+            friction_data,
         };
         self.pipeline.step(
             self.gravity,
@@ -1366,13 +1395,13 @@ fn collider_contact_material(
 }
 
 fn voxel_metadata(
-    voxel_colliders: &HashMap<(u32, u32), HashMap<u32, VoxelCellMetadata>>,
+    voxel_colliders: &HashMap<(u32, u32), VoxelColliderMetadata>,
     handle: ColliderHandle,
     subshape: u32,
 ) -> Option<VoxelCellMetadata> {
     voxel_colliders
         .get(&collider_key(handle))
-        .and_then(|metadata| metadata.get(&subshape))
+        .and_then(|metadata| metadata.get(subshape))
         .copied()
 }
 
@@ -1395,9 +1424,15 @@ fn remove_voxel_collider_metadata(world: &mut AlchemyRapierWorldInner, handle: C
     world.voxel_terrain_sources.remove(&handle);
 }
 
+type AlchemyRapierFrictionScaleCallback = Option<extern "C" fn(*mut c_void, u64, i32, AlchemyRapierVec2) -> f32>;
+
 struct AlchemyContactHooks<'a> {
     contact_materials: &'a HashMap<u16, ContactMaterial>,
-    voxel_colliders: &'a HashMap<(u32, u32), HashMap<u32, VoxelCellMetadata>>,
+    voxel_colliders: &'a HashMap<(u32, u32), VoxelColliderMetadata>,
+    pixel_rigidbodies: &'a HashMap<RigidBodyHandle, PixelRigidbodyState>,
+    voxel_terrain_sources: &'a HashMap<ColliderHandle, VoxelTerrainSourceMetadata>,
+    friction_callback: AlchemyRapierFrictionScaleCallback,
+    friction_data: usize,
 }
 
 impl AlchemyContactHooks<'_> {
@@ -1443,21 +1478,45 @@ impl PhysicsHooks for AlchemyContactHooks<'_> {
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
         let material1 = self.material_for(context, context.collider1, context.manifold.subshape1);
         let material2 = self.material_for(context, context.collider2, context.manifold.subshape2);
-        let friction = combine_coefficient(
-            material1.friction,
-            material2.friction,
-            material1.friction_combine_rule,
-            material2.friction_combine_rule,
-        );
         let restitution = combine_coefficient(
             material1.restitution,
             material2.restitution,
             material1.restitution_combine_rule,
             material2.restitution_combine_rule,
         );
-
+        let sample = self.friction_callback;
+        let normal = *context.normal;
         for contact in context.solver_contacts.iter_mut() {
-            contact.friction = friction;
+            let mut values = [material1.friction, material2.friction];
+            if let Some(sample) = sample {
+                for (side, (collider, body)) in [
+                    (context.collider1, context.rigid_body1),
+                    (context.collider2, context.rigid_body2),
+                ].into_iter().enumerate() {
+                    let sign = if side == 0 { -1.0 } else { 1.0 };
+                    let p = contact.point + normal * (sign * 0.51);
+                    let mut body_id = 0;
+                    let mut cell = -1;
+                    if let Some(handle) = body {
+                        if let (Some(pixel), Some(rigid_body)) = (self.pixel_rigidbodies.get(&handle), context.bodies.get(handle)) {
+                            if pixel.collider == collider {
+                                let local = rigid_body.position().inverse_transform_point(p);
+                                let asset = local + pixel_shape_half_extents(pixel.width, pixel.height, pixel.pixel_size) - pixel.local_origin;
+                                let x = (asset.x / pixel.pixel_size).floor() as i32;
+                                let y = (asset.y / pixel.pixel_size).floor() as i32;
+                                if x >= 0 && y >= 0 && x < pixel.width as i32 && y < pixel.height as i32 {
+                                    body_id = pack_body_handle(handle);
+                                    cell = y * pixel.width as i32 + x;
+                                }
+                            }
+                        }
+                    }
+                    if body_id == 0 && !self.voxel_terrain_sources.contains_key(&collider) { continue; }
+                    let override_friction = sample(self.friction_data as *mut c_void, body_id, cell, AlchemyRapierVec2 { x: p.x, y: p.y });
+                    if override_friction.is_finite() && override_friction >= 0.0 { values[side] = override_friction; }
+                }
+            }
+            contact.friction = combine_coefficient(values[0], values[1], material1.friction_combine_rule, material2.friction_combine_rule);
             contact.restitution = restitution;
         }
     }
@@ -1579,7 +1638,7 @@ fn set_body_can_sleep(body: &mut RigidBody, can_sleep: bool) {
     }
 }
 
-fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) {
+fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) -> bool {
     let wake_up = desc.wake_up != 0;
     body.set_body_type(body_type_to_rapier(desc.body_type), wake_up);
     if desc.write_transform != 0 {
@@ -1596,17 +1655,23 @@ fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) {
     body.set_angular_damping(desc.angular_damping.max(0.0));
     body.set_gravity_scale(desc.gravity_scale, wake_up);
     body.lock_rotations(desc.fixed_rotation != 0, wake_up);
-    if desc.use_collider_mass != 0 {
-        body.set_additional_mass(0.0, wake_up);
+    let desired_mass = if desc.use_collider_mass != 0 {
+        RigidBodyAdditionalMassProps::Mass(0.0)
     } else {
-        body.set_additional_mass_properties(
-            MassProperties::new(
+        RigidBodyAdditionalMassProps::MassProps(MassProperties::new(
                 vector(desc.local_center_of_mass),
                 sanitize_positive(desc.mass, 1.0),
                 sanitize_positive(desc.inertia, 1.0),
-            ),
-            wake_up,
-        );
+            ))
+    };
+    // Rapier's setter allocates a Box even when the value is identical. The
+    // game sends this descriptor every tick, so compare before calling it.
+    let mass_changed = body.mass_properties().additional_local_mprops.as_deref() != Some(&desired_mass);
+    if mass_changed {
+        match desired_mass {
+            RigidBodyAdditionalMassProps::Mass(mass) => body.set_additional_mass(mass, wake_up),
+            RigidBodyAdditionalMassProps::MassProps(props) => body.set_additional_mass_properties(props, wake_up),
+        }
     }
     set_body_can_sleep(body, desc.can_sleep != 0);
     if desc.sleep != 0 {
@@ -1615,6 +1680,7 @@ fn apply_body_desc(body: &mut RigidBody, desc: AlchemyRapierBodyDesc) {
         body.wake_up(true);
     }
     body.user_data = desc.user_data as u128;
+    mass_changed
 }
 
 fn recompute_body_mass(world: &mut AlchemyRapierWorldInner, handle: RigidBodyHandle) {
@@ -1859,7 +1925,10 @@ fn build_pixel_collider(asset: &AuthoredVoxelAsset, local_origin: Vector) -> Opt
     if shapes.is_empty() {
         return None;
     }
-    Some(ColliderBuilder::compound(shapes).density(1.0).build())
+    Some(ColliderBuilder::compound(shapes)
+        .density(1.0)
+        .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
+        .build())
 }
 
 fn actor_cells(
@@ -1931,7 +2000,10 @@ fn build_actor_collider(
             SharedShape::cuboid(voxel_size * 0.5, voxel_size * 0.5),
         ));
     }
-    Some(ColliderBuilder::compound(shapes).density(1.0).build())
+    Some(ColliderBuilder::compound(shapes)
+        .density(1.0)
+        .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
+        .build())
 }
 
 fn pixel_shape_local_origin_for_com(
@@ -2946,7 +3018,7 @@ struct DeformingCapsuleContact {
 }
 
 #[derive(Clone, Copy)]
-struct SegmentCapsuleBroadPhaseCandidate {
+struct QueryBroadPhaseCandidate {
     collider_handle: ColliderHandle,
     target: QueryTarget,
     aabb: Aabb,
@@ -3378,17 +3450,18 @@ fn overlap_deforming_capsule_against_collider<D: QueryDispatcher + ?Sized>(
     )
 }
 
-fn collect_segment_capsule_broad_phase_candidates(
+fn collect_query_broad_phase_candidates_into(
     world: &AlchemyRapierWorldInner,
     query_aabb: &Aabb,
     ignored_body: Option<RigidBodyHandle>,
     source_mask: u32,
-) -> Vec<SegmentCapsuleBroadPhaseCandidate> {
+    candidates: &mut Vec<QueryBroadPhaseCandidate>,
+) {
     let pipeline = world.broad_phase.as_query_pipeline(
         world.narrow_phase.query_dispatcher(), &world.bodies, &world.colliders,
         QueryFilter::default(),
     );
-    let mut candidates = Vec::new();
+    candidates.clear();
     let mut append = |collider_handle: ColliderHandle, collider: &Collider| {
         if !collider.is_enabled() {
             return;
@@ -3398,7 +3471,7 @@ fn collect_segment_capsule_broad_phase_candidates(
         };
         let aabb = collider.shape().compute_aabb(collider.position());
         if aabbs_intersect(query_aabb, &aabb) {
-            candidates.push(SegmentCapsuleBroadPhaseCandidate { collider_handle, target, aabb });
+            candidates.push(QueryBroadPhaseCandidate { collider_handle, target, aabb });
         }
     };
     for (handle, collider) in pipeline.intersect_aabb_conservative(*query_aabb) {
@@ -3415,6 +3488,16 @@ fn collect_segment_capsule_broad_phase_candidates(
     }
     // Match ColliderSet arena order for deterministic ties at equal TOI.
     candidates.sort_unstable_by_key(|candidate| candidate.collider_handle.into_raw_parts().0);
+}
+
+fn collect_query_broad_phase_candidates(
+    world: &AlchemyRapierWorldInner,
+    query_aabb: &Aabb,
+    ignored_body: Option<RigidBodyHandle>,
+    source_mask: u32,
+) -> Vec<QueryBroadPhaseCandidate> {
+    let mut candidates = Vec::new();
+    collect_query_broad_phase_candidates_into(world, query_aabb, ignored_body, source_mask, &mut candidates);
     candidates
 }
 
@@ -3583,7 +3666,7 @@ pub extern "C" fn alchemy_rapier_step(
     time_step: f32,
     sub_step_count: i32,
 ) -> AlchemyRapierStepResult {
-    step_with_contact_callback(world, time_step, sub_step_count, None, ptr::null_mut())
+    step_with_contact_callback(world, time_step, sub_step_count, None, ptr::null_mut(), None)
 }
 
 #[unsafe(no_mangle)]
@@ -3594,7 +3677,19 @@ pub extern "C" fn alchemy_rapier_step_with_contact_callback(
     callback: AlchemyRapierContactCallback,
     user_data: *mut c_void,
 ) -> AlchemyRapierStepResult {
-    step_with_contact_callback(world, time_step, sub_step_count, callback, user_data)
+    step_with_contact_callback(world, time_step, sub_step_count, callback, user_data, None)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_step_with_surface_friction(
+    world: *mut AlchemyRapierWorld,
+    time_step: f32,
+    sub_step_count: i32,
+    callback: AlchemyRapierContactCallback,
+    user_data: *mut c_void,
+    friction_callback: AlchemyRapierFrictionScaleCallback,
+) -> AlchemyRapierStepResult {
+    step_with_contact_callback(world, time_step, sub_step_count, callback, user_data, friction_callback)
 }
 
 fn step_with_contact_callback(
@@ -3603,6 +3698,7 @@ fn step_with_contact_callback(
     sub_step_count: i32,
     callback: AlchemyRapierContactCallback,
     user_data: *mut c_void,
+    friction_callback: AlchemyRapierFrictionScaleCallback,
 ) -> AlchemyRapierStepResult {
     match catch_unwind(AssertUnwindSafe(|| {
         if !time_step.is_finite() || time_step <= 0.0 || sub_step_count <= 0 {
@@ -3616,7 +3712,7 @@ fn step_with_contact_callback(
         let mut active_pairs = HashSet::new();
         let mut contact_hit_count = 0usize;
         for _ in 0..sub_steps {
-            world.step_once(dt);
+            world.step_once(dt, friction_callback, user_data as usize);
             if callback.is_some() {
                 contact_hit_count = contact_hit_count
                     .saturating_add(emit_contact_samples(world, callback, user_data));
@@ -3736,9 +3832,58 @@ pub extern "C" fn alchemy_rapier_update_body(
         };
         let moved = desc.write_transform != 0 &&
             *body.position() != Pose::from_parts(vector(desc.position), Rotation::new(desc.rotation));
-        apply_body_desc(body, desc);
-        body.recompute_mass_properties_from_colliders(&world.colliders);
+        let mass_changed = apply_body_desc(body, desc);
+        if mass_changed {
+            body.recompute_mass_properties_from_colliders(&world.colliders);
+        }
         if moved { world.mark_query_body_pending(handle); }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_simulation_enabled(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    enabled: u8,
+    position: AlchemyRapierVec2,
+    rotation: f32,
+    velocity: AlchemyRapierVec2,
+    angular_velocity: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if enabled > 1 || !position.x.is_finite() || !position.y.is_finite() ||
+            !rotation.is_finite() || !velocity.x.is_finite() || !velocity.y.is_finite() ||
+            !angular_velocity.is_finite() { return AlchemyRapierStatus::InvalidArgument; }
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        let handle = handle_from_ffi(handle);
+        let Some(body) = world.bodies.get_mut(handle) else { return AlchemyRapierStatus::InvalidHandle; };
+        let changed = body.is_enabled() != (enabled != 0);
+        if !changed && enabled != 0 { return AlchemyRapierStatus::Ok; }
+        if enabled != 0 && changed {
+            body.set_position(Pose::from_parts(vector(position), Rotation::new(rotation)), true);
+            body.set_linvel(vector(velocity), true);
+            body.set_angvel(angular_velocity, true);
+        }
+        body.set_enabled(enabled != 0);
+        let body_pose = *body.position();
+        for collider in body.colliders().iter().copied() {
+            if let Some(collider_ref) = world.colliders.get_mut(collider) {
+                if !changed && collider_ref.is_enabled() == (enabled != 0) {
+                    continue;
+                }
+                if enabled != 0 {
+                    if let Some(local) = collider_ref.position_wrt_parent().copied() {
+                        collider_ref.set_position(body_pose * local);
+                    }
+                }
+                collider_ref.set_enabled(enabled != 0);
+            }
+            world.query_pending_colliders.insert(collider);
+        }
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -3761,6 +3906,24 @@ pub extern "C" fn alchemy_rapier_set_body_user_data(
             return AlchemyRapierStatus::InvalidHandle;
         };
         body.user_data = user_data as u128;
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_set_body_gravity_scale(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierRigidBodyHandle,
+    scale: f32,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if !scale.is_finite() || scale < 0.0 { return AlchemyRapierStatus::InvalidArgument; }
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        let Some(body) = world.bodies.get_mut(handle_from_ffi(handle)) else { return AlchemyRapierStatus::InvalidHandle; };
+        if (body.gravity_scale() - scale).abs() > f32::EPSILON { body.set_gravity_scale(scale, true); }
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -4232,8 +4395,10 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
 }
 
 fn build_voxel_collider_shape_and_metadata(
+    world: &mut AlchemyRapierWorldInner,
     desc: AlchemyRapierVoxelColliderDesc,
-) -> Result<(SharedShape, HashMap<u32, VoxelCellMetadata>), AlchemyRapierStatus> {
+    cache_full_terrain: bool,
+) -> Result<(SharedShape, VoxelColliderMetadata), AlchemyRapierStatus> {
     if !desc.translation.x.is_finite()
         || !desc.translation.y.is_finite()
         || !desc.voxel_size.x.is_finite()
@@ -4247,6 +4412,71 @@ fn build_voxel_collider_shape_and_metadata(
     }
 
     let source = unsafe { slice::from_raw_parts(desc.cells, desc.cell_count) };
+    const TERRAIN_SIDE: usize = 64;
+    const TERRAIN_CELLS: usize = TERRAIN_SIDE * TERRAIN_SIDE;
+    if cache_full_terrain
+        && desc.voxel_size.x == 1.0
+        && desc.voxel_size.y == 1.0
+        && source.len() == TERRAIN_CELLS
+    {
+        // Count alone is insufficient: duplicate coordinates or cells outside
+        // the chunk must retain the general Voxels construction semantics.
+        let mut occupied = [0u64; TERRAIN_CELLS / 64];
+        let full = source.iter().all(|cell| {
+            if !(0..TERRAIN_SIDE as i32).contains(&cell.coord.x)
+                || !(0..TERRAIN_SIDE as i32).contains(&cell.coord.y)
+            {
+                return false;
+            }
+            let index = cell.coord.y as usize * TERRAIN_SIDE + cell.coord.x as usize;
+            let bit = 1u64 << (index % 64);
+            let word = &mut occupied[index / 64];
+            let fresh = *word & bit == 0;
+            *word |= bit;
+            fresh
+        });
+        if full {
+            if world.full_terrain_shape.is_none() {
+                let coords: Vec<_> = source
+                    .iter()
+                    .map(|cell| IVector::new(cell.coord.x, cell.coord.y))
+                    .collect();
+                let voxels = Voxels::new(vector(desc.voxel_size), &coords);
+                let mut flat_id_by_cell = vec![0; TERRAIN_CELLS];
+                let mut valid_mapping = true;
+                for cell in source {
+                    let local = cell.coord.y as usize * TERRAIN_SIDE + cell.coord.x as usize;
+                    match voxels.linear_index(IVector::new(cell.coord.x, cell.coord.y)) {
+                        Some(index) if index.flat_id() < TERRAIN_CELLS => {
+                            flat_id_by_cell[local] = index.flat_id();
+                        }
+                        _ => {
+                            valid_mapping = false;
+                            break;
+                        }
+                    }
+                }
+                if valid_mapping {
+                    world.full_terrain_shape = Some(FullTerrainShapeCache {
+                        shape: SharedShape::new(voxels),
+                        flat_id_by_cell,
+                    });
+                }
+            }
+            if let Some(cache) = &world.full_terrain_shape {
+                let mut metadata = vec![None; TERRAIN_CELLS];
+                for cell in source {
+                    let local = cell.coord.y as usize * TERRAIN_SIDE + cell.coord.x as usize;
+                    metadata[cache.flat_id_by_cell[local]] = Some(VoxelCellMetadata {
+                        material_id: cell.material_id,
+                        source_cell_id: cell.source_cell_id,
+                    });
+                }
+                return Ok((cache.shape.clone(), VoxelColliderMetadata::Dense(metadata)));
+            }
+        }
+    }
+
     let coords = source
         .iter()
         .map(|cell| IVector::new(cell.coord.x, cell.coord.y))
@@ -4266,14 +4496,19 @@ fn build_voxel_collider_shape_and_metadata(
         }
     }
 
-    Ok((SharedShape::new(voxels), metadata))
+    Ok((
+        SharedShape::new(voxels),
+        VoxelColliderMetadata::Sparse(metadata),
+    ))
 }
 
 fn create_voxel_collider_inner(
     world: &mut AlchemyRapierWorldInner,
     desc: AlchemyRapierVoxelColliderDesc,
+    cache_full_terrain: bool,
 ) -> Result<ColliderHandle, AlchemyRapierStatus> {
-    let (shape, metadata) = build_voxel_collider_shape_and_metadata(desc)?;
+    let (shape, metadata) =
+        build_voxel_collider_shape_and_metadata(world, desc, cache_full_terrain)?;
     let collider = ColliderBuilder::new(shape)
         .translation(vector(desc.translation))
         .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
@@ -4288,8 +4523,10 @@ fn update_voxel_collider_inner(
     world: &mut AlchemyRapierWorldInner,
     packed_id: u64,
     desc: AlchemyRapierVoxelColliderDesc,
+    cache_full_terrain: bool,
 ) -> Result<ColliderHandle, AlchemyRapierStatus> {
-    let (shape, metadata) = build_voxel_collider_shape_and_metadata(desc)?;
+    let (shape, metadata) =
+        build_voxel_collider_shape_and_metadata(world, desc, cache_full_terrain)?;
     let Some(handle) = collider_handle_from_packed(packed_id) else {
         return Err(AlchemyRapierStatus::InvalidHandle);
     };
@@ -4314,7 +4551,7 @@ pub extern "C" fn alchemy_rapier_create_voxel_collider(
         let Ok(world) = to_inner(world) else {
             return empty_create_collider_result(AlchemyRapierStatus::NullPointer);
         };
-        match create_voxel_collider_inner(world, desc) {
+        match create_voxel_collider_inner(world, desc, false) {
             Ok(handle) => AlchemyRapierCreateColliderResult {
                 status: AlchemyRapierStatus::Ok,
                 handle: collider_handle_to_ffi(handle),
@@ -4341,7 +4578,7 @@ pub extern "C" fn alchemy_rapier_create_static_terrain_voxel_collider(
             Ok(source) => source,
             Err(status) => return empty_create_collider_result(status),
         };
-        match create_voxel_collider_inner(world, desc.voxel) {
+        match create_voxel_collider_inner(world, desc.voxel, true) {
             Ok(handle) => {
                 world.voxel_terrain_sources.insert(handle, source);
                 AlchemyRapierCreateColliderResult {
@@ -4368,7 +4605,7 @@ pub extern "C" fn alchemy_rapier_update_voxel_collider_by_id(
         let Ok(world) = to_inner(world) else {
             return AlchemyRapierStatus::NullPointer;
         };
-        match update_voxel_collider_inner(world, packed_id, desc) {
+        match update_voxel_collider_inner(world, packed_id, desc, false) {
             Ok(handle) => {
                 world.voxel_terrain_sources.remove(&handle);
                 AlchemyRapierStatus::Ok
@@ -4395,7 +4632,7 @@ pub extern "C" fn alchemy_rapier_update_static_terrain_voxel_collider_by_id(
             Ok(source) => source,
             Err(status) => return status,
         };
-        match update_voxel_collider_inner(world, packed_id, desc.voxel) {
+        match update_voxel_collider_inner(world, packed_id, desc.voxel, true) {
             Ok(handle) => {
                 world.voxel_terrain_sources.insert(handle, source);
                 AlchemyRapierStatus::Ok
@@ -5770,14 +6007,20 @@ pub extern "C" fn alchemy_rapier_query_cast_capsule(
         let dispatcher = world.narrow_phase.query_dispatcher();
         let mut hit_count = 0;
         let mut written_count = 0;
-        let mut candidate_count = 0;
-        for (collider_handle, collider) in world.colliders.iter_enabled() {
-            let Some(target) =
-                query_target(world, collider_handle, collider, ignored_body, source_mask)
-            else {
+        let extents = Vector::new(radius.max(0.000001), half_height + radius.max(0.000001));
+        let query_aabb = Aabb::new(
+            Vector::new(from_origin.x.min(to_origin.x), from_origin.y.min(to_origin.y)) - extents,
+            Vector::new(from_origin.x.max(to_origin.x), from_origin.y.max(to_origin.y)) + extents,
+        );
+        let mut candidates = std::mem::take(&mut world.query_candidate_scratch);
+        collect_query_broad_phase_candidates_into(world, &query_aabb, ignored_body, source_mask, &mut candidates);
+        let candidate_count = candidates.len();
+        for candidate in &candidates {
+            let collider_handle = candidate.collider_handle;
+            let target = candidate.target;
+            let Some(collider) = world.colliders.get(collider_handle) else {
                 continue;
             };
-            candidate_count += 1;
             let pos12 = collider.position().inv_mul(&capsule_pose);
             let local_vel12 = collider.position().inverse_transform_vector(delta);
             let Ok(Some(shape_hit)) =
@@ -5802,6 +6045,7 @@ pub extern "C" fn alchemy_rapier_query_cast_capsule(
             }
         }
 
+        world.query_candidate_scratch = candidates;
         AlchemyRapierQueryResult {
             status: AlchemyRapierStatus::Ok,
             hit_count,
@@ -5844,6 +6088,9 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
             .propagate_modified_body_positions_to_colliders(&mut world.colliders);
 
         let origin = vector(origin);
+        if !origin.x.is_finite() || !origin.y.is_finite() {
+            return empty_query_result(AlchemyRapierStatus::InvalidArgument);
+        }
         let capsule = Capsule::new_y(half_height, radius.max(0.000001));
         let capsule_pose = pose_translation(origin);
         let ignored_body = if has_ignored_body != 0 {
@@ -5854,14 +6101,17 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
         let dispatcher = world.narrow_phase.query_dispatcher();
         let mut hit_count = 0;
         let mut written_count = 0;
-        let mut candidate_count = 0;
-        for (collider_handle, collider) in world.colliders.iter_enabled() {
-            let Some(target) =
-                query_target(world, collider_handle, collider, ignored_body, source_mask)
-            else {
+        let extents = Vector::new(radius.max(0.000001), half_height + radius.max(0.000001));
+        let query_aabb = Aabb::new(origin - extents, origin + extents);
+        let mut candidates = std::mem::take(&mut world.query_candidate_scratch);
+        collect_query_broad_phase_candidates_into(world, &query_aabb, ignored_body, source_mask, &mut candidates);
+        let candidate_count = candidates.len();
+        for candidate in &candidates {
+            let collider_handle = candidate.collider_handle;
+            let target = candidate.target;
+            let Some(collider) = world.colliders.get(collider_handle) else {
                 continue;
             };
-            candidate_count += 1;
             let pos12 = capsule_pose.inv_mul(collider.position());
             let Ok(intersects) = dispatcher.intersection_test(&pos12, &capsule, collider.shape())
             else {
@@ -5880,6 +6130,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
             }
         }
 
+        world.query_candidate_scratch = candidates;
         AlchemyRapierQueryResult {
             status: AlchemyRapierStatus::Ok,
             hit_count,
@@ -5946,7 +6197,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsule(
         let dispatcher = world.narrow_phase.query_dispatcher();
         let maximum_motion = motion.maximum_motion();
         let mut earliest_hit: Option<AlchemyRapierQueryHit> = None;
-        let candidates = collect_segment_capsule_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
+        let candidates = collect_query_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
         let candidate_count = candidates.len();
         for candidate in candidates {
             let collider_handle = candidate.collider_handle;
@@ -6052,7 +6303,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_segment_capsule(
         };
         let dispatcher = world.narrow_phase.query_dispatcher();
         let mut deepest_hit: Option<AlchemyRapierQueryHit> = None;
-        let candidates = collect_segment_capsule_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
+        let candidates = collect_query_broad_phase_candidates(world, &query_aabb, ignored_body, source_mask);
         let candidate_count = candidates.len();
         for candidate in candidates {
             let collider_handle = candidate.collider_handle;
@@ -6149,9 +6400,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsules(
         let Ok(world) = to_inner(world) else {
             return empty_query_result(AlchemyRapierStatus::NullPointer);
         };
-        world
-            .bodies
-            .propagate_modified_body_positions_to_colliders(&mut world.colliders);
+        world.bodies.propagate_modified_body_positions_to_colliders(&mut world.colliders);
 
         let first_motion = segment_capsule_query_motion(&queries[0]);
         let mut batch_aabb = first_motion
@@ -6169,7 +6418,7 @@ pub extern "C" fn alchemy_rapier_query_cast_segment_capsules(
         } else {
             None
         };
-        let candidates = collect_segment_capsule_broad_phase_candidates(
+        let candidates = collect_query_broad_phase_candidates(
             world,
             &batch_aabb,
             ignored_body,
@@ -6297,7 +6546,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_segment_capsules(
         } else {
             None
         };
-        let candidates = collect_segment_capsule_broad_phase_candidates(
+        let candidates = collect_query_broad_phase_candidates(
             world,
             &batch_aabb,
             ignored_body,
@@ -6406,7 +6655,7 @@ pub extern "C" fn alchemy_rapier_query_surface_anchor(
                 // callers may filter individual bodies after projecting them.
                 let radius = Vector::splat(max_distance);
                 let query_aabb = Aabb::new(anchor - radius, anchor + radius);
-                let candidates = collect_segment_capsule_broad_phase_candidates(
+                let candidates = collect_query_broad_phase_candidates(
                     world, &query_aabb, None, 1 << 1,
                 );
                 candidate_count = candidates.len();
@@ -7061,6 +7310,90 @@ mod tests {
     use rapier2d::parry::query::DefaultQueryDispatcher;
 
     #[test]
+    fn full_terrain_shape_cache_preserves_per_collider_metadata_and_falls_back_for_damage() {
+        let mut world = AlchemyRapierWorldInner::new();
+        let mut cells: Vec<_> = (0..64)
+            .flat_map(|y| {
+                (0..64).map(move |x| AlchemyRapierVoxelCell {
+                    coord: AlchemyRapierIVec2 { x, y },
+                    material_id: ((x + 2 * y) % 31 + 1) as u16,
+                    source_cell_id: (y * 64 + x) as u32,
+                })
+            })
+            .collect();
+        let desc = |cells: &[AlchemyRapierVoxelCell]| AlchemyRapierVoxelColliderDesc {
+            translation: AlchemyRapierVec2 { x: 128.0, y: 64.0 },
+            voxel_size: AlchemyRapierVec2 { x: 1.0, y: 1.0 },
+            cells: cells.as_ptr(),
+            cell_count: cells.len(),
+        };
+        let (first_shape, first_metadata) =
+            build_voxel_collider_shape_and_metadata(&mut world, desc(&cells), true).unwrap();
+        assert!(matches!(first_metadata, VoxelColliderMetadata::Dense(_)));
+
+        // A different order and different materials must share the geometry,
+        // while looking up each actual subshape still returns this chunk's data.
+        cells.reverse();
+        for cell in &mut cells {
+            cell.material_id += 40;
+            cell.source_cell_id += 10000;
+        }
+        let (second_shape, second_metadata) =
+            build_voxel_collider_shape_and_metadata(&mut world, desc(&cells), true).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first_shape.0, &second_shape.0));
+        let voxels = second_shape.as_voxels().unwrap();
+        for cell in &cells {
+            let flat_id = voxels
+                .linear_index(IVector::new(cell.coord.x, cell.coord.y))
+                .unwrap()
+                .flat_id() as u32;
+            let actual = second_metadata.get(flat_id).unwrap();
+            assert_eq!(actual.material_id, cell.material_id);
+            assert_eq!(actual.source_cell_id, cell.source_cell_id);
+            let previous = first_metadata.get(flat_id).unwrap();
+            assert_eq!(previous.material_id + 40, actual.material_id);
+            assert_eq!(previous.source_cell_id + 10000, actual.source_cell_id);
+        }
+        assert!(second_metadata.get(4096).is_none());
+
+        let changed_handle = create_voxel_collider_inner(&mut world, desc(&cells), true).unwrap();
+        let intact_handle = create_voxel_collider_inner(&mut world, desc(&cells), true).unwrap();
+
+        // Destroyed or duplicated pixels cannot use the all-solid cache.
+        let removed = cells.pop().unwrap();
+        let (damaged_shape, damaged_metadata) =
+            build_voxel_collider_shape_and_metadata(&mut world, desc(&cells), true).unwrap();
+        assert!(matches!(damaged_metadata, VoxelColliderMetadata::Sparse(_)));
+        assert!(!std::sync::Arc::ptr_eq(&first_shape.0, &damaged_shape.0));
+        update_voxel_collider_inner(
+            &mut world,
+            pack_collider_handle(changed_handle),
+            desc(&cells),
+            true,
+        )
+        .unwrap();
+        let removed_coord = IVector::new(removed.coord.x, removed.coord.y);
+        let changed = world.colliders[changed_handle].shape().as_voxels().unwrap();
+        assert!(changed.voxel_state(removed_coord).is_none_or(|state| state.is_empty()));
+        let intact = world.colliders[intact_handle].shape().as_voxels().unwrap();
+        assert!(!intact.voxel_state(removed_coord).unwrap().is_empty());
+        let intact_id = intact.linear_index(removed_coord).unwrap().flat_id() as u32;
+        assert_eq!(
+            voxel_metadata(&world.voxel_colliders, intact_handle, intact_id)
+                .unwrap()
+                .source_cell_id,
+            removed.source_cell_id
+        );
+        cells.push(cells[0]);
+        let (_, duplicate_metadata) =
+            build_voxel_collider_shape_and_metadata(&mut world, desc(&cells), true).unwrap();
+        assert!(matches!(
+            duplicate_metadata,
+            VoxelColliderMetadata::Sparse(_)
+        ));
+    }
+
+    #[test]
     fn control_drive_validates_before_updating_and_disables_motors() {
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<AlchemyRapierControlDriveDesc>(), 52);
@@ -7305,6 +7638,94 @@ mod tests {
             AlchemyRapierStatus::Ok
         );
         body.handle
+    }
+
+    #[test]
+    fn unchanged_body_mass_does_not_reallocate_or_wake_but_updates_still_apply() {
+        let world = alchemy_rapier_create_world();
+        let mut desc = test_body_desc(0.0);
+        desc.can_sleep = 1;
+        desc.wake_up = 0;
+        desc.sleep = 1;
+        let created = alchemy_rapier_create_body(world.world, desc);
+        assert_eq!(created.status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_update_body(world.world, created.handle, desc), AlchemyRapierStatus::Ok);
+        let mass_ptr = |world| {
+            let inner = to_inner(world).unwrap();
+            inner.bodies[handle_from_ffi(created.handle)].mass_properties()
+                .additional_local_mprops.as_deref().unwrap() as *const _ as usize
+        };
+        let original_ptr = mass_ptr(world.world);
+        desc.sleep = 0;
+        desc.write_transform = 0;
+        desc.write_velocity = 0;
+        for _ in 0..16 {
+            assert_eq!(alchemy_rapier_update_body(world.world, created.handle, desc), AlchemyRapierStatus::Ok);
+            assert_eq!(mass_ptr(world.world), original_ptr);
+        }
+        assert_eq!(alchemy_rapier_body_state(world.world, created.handle).is_awake, 0);
+        desc.mass = 4.0;
+        desc.inertia = 3.0;
+        assert_eq!(alchemy_rapier_update_body(world.world, created.handle, desc), AlchemyRapierStatus::Ok);
+        let changed = alchemy_rapier_body_mass(world.world, created.handle);
+        assert_eq!(changed.status, AlchemyRapierStatus::Ok);
+        assert!((changed.mass - 4.0).abs() < 0.0001);
+        assert!((changed.inertia - 3.0).abs() < 0.0001);
+        assert_eq!(alchemy_rapier_create_capsule_collider(world.world, created.handle, 0.5, 0.5).status, AlchemyRapierStatus::Ok);
+        let collider_mass = alchemy_rapier_body_mass(world.world, created.handle).mass;
+        assert_eq!(alchemy_rapier_update_body(world.world, created.handle, desc), AlchemyRapierStatus::Ok);
+        assert!((alchemy_rapier_body_mass(world.world, created.handle).mass - collider_mass).abs() < 0.0001);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn capsule_broad_phase_keeps_new_and_moved_colliders_and_filters_distant_ones() {
+        let world = alchemy_rapier_create_world();
+        let mut desc = test_body_desc(0.0);
+        desc.position = AlchemyRapierVec2 { x: 4.0, y: 0.0 };
+        let near = alchemy_rapier_create_body(world.world, desc);
+        assert_eq!(near.status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_create_capsule_collider(world.world, near.handle, 0.5, 0.0).status, AlchemyRapierStatus::Ok);
+        for index in 0..100 {
+            let mut far = desc;
+            far.position.x = 1000.0 + index as f32 * 4.0;
+            let body = alchemy_rapier_create_body(world.world, far);
+            assert_eq!(body.status, AlchemyRapierStatus::Ok);
+            assert_eq!(alchemy_rapier_create_capsule_collider(world.world, body.handle, 0.5, 0.0).status, AlchemyRapierStatus::Ok);
+        }
+        let from = AlchemyRapierVec2 { x: 0.0, y: 0.0 };
+        let to = AlchemyRapierVec2 { x: 10.0, y: 0.0 };
+        let mut hits = [AlchemyRapierQueryHit::default(); 8];
+        let cast = |hits: &mut [AlchemyRapierQueryHit; 8]| alchemy_rapier_query_cast_capsule(
+            world.world, from, to, 0.5, 0.0, AlchemyRapierRigidBodyHandle::default(), 0,
+            QUERY_SOURCE_DYNAMIC_RIGIDBODY, hits.as_mut_ptr(), hits.len());
+        let first = cast(&mut hits);
+        assert_eq!(first.status, AlchemyRapierStatus::Ok);
+        assert_eq!(first.hit_count, 1);
+        assert!(first.candidate_count < 10);
+        assert_eq!(hits[0].body_packed_id, near.packed_id);
+        assert!((hits[0].fraction - 0.3).abs() < 0.01);
+        assert_eq!(alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status, AlchemyRapierStatus::Ok);
+        let stepped = cast(&mut hits);
+        assert_eq!(stepped.hit_count, 1);
+        assert_eq!(hits[0].body_packed_id, near.packed_id);
+        desc.position.x = 8.0;
+        assert_eq!(alchemy_rapier_update_body(world.world, near.handle, desc), AlchemyRapierStatus::Ok);
+        let moved = cast(&mut hits);
+        assert_eq!(moved.hit_count, 1);
+        assert_eq!(hits[0].body_packed_id, near.packed_id);
+        assert!((hits[0].fraction - 0.7).abs() < 0.01);
+        let overlap = alchemy_rapier_query_overlap_capsule(world.world, desc.position, 0.5, 0.0,
+            AlchemyRapierRigidBodyHandle::default(), 0, QUERY_SOURCE_DYNAMIC_RIGIDBODY, hits.as_mut_ptr(), hits.len());
+        assert_eq!(overlap.hit_count, 1);
+        assert_eq!(hits[0].body_packed_id, near.packed_id);
+        let ignored = alchemy_rapier_query_overlap_capsule(world.world, desc.position, 0.5, 0.0,
+            near.handle, 1, QUERY_SOURCE_DYNAMIC_RIGIDBODY, hits.as_mut_ptr(), hits.len());
+        assert_eq!(ignored.hit_count, 0);
+        desc.position.x = 500.0;
+        assert_eq!(alchemy_rapier_update_body(world.world, near.handle, desc), AlchemyRapierStatus::Ok);
+        assert_eq!(cast(&mut hits).hit_count, 0);
+        alchemy_rapier_destroy_world(world.world);
     }
 
     #[test]
