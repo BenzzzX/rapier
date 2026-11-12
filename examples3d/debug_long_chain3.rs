@@ -1,20 +1,17 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let mut impulse_joints = ImpulseJointSet::new();
-    let mut multibody_joints = MultibodyJointSet::new();
-    let use_articulations = false;
+    let mut world = PhysicsWorld::new();
+    let use_articulations = true;
 
     /*
      * Create the long chain.
      */
-    let num = 100;
+    let num = 85;
     let rad = 0.2;
     let shift = rad * 2.2;
 
@@ -31,9 +28,8 @@ pub fn init_world(testbed: &mut Testbed) {
 
         let rigid_body =
             RigidBodyBuilder::new(status).translation(Vector::new(0.0, 0.0, fi * shift));
-        let child_handle = bodies.insert(rigid_body);
         let collider = ColliderBuilder::ball(rad);
-        colliders.insert_with_parent(collider, child_handle, &mut bodies);
+        let (child_handle, _) = world.insert(rigid_body, collider);
 
         // Vertical joint.
         if i > 0 {
@@ -47,9 +43,9 @@ pub fn init_world(testbed: &mut Testbed) {
             };
 
             if use_articulations {
-                multibody_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_multibody_joint(parent_handle, child_handle, joint);
             } else {
-                impulse_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_impulse_joint(parent_handle, child_handle, joint);
             }
         }
 
@@ -59,6 +55,13 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

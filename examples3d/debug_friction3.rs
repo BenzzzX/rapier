@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -17,25 +14,30 @@ pub fn init_world(testbed: &mut Testbed) {
     let ground_height = 0.1;
 
     let rigid_body = RigidBodyBuilder::fixed();
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(ground_size, ground_height, ground_size).friction(1.5);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let (_handle, _) = world.insert(rigid_body, collider);
 
     // Build a dynamic box rigid body.
     let rigid_body = RigidBodyBuilder::dynamic()
         .translation(Vector::new(0.0, 1.1, 0.0))
         .rotation(Vector::Y * 0.3);
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(2.0, 1.0, 3.0).friction(1.5);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let (handle, _) = world.insert(rigid_body, collider);
 
-    let rigid_body = &mut bodies[handle];
+    let rigid_body = &mut world.bodies[handle];
     let force = rigid_body.rotation() * Vector::Z * 50.0;
     rigid_body.set_linvel(force, true);
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

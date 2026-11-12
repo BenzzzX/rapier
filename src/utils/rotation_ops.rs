@@ -2,7 +2,6 @@
 
 #[cfg(feature = "dim3")]
 use crate::math::Mat3;
-#[cfg(feature = "simd-is-enabled")]
 use crate::math::SimdReal;
 use crate::math::{Matrix, Real, Rotation, Vector};
 #[cfg(feature = "dim3")]
@@ -10,7 +9,7 @@ use crate::utils::CrossProductMatrix;
 use crate::utils::ScalarType;
 use core::fmt::Debug;
 use core::ops::Mul;
-#[cfg(all(feature = "dim3", feature = "simd-is-enabled"))]
+#[cfg(feature = "dim3")]
 use na::{Matrix3, UnitQuaternion};
 
 /// Trait implemented by quaternions.
@@ -30,6 +29,8 @@ pub trait RotationOps<N: ScalarType>:
     fn dot(&self, rhs: &Self) -> N;
     /// The imaginary part of the quaternion.
     fn imag(&self) -> N::Vector;
+    /// The real (scalar) part of the quaternion.
+    fn real(&self) -> N;
     /// Multiply this quaternion by a scalar without renormalizing.
     fn mul_assign_unchecked(&mut self, rhs: N);
 }
@@ -45,11 +46,13 @@ pub trait RotationOps<N: ScalarType>:
     fn inverse(self) -> Self;
     /// The imaginary part of the complex rotation.
     fn imag(&self) -> N;
+    /// The real part of the complex rotation.
+    fn real(&self) -> N;
     /// The angle of the rotation.
     fn angle(&self) -> N;
 }
 
-#[cfg(all(feature = "dim3", feature = "simd-is-enabled"))]
+#[cfg(feature = "dim3")]
 impl RotationOps<SimdReal> for UnitQuaternion<SimdReal> {
     #[inline]
     fn to_mat(self) -> na::Matrix3<SimdReal> {
@@ -90,6 +93,11 @@ impl RotationOps<SimdReal> for UnitQuaternion<SimdReal> {
     #[inline]
     fn imag(&self) -> na::Vector3<SimdReal> {
         (**self).imag()
+    }
+
+    #[inline]
+    fn real(&self) -> SimdReal {
+        self.w
     }
 
     #[inline]
@@ -142,6 +150,11 @@ impl RotationOps<Real> for Rotation {
     }
 
     #[inline]
+    fn real(&self) -> Real {
+        self.w
+    }
+
+    #[inline]
     fn mul_assign_unchecked(&mut self, rhs: Real) {
         *self *= rhs;
     }
@@ -168,12 +181,17 @@ impl RotationOps<Real> for Rotation {
     }
 
     #[inline]
+    fn real(&self) -> Real {
+        self.re
+    }
+
+    #[inline]
     fn angle(&self) -> Real {
         (*self).angle()
     }
 }
 
-#[cfg(all(feature = "dim2", feature = "simd-is-enabled"))]
+#[cfg(feature = "dim2")]
 impl RotationOps<SimdReal> for na::UnitComplex<SimdReal> {
     #[inline]
     fn to_mat(self) -> na::Matrix2<SimdReal> {
@@ -188,6 +206,11 @@ impl RotationOps<SimdReal> for na::UnitComplex<SimdReal> {
     #[inline]
     fn imag(&self) -> SimdReal {
         self.im
+    }
+
+    #[inline]
+    fn real(&self) -> SimdReal {
+        self.re
     }
 
     #[inline]

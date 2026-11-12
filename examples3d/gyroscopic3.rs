@@ -1,13 +1,10 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
 // Simulate the the Dzhanibekov effect:
 // https://en.wikipedia.org/wiki/Tennis_racket_theorem
-pub fn init_world(testbed: &mut Testbed) {
-    let mut colliders = ColliderSet::new();
-    let mut bodies = RigidBodySet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    let mut world = PhysicsWorld::new();
 
     let shapes = vec![
         (Pose::IDENTITY, SharedShape::cuboid(2.0, 0.2, 0.2)),
@@ -21,10 +18,16 @@ pub fn init_world(testbed: &mut Testbed) {
         .gravity_scale(0.0)
         .angvel(Vector::new(0.0, 20.0, 0.1))
         .gyroscopic_forces_enabled(true);
-    let body_handle = bodies.insert(body);
     let collider = ColliderBuilder::compound(shapes);
-    colliders.insert_with_parent(collider, body_handle, &mut bodies);
+    let (_body_handle, _) = world.insert(body, collider);
 
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(8.0, 0.0, 8.0), Vec3::new(0.0, 0.0, 0.0));
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(8.0, 0.0, 8.0), Vec3::new(0.0, 0.0, 0.0));
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

@@ -1,0 +1,9 @@
+{
+    "extends": "./tsconfig.common.json",
+    "compilerOptions": {
+        "rootDir": "./gen3d",
+        "outDir": "./pkg/dist",
+        "declarationDir": "./pkg/dist"
+    },
+    "files": ["./gen3d/rapier.ts"]
+}

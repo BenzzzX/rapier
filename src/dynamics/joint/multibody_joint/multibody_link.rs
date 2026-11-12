@@ -1,6 +1,8 @@
 use crate::alloc_prelude::*;
 use core::ops::{Deref, DerefMut};
 
+#[cfg(doc)]
+use crate::dynamics::Multibody;
 use crate::dynamics::{MultibodyJoint, RigidBodyHandle};
 use crate::math::{Pose, Real, Vector};
 use crate::prelude::RigidBodyVelocity;
@@ -80,6 +82,18 @@ impl MultibodyLink {
         self.internal_id
     }
 
+    /// The offset of this link's degrees of freedom in the multibody's
+    /// generalized coordinate / velocity vectors.
+    ///
+    /// The link's `ndofs` generalized velocities occupy
+    /// `assembly_id..assembly_id + ndofs` in [`Multibody::generalized_velocity`]
+    /// (and the matching slice of any displacement passed to
+    /// [`Multibody::apply_displacements`]).
+    #[inline]
+    pub fn assembly_id(&self) -> usize {
+        self.assembly_id
+    }
+
     /// The handle of the parent link.
     #[inline]
     pub fn parent_id(&self) -> Option<usize> {
@@ -119,11 +133,11 @@ impl MultibodyLinkVec {
         );
         assert!(parent_id < self.len(), "Invalid parent index.");
 
-        unsafe {
-            let rb = &mut *(self.get_unchecked_mut(i) as *mut _);
-            let parent_rb = &*(self.get_unchecked(parent_id) as *const _);
-            (rb, parent_rb)
-        }
+        let [rb, parent_rb] = self
+            .0
+            .get_disjoint_mut([i, parent_id])
+            .expect("indices are in bounds and distinct");
+        (rb, &*parent_rb)
     }
 }
 

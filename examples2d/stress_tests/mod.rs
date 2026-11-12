@@ -1,37 +1,23 @@
-use rapier_testbed2d::Example;
-
-mod balls2;
-mod boxes2;
-mod capsules2;
-mod convex_polygons2;
-mod heightfield2;
-mod joint_ball2;
-mod joint_fixed2;
-mod joint_prismatic2;
-mod pyramid2;
-mod vertical_stacks2;
-
-pub fn builders() -> Vec<Example> {
-    const STRESS: &str = "Stress Tests";
-
-    vec![
-        Example::new(STRESS, "Balls", balls2::init_world),
-        Example::new(STRESS, "Boxes", boxes2::init_world),
-        Example::new(STRESS, "Capsules", capsules2::init_world),
-        Example::new(STRESS, "Convex polygons", convex_polygons2::init_world),
-        Example::new(STRESS, "Heightfield", heightfield2::init_world),
-        Example::new(STRESS, "Pyramid", pyramid2::init_world),
-        Example::new(STRESS, "Verticals stacks", vertical_stacks2::init_world),
-        Example::new(STRESS, "(Stress test) joint ball", joint_ball2::init_world),
-        Example::new(
-            STRESS,
-            "(Stress test) joint fixed",
-            joint_fixed2::init_world,
-        ),
-        Example::new(
-            STRESS,
-            "(Stress test) joint prismatic",
-            joint_prismatic2::init_world,
-        ),
-    ]
-}
+// Stress-test scenes. The registry (group/name) lives in the main file; this
+// module just exposes each scene's `run` entry point.
+pub mod balls2;
+pub mod boxes2;
+pub mod capsules2;
+pub mod convex_polygons2;
+pub mod heightfield2;
+pub mod joint_ball2;
+pub mod joint_fixed2;
+pub mod joint_prismatic2;
+pub mod large_pyramids2;
+pub mod many_pyramids2;
+pub mod pyramid2;
+pub mod ragdolls2;
+pub mod ropes2;
+pub mod soft_blobs2;
+pub mod soft_cloth_keva2;
+pub mod soft_fem_beams2;
+pub mod soft_jellies2;
+pub mod soft_ropes2;
+pub mod soft_slab2;
+pub mod soft_strips2;
+pub mod vertical_stacks2;

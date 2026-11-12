@@ -1,14 +1,11 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -49,15 +46,21 @@ pub fn init_world(testbed: &mut Testbed) {
 
             // Build the rigid body.
             let rigid_body = RigidBodyBuilder::new(status).translation(Vec2::new(x, y));
-            let handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::ball(rad);
-            colliders.insert_with_parent(collider, handle, &mut bodies);
+            let _ = world.insert(rigid_body, collider);
         }
     }
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::new(0.0, 2.5), 5.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::new(0.0, 2.5), 5.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

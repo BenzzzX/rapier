@@ -1,15 +1,12 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::na::ComplexField;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -28,9 +25,8 @@ pub fn init_world(testbed: &mut Testbed) {
     points.push(Vector::new(ground_size / 2.0, 40.0));
 
     let rigid_body = RigidBodyBuilder::fixed();
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::polyline(points, None);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let _ = world.insert(rigid_body, collider);
 
     /*
      * Create the cubes
@@ -49,14 +45,13 @@ pub fn init_world(testbed: &mut Testbed) {
 
             // Build the rigid body.
             let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y));
-            let handle = bodies.insert(rigid_body);
 
             if j % 2 == 0 {
                 let collider = ColliderBuilder::cuboid(rad, rad);
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                let _ = world.insert(rigid_body, collider);
             } else {
                 let collider = ColliderBuilder::ball(rad);
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                let _ = world.insert(rigid_body, collider);
             }
         }
     }
@@ -64,6 +59,13 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::ZERO, 10.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::ZERO, 10.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

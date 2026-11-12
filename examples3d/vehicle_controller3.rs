@@ -1,15 +1,12 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::{Key, TestbedViewer};
 use rapier3d::control::{DynamicRayCastVehicleController, WheelTuning};
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -18,9 +15,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let ground_height = 0.1;
 
     let rigid_body = RigidBodyBuilder::fixed().translation(Vector::new(0.0, -ground_height, 0.0));
-    let floor_handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(ground_size, ground_height, ground_size);
-    colliders.insert_with_parent(collider, floor_handle, &mut bodies);
+    world.insert(rigid_body, collider);
 
     /*
      * Vehicle we will control manually.
@@ -28,9 +24,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let hw = 0.3;
     let hh = 0.15;
     let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 1.0, 0.0));
-    let vehicle_handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(hw * 2.0, hh, hw).density(100.0);
-    colliders.insert_with_parent(collider, vehicle_handle, &mut bodies);
+    let (vehicle_handle, _) = world.insert(rigid_body, collider);
 
     let tuning = WheelTuning {
         suspension_stiffness: 100.0,
@@ -67,9 +62,8 @@ pub fn init_world(testbed: &mut Testbed) {
                 let z = k as f32 * shift + centerx;
 
                 let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y, z));
-                let handle = bodies.insert(rigid_body);
                 let collider = ColliderBuilder::cuboid(rad, rad, rad);
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                world.insert(rigid_body, collider);
             }
         }
     }
@@ -86,7 +80,7 @@ pub fn init_world(testbed: &mut Testbed) {
             0.0,
         ))
         .rotation(Vector::Z * slope_angle);
-    colliders.insert(collider);
+    world.insert_collider(collider, None);
 
     /*
      * Create a slope we can’t climb.
@@ -100,7 +94,7 @@ pub fn init_world(testbed: &mut Testbed) {
             0.0,
         ))
         .rotation(Vector::Z * impossible_slope_angle);
-    colliders.insert(collider);
+    world.insert_collider(collider, None);
 
     /*
      * More complex ground.
@@ -115,12 +109,52 @@ pub fn init_world(testbed: &mut Testbed) {
 
     let collider =
         ColliderBuilder::heightfield(heights, ground_size).translation(Vector::new(-7.0, 0.0, 0.0));
-    colliders.insert(collider);
+    world.insert_collider(collider, None);
 
     /*
-     * Set up the testbed.
+     * Set up the viewer.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.set_vehicle_controller(vehicle);
-    testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            /*
+             * Vehicle controls.
+             */
+            let keys = viewer.keys();
+            let mut engine_force = 0.0;
+            let mut steering_angle = 0.0;
+
+            if keys.pressed(Key::Right) {
+                steering_angle += -0.7;
+            }
+            if keys.pressed(Key::Left) {
+                steering_angle += 0.7;
+            }
+            if keys.pressed(Key::Up) {
+                engine_force += 30.0;
+            }
+            if keys.pressed(Key::Down) {
+                engine_force += -30.0;
+            }
+
+            let wheels = vehicle.wheels_mut();
+            wheels[0].engine_force = engine_force;
+            wheels[0].steering = steering_angle;
+            wheels[1].engine_force = engine_force;
+            wheels[1].steering = steering_angle;
+
+            let q = world.broad_phase.as_query_pipeline_mut(
+                world.narrow_phase.query_dispatcher(),
+                &mut world.bodies,
+                &mut world.colliders,
+                QueryFilter::exclude_dynamic().exclude_rigid_body(vehicle_handle),
+            );
+            vehicle.update_vehicle(world.integration_parameters.dt, q);
+
+            world.step();
+        }
+    }
+    Ok(())
 }

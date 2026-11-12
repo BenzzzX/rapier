@@ -255,11 +255,14 @@ impl PhysicsHooks for FxContactHooks {
         if suppress {
             Some(SolverFlags::empty())
         } else {
-            Some(SolverFlags::COMPUTE_IMPULSES)
+            Some(SolverFlags::COMPUTE_RIGID_IMPULSES)
         }
     }
 
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        if context.rigid().is_none() {
+            return;
+        }
         let registry = self
             .registry
             .read()
@@ -277,7 +280,7 @@ impl PhysicsHooks for FxContactHooks {
             .get(&material)
             .copied()
             .unwrap_or_default();
-        let before = context.solver_contacts.len();
+        let before = context.rigid().unwrap().solver_contacts.len();
         let pair_contains_small_debris = mappings
             .iter()
             .copied()
@@ -296,16 +299,13 @@ impl PhysicsHooks for FxContactHooks {
             .iter()
             .filter_map(|impact| impact.map(|impact| impact.action))
             .max();
-        for contact in context.solver_contacts.iter_mut() {
-            contact.friction = properties.friction;
-            contact.restitution = properties.restitution;
-        }
+        let rigid = context.rigid_mut().unwrap();
+        *rigid.friction = properties.friction;
+        *rigid.restitution = properties.restitution;
         if strongest_action == Some(QuickImpactAction::Soften) {
             let settings = registry.quick_impact_settings;
-            for contact in context.solver_contacts.iter_mut() {
-                contact.friction *= settings.softened_friction_scale;
-                contact.restitution *= settings.softened_restitution_scale;
-            }
+            *rigid.friction *= settings.softened_friction_scale;
+            *rigid.restitution *= settings.softened_restitution_scale;
         } else if strongest_action == Some(QuickImpactAction::Suppress) {
             register_suppress_tunnel_windows(
                 context,
@@ -315,13 +315,14 @@ impl PhysicsHooks for FxContactHooks {
                 &self.current_tick,
                 &self.suppress_tunnel_windows,
             );
-            context.solver_contacts.clear();
+            context.rigid_mut().unwrap().solver_contacts.clear();
         }
-        let after = context.solver_contacts.len();
+        let after = context.rigid().unwrap().solver_contacts.len();
         let solver_contact_ids = context
+            .rigid().unwrap()
             .solver_contacts
             .iter()
-            .map(|contact| contact.contact_id[0])
+            .map(|contact| contact.contact_indices()[0])
             .collect::<Vec<_>>();
         let pair_key = contact_pair_key(context.collider1, context.collider2);
         let mut cache = self
@@ -519,7 +520,8 @@ fn quick_impact_for_mapping(
         ContactPairSide::Collider2 => (body2, body1),
     };
     let destructible_body = destructible_body?;
-    let normal = *context.normal;
+    let rigid = context.rigid()?;
+    let normal = *rigid.normal;
     let normal_sign = match mapping.side {
         ContactPairSide::Collider1 => 1.0,
         ContactPairSide::Collider2 => -1.0,
@@ -550,12 +552,13 @@ fn quick_impact_for_mapping(
     }
 
     let mut best = None;
-    for contact in context.solver_contacts.iter() {
+    for contact in rigid.solver_contacts.iter() {
+        let point = (contact.anchor1 + contact.anchor2) * 0.5;
         let vel1 = body1
-            .map(|body| body.velocity_at_point(contact.point))
+            .map(|body| body.velocity_at_point(point))
             .unwrap_or_default();
         let vel2 = body2
-            .map(|body| body.velocity_at_point(contact.point))
+            .map(|body| body.velocity_at_point(point))
             .unwrap_or_default();
         let relative_normal_speed = (-(vel2 - vel1).dot(normal)).max(0.0);
         let penetration_speed = (-contact.dist).max(0.0) * settings.penetration_impulse_scale;
@@ -570,7 +573,7 @@ fn quick_impact_for_mapping(
         };
         let estimate = QuickImpactEstimate {
             action,
-            point: contact.point,
+            point,
             normal,
             impulse: normal * (raw_impulse * normal_sign),
             relative_normal_speed,
@@ -582,7 +585,7 @@ fn quick_impact_for_mapping(
                 soften_threshold
             },
             hardness,
-            contact_id: contact.contact_id[0],
+            contact_id: contact.contact_indices()[0],
             dynamic_opponent,
         };
         if best.is_none_or(|best: QuickImpactEstimate| {
@@ -648,8 +651,9 @@ fn contact_context_subshapes(
     side: ContactPairSide,
     context: &ContactModificationContext,
 ) -> (u32, u32) {
+    let manifold = context.rigid().expect("fracture mapping requires a rigid contact manifold").manifold;
     match side {
-        ContactPairSide::Collider1 => (context.manifold.subshape1, context.manifold.subshape2),
-        ContactPairSide::Collider2 => (context.manifold.subshape2, context.manifold.subshape1),
+        ContactPairSide::Collider1 => (manifold.subshape1, manifold.subshape2),
+        ContactPairSide::Collider2 => (manifold.subshape2, manifold.subshape1),
     }
 }

@@ -1,19 +1,19 @@
 use kiss3d::color::Color;
 use obj::raw::object::Polygon;
 use rapier_testbed3d::KeyCode;
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::parry::bounding_volume;
 use rapier3d::parry::transformation::voxelization::FillMode;
 use rapier3d::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * Voxel geometry type selection.
      */
 
-    let settings = testbed.example_settings_mut();
+    let settings = viewer.example_settings_mut();
 
     let falling_objects = settings.get_or_set_string(
         "Falling objects",
@@ -39,10 +39,7 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Create a bowl for the ground
@@ -115,11 +112,13 @@ pub fn init_world(testbed: &mut Testbed) {
                     let z = k as f32 * shift - 3.0;
 
                     let body = RigidBodyBuilder::fixed().translation(Vector::new(x, y, z));
-                    let handle = bodies.insert(body);
+                    let mut shapes_iter = shapes.iter();
+                    let first_shape = shapes_iter.next().unwrap();
+                    let (handle, _) = world.insert(body, ColliderBuilder::new(first_shape.clone()));
 
-                    for shape in &shapes {
+                    for shape in shapes_iter {
                         let collider = ColliderBuilder::new(shape.clone());
-                        colliders.insert_with_parent(collider, handle, &mut bodies);
+                        world.insert_collider(collider, Some(handle));
                     }
                 }
             }
@@ -153,7 +152,7 @@ pub fn init_world(testbed: &mut Testbed) {
     }
     let collider = ColliderBuilder::voxels_from_points(voxel_size, &samples).build();
     let floor_aabb = collider.compute_aabb();
-    colliders.insert(collider);
+    world.insert_collider(collider, None);
 
     /*
      * Some dynamic primitives.
@@ -173,8 +172,6 @@ pub fn init_world(testbed: &mut Testbed) {
                 if test_ccd {
                     rb = rb.linvel(Vector::new(0.0, -1000.0, 0.0)).ccd_enabled(true);
                 }
-                let rb_handle = bodies.insert(rb);
-
                 let falling_objects = if falling_objects == 5 {
                     j % 5
                 } else {
@@ -189,7 +186,7 @@ pub fn init_world(testbed: &mut Testbed) {
                     4 => ColliderBuilder::capsule_y(ball_radius, ball_radius),
                     _ => unreachable!(),
                 };
-                colliders.insert_with_parent(co, rb_handle, &mut bodies);
+                world.insert(rb, co);
             }
         }
     }
@@ -198,113 +195,124 @@ pub fn init_world(testbed: &mut Testbed) {
     // pointed at by the mouse. We spawn two fake colliders that don’t interact
     // with anything. They are used as gizmos to indicate where the ray hits on voxels
     // by highlighting the voxel and drawing a small ball at the intersection.
-    let hit_indicator_handle =
-        colliders.insert(ColliderBuilder::ball(0.1).collision_groups(InteractionGroups::none()));
-    let hit_highlight_handle = colliders.insert(
-        ColliderBuilder::cuboid(0.51, 0.51, 0.51).collision_groups(InteractionGroups::none()),
+    let hit_indicator_handle = world.insert_collider(
+        ColliderBuilder::ball(0.1).collision_groups(InteractionGroups::none()),
+        None,
     );
-    testbed.set_initial_collider_color(hit_indicator_handle, Color::new(0.5, 0.5, 0.1, 1.0));
-    testbed.set_initial_collider_color(hit_highlight_handle, Color::new(0.1, 0.5, 0.1, 1.0));
-
-    testbed.add_callback(move |graphics, physics, _, _| {
-        let Some(graphics) = graphics else { return };
-        let Some((mouse_orig, mouse_dir)) = graphics.mouse().ray else {
-            return;
-        };
-
-        let ray = Ray::new(
-            Vector::new(mouse_orig.x, mouse_orig.y, mouse_orig.z),
-            Vector::new(mouse_dir.x, mouse_dir.y, mouse_dir.z),
-        );
-        let filter = QueryFilter {
-            predicate: Some(&|_, co: &Collider| co.shape().as_voxels().is_some()),
-            ..Default::default()
-        };
-        let query_pipeline = physics.broad_phase.as_query_pipeline(
-            physics.narrow_phase.query_dispatcher(),
-            &physics.bodies,
-            &physics.colliders,
-            filter,
-        );
-
-        if let Some((handle, hit)) = query_pipeline.cast_ray_and_get_normal(&ray, Real::MAX, true) {
-            // Highlight the voxel.
-            let hit_collider = &physics.colliders[handle];
-            let hit_pos = hit_collider.position();
-            let hit_local_normal = hit_pos.rotation.inverse() * hit.normal;
-            let voxels = hit_collider.shape().as_voxels().unwrap();
-            let FeatureId::Face(id) = hit.feature else {
-                unreachable!()
-            };
-            let voxel_key = voxels.voxel_at_flat_id(id).unwrap();
-            let voxel_center_local = voxels.voxel_center(voxel_key);
-            let voxel_center = hit_pos.rotation * voxel_center_local + hit_pos.translation;
-            let voxel_size = voxels.voxel_size();
-            let hit_highlight = physics.colliders.get_mut(hit_highlight_handle).unwrap();
-            hit_highlight.set_translation(voxel_center);
-            hit_highlight
-                .shape_mut()
-                .as_cuboid_mut()
-                .unwrap()
-                .half_extents = voxel_size / 2.0 + Vector::splat(0.001);
-            graphics.update_collider(hit_highlight_handle, &physics.colliders);
-
-            // Show the hit point.
-            let hit_pt = ray.point_at(hit.time_of_impact);
-            let hit_indicator = physics.colliders.get_mut(hit_indicator_handle).unwrap();
-            hit_indicator.set_translation(hit_pt);
-            hit_indicator.shape_mut().as_ball_mut().unwrap().radius = voxel_size.length() / 3.5;
-            graphics.update_collider(hit_indicator_handle, &physics.colliders);
-
-            // If a relevant key was pressed, edit the shape.
-            if graphics.keys().pressed(KeyCode::Space) {
-                let removal_mode = graphics.keys().pressed(KeyCode::LShift);
-                let voxels = physics
-                    .colliders
-                    .get_mut(handle)
-                    .unwrap()
-                    .shape_mut()
-                    .as_voxels_mut()
-                    .unwrap();
-                let mut affected_key = voxel_key;
-
-                if !removal_mode {
-                    // Find index of max absolute value component
-                    let abs_normal = hit_local_normal.abs();
-                    let imax = if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
-                        0
-                    } else if abs_normal.y >= abs_normal.z {
-                        1
-                    } else {
-                        2
-                    };
-                    let normal_arr = [hit_local_normal.x, hit_local_normal.y, hit_local_normal.z];
-                    if normal_arr[imax] >= 0.0 {
-                        affected_key[imax] += 1;
-                    } else {
-                        affected_key[imax] -= 1;
-                    }
-                }
-
-                voxels.set_voxel(affected_key, !removal_mode);
-                graphics.update_collider(handle, &physics.colliders);
-            }
-        } else {
-            // When there is no hit, move the indicators behind the camera.
-            let behind_camera = mouse_orig - mouse_dir * 1000.0;
-            let behind_camera_vect = Vector::new(behind_camera.x, behind_camera.y, behind_camera.z);
-            let hit_indicator = physics.colliders.get_mut(hit_indicator_handle).unwrap();
-            hit_indicator.set_translation(behind_camera_vect);
-            let hit_highlight = physics.colliders.get_mut(hit_highlight_handle).unwrap();
-            hit_highlight.set_translation(behind_camera_vect);
-        }
-    });
+    let hit_highlight_handle = world.insert_collider(
+        ColliderBuilder::cuboid(0.51, 0.51, 0.51).collision_groups(InteractionGroups::none()),
+        None,
+    );
+    viewer.set_initial_collider_color(hit_indicator_handle, Color::new(0.5, 0.5, 0.1, 1.0));
+    viewer.set_initial_collider_color(hit_highlight_handle, Color::new(0.1, 0.5, 0.1, 1.0));
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+
+            let Some((mouse_orig, mouse_dir)) = viewer.mouse().ray else {
+                continue;
+            };
+
+            let ray = Ray::new(
+                Vector::new(mouse_orig.x, mouse_orig.y, mouse_orig.z),
+                Vector::new(mouse_dir.x, mouse_dir.y, mouse_dir.z),
+            );
+            let filter = QueryFilter {
+                predicate: Some(&|_, co: &Collider| co.shape().as_voxels().is_some()),
+                ..Default::default()
+            };
+            let query_pipeline = world.broad_phase.as_query_pipeline(
+                world.narrow_phase.query_dispatcher(),
+                &world.bodies,
+                &world.colliders,
+                filter,
+            );
+
+            if let Some((handle, hit)) =
+                query_pipeline.cast_ray_and_get_normal(&ray, Real::MAX, true)
+            {
+                // Highlight the voxel.
+                let hit_collider = &world.colliders[handle];
+                let hit_pos = hit_collider.position();
+                let hit_local_normal = hit_pos.rotation.inverse() * hit.normal;
+                let voxels = hit_collider.shape().as_voxels().unwrap();
+                let FeatureId::Face(id) = hit.feature else {
+                    unreachable!()
+                };
+                let voxel_key = voxels.voxel_at_flat_id(id).unwrap();
+                let voxel_center_local = voxels.voxel_center(voxel_key);
+                let voxel_center = hit_pos.rotation * voxel_center_local + hit_pos.translation;
+                let voxel_size = voxels.voxel_size();
+                let hit_highlight = world.colliders.get_mut(hit_highlight_handle).unwrap();
+                hit_highlight.set_translation(voxel_center);
+                hit_highlight
+                    .shape_mut()
+                    .as_cuboid_mut()
+                    .unwrap()
+                    .half_extents = voxel_size / 2.0 + Vector::splat(0.001);
+                viewer.update_collider(hit_highlight_handle, &world);
+
+                // Show the hit point.
+                let hit_pt = ray.point_at(hit.time_of_impact);
+                let hit_indicator = world.colliders.get_mut(hit_indicator_handle).unwrap();
+                hit_indicator.set_translation(hit_pt);
+                hit_indicator.shape_mut().as_ball_mut().unwrap().radius = voxel_size.length() / 3.5;
+                viewer.update_collider(hit_indicator_handle, &world);
+
+                // If a relevant key was pressed, edit the shape.
+                if viewer.keys().pressed(KeyCode::Space) {
+                    let removal_mode = viewer.keys().pressed(KeyCode::LShift);
+                    let voxels = world
+                        .colliders
+                        .get_mut(handle)
+                        .unwrap()
+                        .shape_mut()
+                        .as_voxels_mut()
+                        .unwrap();
+                    let mut affected_key = voxel_key;
+
+                    if !removal_mode {
+                        // Find index of max absolute value component
+                        let abs_normal = hit_local_normal.abs();
+                        let imax = if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
+                            0
+                        } else if abs_normal.y >= abs_normal.z {
+                            1
+                        } else {
+                            2
+                        };
+                        let normal_arr =
+                            [hit_local_normal.x, hit_local_normal.y, hit_local_normal.z];
+                        if normal_arr[imax] >= 0.0 {
+                            affected_key[imax] += 1;
+                        } else {
+                            affected_key[imax] -= 1;
+                        }
+                    }
+
+                    voxels.set_voxel(affected_key, !removal_mode);
+                    viewer.update_collider(handle, &world);
+                }
+            } else {
+                // When there is no hit, move the indicators behind the camera.
+                let behind_camera = mouse_orig - mouse_dir * 1000.0;
+                let behind_camera_vect =
+                    Vector::new(behind_camera.x, behind_camera.y, behind_camera.z);
+                let hit_indicator = world.colliders.get_mut(hit_indicator_handle).unwrap();
+                hit_indicator.set_translation(behind_camera_vect);
+                let hit_highlight = world.colliders.get_mut(hit_highlight_handle).unwrap();
+                hit_highlight.set_translation(behind_camera_vect);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn models() -> Vec<String> {

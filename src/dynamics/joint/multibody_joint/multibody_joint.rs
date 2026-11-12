@@ -29,6 +29,13 @@ pub struct MultibodyJoint {
     pub kinematic: bool,
     pub(crate) coords: SpatialVector,
     pub(crate) joint_rot: Rotation,
+    /// Per-DoF spring stiffness (a passive joint spring integrated implicitly
+    /// in the generalized dynamics). Zero on axes with no spring.
+    pub(crate) spring_stiffness: SpatialVector,
+    /// Per-DoF spring rest position, in the joint's generalized coordinate
+    /// (same convention as [`Self::coords`]). Only meaningful where
+    /// `spring_stiffness` is non-zero.
+    pub(crate) spring_ref: SpatialVector,
 }
 
 impl MultibodyJoint {
@@ -39,7 +46,23 @@ impl MultibodyJoint {
             kinematic,
             coords: Default::default(),
             joint_rot: Rotation::IDENTITY,
+            spring_stiffness: Default::default(),
+            spring_ref: Default::default(),
         }
+    }
+
+    /// Sets a passive joint spring on `axis` (an index into the 6-DoF spatial
+    /// layout: `0..DIM` linear, `DIM..SPATIAL_DIM` angular). The spring applies
+    /// a generalized force `-stiffness · (q − rest)` integrated implicitly.
+    pub fn set_spring(&mut self, axis: usize, stiffness: Real, rest: Real) {
+        self.spring_stiffness[axis] = stiffness;
+        self.spring_ref[axis] = rest;
+    }
+
+    /// The passive joint spring on `axis` as `(stiffness, rest)`, as set by
+    /// [`Self::set_spring`]. `(0, 0)` if no spring is set on that axis.
+    pub fn spring(&self, axis: usize) -> (Real, Real) {
+        (self.spring_stiffness[axis], self.spring_ref[axis])
     }
 
     pub(crate) fn free(pos: Pose) -> Self {
@@ -70,13 +93,19 @@ impl MultibodyJoint {
         self.joint_rot = pos.rotation;
     }
 
-    // pub(crate) fn local_joint_rot(&self) -> &Rotation {
-    //     &self.joint_rot
-    // }
+    /// The joint’s angular coordinates converted to a rotation.
+    pub fn joint_rot(&self) -> Rotation {
+        self.joint_rot
+    }
 
     fn num_free_lin_dofs(&self) -> usize {
         let locked_bits = self.data.locked_axes.bits();
         DIM - (locked_bits & ((1 << DIM) - 1)).count_ones() as usize
+    }
+
+    /// Generalized coordinates for this joint.
+    pub fn coords(&self) -> SpatialVector {
+        self.coords
     }
 
     /// The number of degrees of freedom allowed by the multibody_joint.
@@ -332,6 +361,24 @@ impl MultibodyJoint {
                         self.data.softness,
                     );
                 }
+                // Dry joint friction (MuJoCo `frictionloss`), keyed per-DoF on
+                // the multibody rather than per-axis on the joint. Zero (the
+                // default) emits nothing.
+                let friction = multibody.frictions()[link.assembly_id + curr_free_dof];
+                if friction > 0.0 {
+                    joint::unit_joint_friction_constraint(
+                        params,
+                        multibody,
+                        link,
+                        friction,
+                        curr_free_dof,
+                        j_id,
+                        jacobians,
+                        constraints,
+                        &mut num_constraints,
+                        self.data.softness,
+                    );
+                }
                 curr_free_dof += 1;
             }
         }
@@ -385,6 +432,25 @@ impl MultibodyJoint {
                         jacobians,
                         constraints,
                         &mut num_constraints,
+                    );
+                }
+
+                // Dry joint friction (MuJoCo `frictionloss`), keyed per-DoF on
+                // the multibody rather than per-axis on the joint. Zero (the
+                // default) emits nothing.
+                let friction = multibody.frictions()[link.assembly_id + curr_free_dof];
+                if friction > 0.0 {
+                    joint::unit_joint_friction_constraint(
+                        params,
+                        multibody,
+                        link,
+                        friction,
+                        curr_free_dof,
+                        j_id,
+                        jacobians,
+                        constraints,
+                        &mut num_constraints,
+                        self.data.softness,
                     );
                 }
                 curr_free_dof += 1;

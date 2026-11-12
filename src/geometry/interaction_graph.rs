@@ -59,6 +59,18 @@ impl<N: Copy, E> InteractionGraph<N, E> {
         self.graph.remove_edge(id)
     }
 
+    /// Same as [`Self::remove_edge`], invoking `on_remove` with each removed edge
+    /// index right before the removal is applied (see `Graph::remove_edge_with`).
+    pub(crate) fn remove_edge_with(
+        &mut self,
+        index1: ColliderGraphIndex,
+        index2: ColliderGraphIndex,
+        on_remove: &mut dyn FnMut(TemporaryInteractionIndex),
+    ) -> Option<E> {
+        let id = self.graph.find_edge(index1, index2)?;
+        self.graph.remove_edge_with(id, on_remove)
+    }
+
     /// Removes a handle from this graph and returns a handle that must have its graph index changed to `id`.
     ///
     /// When a node is removed, another node of the graph takes it place. This means that the `ColliderGraphIndex`
@@ -68,6 +80,17 @@ impl<N: Copy, E> InteractionGraph<N, E> {
     #[must_use = "The graph index of the collision object returned by this method has been changed to `id`."]
     pub(crate) fn remove_node(&mut self, id: ColliderGraphIndex) -> Option<N> {
         let _ = self.graph.remove_node(id);
+        self.graph.node_weight(id).cloned()
+    }
+
+    /// Same as [`Self::remove_node`], invoking `on_remove` with each removed edge
+    /// index right before its removal is applied (see `Graph::remove_node_with`).
+    pub(crate) fn remove_node_with(
+        &mut self,
+        id: ColliderGraphIndex,
+        on_remove: &mut dyn FnMut(TemporaryInteractionIndex),
+    ) -> Option<N> {
+        let _ = self.graph.remove_node_with(id, on_remove);
         self.graph.node_weight(id).cloned()
     }
 
@@ -95,6 +118,24 @@ impl<N: Copy, E> InteractionGraph<N, E> {
         id2: ColliderGraphIndex,
     ) -> Option<(N, N, &E)> {
         self.graph.find_edge(id1, id2).and_then(|edge| {
+            let endpoints = self.graph.edge_endpoints(edge)?;
+            let h1 = self.graph.node_weight(endpoints.0)?;
+            let h2 = self.graph.node_weight(endpoints.1)?;
+            let weight = self.graph.edge_weight(edge)?;
+            Some((*h1, *h2, weight))
+        })
+    }
+
+    /// All the interactions between the two collision objects identified by their graph index.
+    ///
+    /// Unlike [`Self::interaction_pair`], this yields every parallel edge connecting the two
+    /// nodes (e.g. every joint attached to the same pair of bodies) instead of only the first.
+    pub fn interactions_between(
+        &self,
+        id1: ColliderGraphIndex,
+        id2: ColliderGraphIndex,
+    ) -> impl Iterator<Item = (N, N, &E)> {
+        self.graph.edges_between(id1, id2).filter_map(move |edge| {
             let endpoints = self.graph.edge_endpoints(edge)?;
             let h1 = self.graph.node_weight(endpoints.0)?;
             let h2 = self.graph.node_weight(endpoints.1)?;

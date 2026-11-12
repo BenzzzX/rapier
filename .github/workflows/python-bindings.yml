@@ -1,0 +1,76 @@
+name: Python bindings
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The engine package lives under bindings/python/rapier-py-3d (rapier3d, f32); the
+# pure-Python testbed under bindings/python/rapier-testbed; the test suite under
+# bindings/python/tests.
+jobs:
+  lint-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+            ${{ runner.os }}-cargo-
+      - name: Cargo fmt
+        run: cargo fmt --check
+      - name: Cargo clippy (Python bindings)
+        run: |
+          cargo clippy --no-deps \
+            -p rapier-py-3d \
+            -- -D warnings
+
+  test:
+    needs: lint-rust
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-py-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-py-
+            ${{ runner.os }}-cargo-
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest pytest-timeout hypothesis numpy matplotlib
+      # Build + install the rapier3d (f32) engine package into the runner's
+      # environment so the test suite can import it.
+      - name: Build & install engine package
+        shell: bash
+        run: python -m pip install --no-build-isolation ./bindings/python/rapier-py-3d
+      - name: Install testbed (no deps; engine package already present)
+        shell: bash
+        run: python -m pip install --no-deps ./bindings/python/rapier-testbed
+      - name: Smoke (import surface)
+        run: python -m pytest bindings/python/tests/test_smoke.py bindings/python/tests/test_math.py -v
+      - name: Full test suite
+        run: python -m pytest bindings/python/tests/ -q --timeout=120

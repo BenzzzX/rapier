@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -17,9 +14,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let ground_height = 2.1;
 
     let rigid_body = RigidBodyBuilder::fixed().translation(Vector::new(0.0, -ground_height, 0.0));
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(ground_size, ground_height, ground_size);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    world.insert(rigid_body, collider);
 
     /*
      * Create the primitives
@@ -45,7 +41,6 @@ pub fn init_world(testbed: &mut Testbed) {
 
                 // Build the rigid body.
                 let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y, z));
-                let handle = bodies.insert(rigid_body);
 
                 let collider = match j % 5 {
                     // _ => ColliderBuilder::cuboid(rad, rad, rad),
@@ -57,7 +52,7 @@ pub fn init_world(testbed: &mut Testbed) {
                     _ => ColliderBuilder::capsule_y(rad, rad),
                 };
 
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                world.insert(rigid_body, collider);
             }
         }
 
@@ -65,8 +60,19 @@ pub fn init_world(testbed: &mut Testbed) {
     }
 
     /*
-     * Set up the testbed.
+     * Set up the viewer.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+
+    /*
+     * Run the simulation.
+     */
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+
+    Ok(())
 }

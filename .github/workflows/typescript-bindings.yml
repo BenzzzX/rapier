@@ -1,0 +1,232 @@
+name: TypeScript bindings
+
+on:
+    push:
+        branches: [master]
+        # A `js-v<version>` tag cuts a real release (see the `publish` job); the
+        # JS packages carry their own version line, independent of the `v*` tags
+        # of the Rust crates. Path filters are not evaluated for tag pushes, so
+        # the `paths` list below only ever gates the `master` pushes.
+        tags: ["js-v*"]
+        paths:
+            - "bindings/typescript/**"
+            - ".github/workflows/typescript-bindings.yml"
+    pull_request:
+        branches: [master]
+        paths:
+            - "bindings/typescript/**"
+            - ".github/workflows/typescript-bindings.yml"
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+
+# The JS/Wasm bindings live under `bindings/typescript/`, which is a self-contained Cargo
+# workspace (its `[patch.crates-io]` builds `rapier2d`/`rapier3d` from the crates
+# of this repo). Every step therefore runs inside that directory.
+
+# Never cancel a run that can publish: interrupting the `publish` job partway
+# leaves some of the twelve packages released and the rest missing.
+concurrency:
+    group: typescript-bindings-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+    check-fmt:
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                working-directory: bindings/typescript
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "22.x"
+            - run: npm ci
+            - name: Check formatting
+              run: npm run fmt -- --check
+            - name: Check Rust formatting
+              run: cargo fmt -- --check
+    build:
+        strategy:
+            matrix:
+                os: [ubuntu-latest, macos-latest]
+        runs-on: ${{ matrix.os }}
+        defaults:
+            run:
+                working-directory: bindings/typescript
+        env:
+            RUSTFLAGS: -D warnings
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      bindings/typescript/target/
+                  key: ${{ runner.os }}-cargo-js-${{ hashFiles('bindings/typescript/builds/prepare_builds/templates/Cargo.toml.tera') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-js-
+            - run: npm ci;
+            - name: Prepare no-compat builds
+              run: |
+                  ./builds/prepare_builds/prepare_all_projects.sh
+            - name: Build all no-compat projects
+              run: |
+                  ./builds/prepare_builds/build_all_projects.sh
+            # Install dependencies to check simd for builds
+            - name: Install wabt
+              run: |
+                  sudo apt install wabt;
+              if: matrix.os == 'ubuntu-latest'
+            - name: Install wabt
+              run: |
+                  brew install wabt;
+              if: matrix.os == 'macos-latest'
+            # Check simd for rust builds
+            - name: Check 2d simd rust build
+              run: |
+                  if ! wasm-objdump -d builds/rapier2d-simd/pkg/rapier_wasm2d_bg.wasm | grep :\\sfd ; then
+                    >&2 echo "ERROR: 2d simd compat build does not include simd opcode prefix." && exit 1
+                  fi
+            - name: Check 3d simd compat build
+              run: |
+                  if ! wasm-objdump -d builds/rapier3d-simd/pkg/rapier_wasm3d_bg.wasm | grep :\\sfd ; then
+                    >&2 echo "ERROR: 3d simd compat build does not include simd opcode prefix." && exit 1
+                  fi
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: pkg no-compat ${{ matrix.os }}
+                  path: |
+                      bindings/typescript/builds/*/pkg
+                  overwrite: true
+    build-compat:
+        strategy:
+            matrix:
+                os: [ubuntu-latest, macos-latest]
+        runs-on: ${{ matrix.os }}
+        defaults:
+            run:
+                working-directory: bindings/typescript
+        env:
+            RUSTFLAGS: -D warnings
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      bindings/typescript/target/
+                  key: ${{ runner.os }}-cargo-js-${{ hashFiles('bindings/typescript/builds/prepare_builds/templates/Cargo.toml.tera') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-js-
+            - run: npm ci;
+            - name: Prepare compat builds
+              run: |
+                  ./builds/prepare_builds/prepare_all_projects.sh
+            - name: Build rapier-compat
+              run: |
+                  cd rapier-compat;
+                  npm ci;
+                  npm run build;
+                  npm run test;
+            # Install dependencies to check simd for builds
+            - name: Install wabt
+              run: |
+                  sudo apt install wabt;
+              if: matrix.os == 'ubuntu-latest'
+            - name: Install wabt
+              run: |
+                  brew install wabt;
+              if: matrix.os == 'macos-latest'
+            # Check simd for compat builds
+            - name: Check 2d simd compat build
+              run: |
+                  if ! wasm-objdump -d rapier-compat/builds/2d-simd/pkg/dist/rapier_wasm2d_bg.wasm | grep :\\sfd ; then
+                    >&2 echo "ERROR: 2d simd compat build does not include simd opcode prefix." && exit 1;
+                  fi
+            - name: Check 3d simd compat build
+              run: |
+                  if ! wasm-objdump -d rapier-compat/builds/3d-simd/pkg/dist/rapier_wasm3d_bg.wasm | grep :\\sfd ; then
+                    >&2 echo "ERROR: 3d simd compat build does not include simd opcode prefix." && exit 1;
+                  fi
+            # Upload
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: pkg compat ${{ matrix.os }}
+                  path: |
+                      bindings/typescript/rapier-compat/builds/*/pkg
+                  overwrite: true
+    # Publishes with npm Trusted Publishing: instead of a long-lived `NPM_TOKEN`,
+    # npm mints a short-lived credential from the GitHub OIDC token of this very
+    # job. Each `@dimforge/rapier*` package must therefore list this repository
+    # *and* this workflow file (`typescript-bindings.yml`) as its trusted
+    # publisher on npmjs.com; a rename of this file breaks publishing until the
+    # npm-side settings are updated to match.
+    #
+    # Both release kinds have to live in this one job: npm allows a single
+    # trusted publisher per package, so a separate tag-only workflow file could
+    # not authenticate.
+    #   - push to master  -> `0.0.0-<sha>-<date>` under the `canary` dist-tag
+    #   - push a `js-v*` tag -> the version baked into the packages, released
+    #     under `latest` (or `next` for a pre-release)
+    publish:
+        runs-on: ubuntu-latest
+        needs: [build, build-compat]
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/js-v')
+        permissions:
+            contents: read
+            # Lets npm request the OIDC token it exchanges for publish rights.
+            id-token: write
+        defaults:
+            run:
+                working-directory: bindings/typescript
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/download-artifact@v4
+              with:
+                  name: pkg no-compat ubuntu-latest
+                  path: bindings/typescript/builds
+            - uses: actions/download-artifact@v4
+              with:
+                  name: pkg compat ubuntu-latest
+                  path: bindings/typescript/rapier-compat/builds
+            # No `registry-url`: that would write an `.npmrc` expecting a
+            # `NODE_AUTH_TOKEN`, which trusted publishing replaces.
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "22.x"
+            # Node 22 still bundles npm 10; OIDC publishing needs npm >= 11.5.1.
+            - name: Upgrade npm
+              run: npm install -g npm@latest
+            # The tag does not set the version: the packages inherit it from
+            # `builds/prepare_builds/templates/Cargo.toml.tera`. Catch the
+            # mismatch here rather than after half the packages are released
+            # under a version nobody tagged.
+            - name: Check the tag matches the package version
+              if: startsWith(github.ref, 'refs/tags/js-v')
+              run: |
+                  tag_version="${GITHUB_REF_NAME#js-v}"
+                  status=0
+                  for pkg in builds/*/pkg rapier-compat/builds/*/pkg; do
+                      pkg_version=$(node -p "require('./$pkg/package.json').version")
+                      if [ "$pkg_version" != "$tag_version" ]; then
+                          >&2 echo "ERROR: $pkg is version $pkg_version, but tag $GITHUB_REF_NAME asks for $tag_version."
+                          status=1
+                      fi
+                  done
+                  exit $status
+            - name: Publish canary versions
+              if: github.ref == 'refs/heads/master'
+              run: |
+                  ./publish_all_canary.sh
+            - name: Publish release versions
+              if: startsWith(github.ref, 'refs/tags/js-v')
+              run: |
+                  ./publish_all_prod.sh

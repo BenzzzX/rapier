@@ -1,14 +1,11 @@
-use rapier_testbed3d::{KeyCode, Testbed};
+use rapier_testbed3d::{KeyCode, TestbedViewer};
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let mut impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground.
@@ -24,7 +21,7 @@ pub fn init_world(testbed: &mut Testbed) {
     let collider = ColliderBuilder::heightfield(heights, ground_size)
         .translation(Vector::new(-7.0, 0.0, 0.0))
         .friction(1.0);
-    colliders.insert(collider);
+    world.insert_collider(collider, None);
 
     /*
      * Vehicle we will control manually, simulated using joints.
@@ -61,8 +58,7 @@ pub fn init_world(testbed: &mut Testbed) {
     let body_rb = RigidBodyBuilder::dynamic()
         .translation(body_position)
         .build();
-    let body_handle = bodies.insert(body_rb);
-    colliders.insert_with_parent(body_co, body_handle, &mut bodies);
+    let (body_handle, _) = world.insert(body_rb, body_co);
 
     let mut steering_joints = vec![];
     let mut motor_joints = vec![];
@@ -75,7 +71,7 @@ pub fn init_world(testbed: &mut Testbed) {
         let axle_rb = RigidBodyBuilder::dynamic()
             .translation(wheel_center)
             .additional_mass_properties(axle_mass_props);
-        let axle_handle = bodies.insert(axle_rb);
+        let axle_handle = world.insert_body(axle_rb);
 
         // This is a fake cylinder collider that we add only because our testbed can
         // only render colliders. Setting it as sensor makes it show up as wireframe.
@@ -96,9 +92,8 @@ pub fn init_world(testbed: &mut Testbed) {
             ))
             .friction(1.0);
         let wheel_rb = RigidBodyBuilder::dynamic().translation(wheel_center);
-        let wheel_handle = bodies.insert(wheel_rb);
-        colliders.insert_with_parent(wheel_co, wheel_handle, &mut bodies);
-        colliders.insert_with_parent(wheel_fake_co, wheel_handle, &mut bodies);
+        let (wheel_handle, _) = world.insert(wheel_rb, wheel_co);
+        world.insert_collider(wheel_fake_co, Some(wheel_handle));
 
         let suspension_attachment_in_body_space =
             wheel_pos_in_car_space - body_position_in_car_space;
@@ -123,92 +118,17 @@ pub fn init_world(testbed: &mut Testbed) {
         }
 
         let body_axle_joint_handle =
-            impulse_joints.insert(body_handle, axle_handle, suspension_joint, true);
+            world.insert_impulse_joint(body_handle, axle_handle, suspension_joint);
 
         // Joint between the axle and the wheel.
         let wheel_joint = RevoluteJointBuilder::new(Vector::X);
-        let wheel_joint_handle =
-            impulse_joints.insert(axle_handle, wheel_handle, wheel_joint, true);
+        let wheel_joint_handle = world.insert_impulse_joint(axle_handle, wheel_handle, wheel_joint);
 
         if is_front {
             steering_joints.push(body_axle_joint_handle);
             motor_joints.push(wheel_joint_handle);
         }
     }
-
-    /*
-     * Callback to control the wheels motors.
-     */
-    testbed.add_callback(move |gfx, physics, _, _| {
-        let Some(gfx) = gfx else { return };
-
-        let mut thrust = 0.0;
-        let mut steering = 0.0;
-        let mut boost = 1.0;
-
-        for key in gfx.keys().get_pressed() {
-            match *key {
-                KeyCode::Right => {
-                    steering = -1.0;
-                }
-                KeyCode::Left => {
-                    steering = 1.0;
-                }
-                KeyCode::Up => {
-                    thrust = -drive_strength;
-                }
-                KeyCode::Down => {
-                    thrust = drive_strength;
-                }
-                KeyCode::RShift => {
-                    boost = 1.5;
-                }
-                _ => {}
-            }
-        }
-        let mut should_wake_up = false;
-        if thrust != 0.0 || steering != 0.0 {
-            should_wake_up = true;
-        }
-
-        // Apply steering to the axles.
-        for steering_handle in &steering_joints {
-            let steering_joint = physics
-                .impulse_joints
-                .get_mut(*steering_handle, should_wake_up)
-                .unwrap();
-            steering_joint.data.set_motor_position(
-                JointAxis::AngY,
-                max_steering_angle * steering,
-                1.0e4,
-                1.0e3,
-            );
-        }
-
-        // Apply thrust.
-        // Pseudo-differential adjusting speed of engines depending on steering arc
-        // Higher values result in more drifty behavior.
-        let differential_strength = 0.5;
-        let sideways_shift = (max_steering_angle * steering).sin() * differential_strength;
-        let speed_diff = if sideways_shift > 0.0 {
-            f32::hypot(1.0, sideways_shift)
-        } else {
-            1.0 / f32::hypot(1.0, sideways_shift)
-        };
-
-        let ms = [1.0 / speed_diff, speed_diff];
-        for (motor_handle, &ms) in motor_joints.iter().copied().zip(ms.iter()) {
-            let motor_joint = physics
-                .impulse_joints
-                .get_mut(motor_handle, should_wake_up)
-                .unwrap();
-            motor_joint.data.set_motor_velocity(
-                JointAxis::AngX,
-                -30.0 * thrust * ms * boost,
-                1.0e2,
-            );
-        }
-    });
 
     /*
      * Create some cubes on the ground.
@@ -238,6 +158,83 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+
+            /*
+             * Control the wheels motors.
+             */
+            let mut thrust = 0.0;
+            let mut steering = 0.0;
+            let mut boost = 1.0;
+
+            for key in viewer.keys().get_pressed() {
+                match *key {
+                    KeyCode::Right => {
+                        steering = -1.0;
+                    }
+                    KeyCode::Left => {
+                        steering = 1.0;
+                    }
+                    KeyCode::Up => {
+                        thrust = -drive_strength;
+                    }
+                    KeyCode::Down => {
+                        thrust = drive_strength;
+                    }
+                    KeyCode::RShift => {
+                        boost = 1.5;
+                    }
+                    _ => {}
+                }
+            }
+            let mut should_wake_up = false;
+            if thrust != 0.0 || steering != 0.0 {
+                should_wake_up = true;
+            }
+
+            // Apply steering to the axles.
+            for steering_handle in &steering_joints {
+                let steering_joint = world
+                    .impulse_joints
+                    .get_mut(*steering_handle, should_wake_up)
+                    .unwrap();
+                steering_joint.data.set_motor_position(
+                    JointAxis::AngY,
+                    max_steering_angle * steering,
+                    1.0e4,
+                    1.0e3,
+                );
+            }
+
+            // Apply thrust.
+            // Pseudo-differential adjusting speed of engines depending on steering arc
+            // Higher values result in more drifty behavior.
+            let differential_strength = 0.5;
+            let sideways_shift = (max_steering_angle * steering).sin() * differential_strength;
+            let speed_diff = if sideways_shift > 0.0 {
+                f32::hypot(1.0, sideways_shift)
+            } else {
+                1.0 / f32::hypot(1.0, sideways_shift)
+            };
+
+            let ms = [1.0 / speed_diff, speed_diff];
+            for (motor_handle, &ms) in motor_joints.iter().copied().zip(ms.iter()) {
+                let motor_joint = world
+                    .impulse_joints
+                    .get_mut(motor_handle, should_wake_up)
+                    .unwrap();
+                motor_joint.data.set_motor_velocity(
+                    JointAxis::AngX,
+                    -30.0 * thrust * ms * boost,
+                    1.0e2,
+                );
+            }
+        }
+    }
+    Ok(())
 }

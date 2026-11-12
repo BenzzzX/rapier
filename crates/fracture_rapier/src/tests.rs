@@ -1140,13 +1140,13 @@ fn contact_hook_material() {
     let has_modified_solver_contact = world
         .narrow_phase()
         .contact_pairs_with(destructible.collider)
-        .flat_map(|pair| &pair.manifolds)
-        .flat_map(|manifold| &manifold.data.solver_contacts)
-        .filter(|contact| {
-            (contact.friction == 0.21 && contact.restitution == 0.17)
-                || (contact.friction == 0.82 && contact.restitution == 0.38)
+        .flat_map(|pair| pair.manifolds())
+        .filter(|manifold| {
+            (manifold.data.friction == 0.21 && manifold.data.restitution == 0.17)
+                || (manifold.data.friction == 0.82 && manifold.data.restitution == 0.38)
         })
-        .count();
+        .map(|manifold| manifold.data.solver_contacts.len())
+        .sum::<usize>();
     assert!(has_modified_solver_contact >= 2);
 }
 
@@ -1420,9 +1420,9 @@ fn quick_impact_skips_destructible_projectile_against_fixed_destructible_target(
                 .actor_handles(FxFamilyId(1), FxActorId(0))
                 .unwrap()
                 .collider,
-            projectile.collider,
+            world.actor_handles(FxFamilyId(2), FxActorId(0)).unwrap().collider,
         ),
-        Some(SolverFlags::COMPUTE_IMPULSES),
+        Some(SolverFlags::COMPUTE_RIGID_IMPULSES),
         "destructible-vs-destructible contacts must stay on the normal solver path"
     );
 }
@@ -2761,9 +2761,9 @@ fn split_remaps_impulse_joint_endpoint_to_child_fragment() {
     assert_eq!(joints.len(), 1);
     let (new_joint, joint) = joints[0];
     assert_eq!(new_joint, replacement.new);
-    assert_eq!(joint.body1, child.body);
-    assert_eq!(joint.body2, anchor);
-    assert_ne!(joint.body1, kept.body);
+    assert_eq!(joint.body1(), child.body);
+    assert_eq!(joint.body2(), anchor);
+    assert_ne!(joint.body1(), kept.body);
     assert_vector_close(joint.data.local_anchor1(), Vector::ZERO);
     assert_vector_close(joint.data.local_anchor2(), Vector::ZERO);
 }
@@ -2812,9 +2812,9 @@ fn voxel_update_split_remaps_impulse_joint_endpoint_to_promoted_family() {
     assert_eq!(joints.len(), 1);
     let (new_joint, joint) = joints[0];
     assert_eq!(new_joint, replacement.new);
-    assert_eq!(joint.body1, child.body);
-    assert_eq!(joint.body2, anchor);
-    assert_ne!(joint.body1, kept.body);
+    assert_eq!(joint.body1(), child.body);
+    assert_eq!(joint.body2(), anchor);
+    assert_ne!(joint.body1(), kept.body);
     assert_vector_close(joint.data.local_anchor1(), Vector::ZERO);
     assert_vector_close(joint.data.local_anchor2(), Vector::ZERO);
 }
@@ -3344,7 +3344,9 @@ fn snapshot_restore_full_integration_parameters() {
     world
         .integration_parameters_mut()
         .num_internal_stabilization_iterations = 3;
-    world.integration_parameters_mut().min_island_size = 8;
+    world.integration_parameters_mut().contact_recycling = false;
+    world.integration_parameters_mut().static_contact_softness.natural_frequency = 63.0;
+    world.integration_parameters_mut().soft_bodies.max_extra_substeps = 7;
     world.integration_parameters_mut().max_ccd_substeps = 5;
     world
         .add_destructible(FxFamilyId(1), single_node_asset(7))
@@ -3527,9 +3529,11 @@ fn snapshot_restore_rejects_invalid_compression_damage_mode() {
         .unwrap();
     let mut bytes = world.snapshot().unwrap();
     const HEADER_LEN: usize = 34;
-    const STRESS_PAYLOAD_OFFSET: usize = 8 + 8 + (9 * 4) + (5 * 4);
+    const INTEGRATION_OFFSET: usize = HEADER_LEN + 8 + 8;
+    let integration_size = u32::from_le_bytes(bytes[INTEGRATION_OFFSET..INTEGRATION_OFFSET + 4].try_into().unwrap()) as usize;
     const COMPRESSION_MODE_STRESS_OFFSET: usize = 4 + 4 + 4;
-    bytes[HEADER_LEN + STRESS_PAYLOAD_OFFSET + COMPRESSION_MODE_STRESS_OFFSET] = 99;
+    let stress_offset = INTEGRATION_OFFSET + 4 + integration_size;
+    bytes[stress_offset + COMPRESSION_MODE_STRESS_OFFSET] = 99;
     rewrite_snapshot_checksum(&mut bytes);
 
     assert!(matches!(

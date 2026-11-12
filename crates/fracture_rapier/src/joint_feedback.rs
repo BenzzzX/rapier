@@ -27,8 +27,8 @@ pub(crate) fn collect_joint_feedback_stress(
     joints.sort_by_key(|(handle, joint)| {
         (
             handle.into_raw_parts(),
-            rigid_body_key(joint.body1),
-            rigid_body_key(joint.body2),
+            rigid_body_key(joint.body1()),
+            rigid_body_key(joint.body2()),
         )
     });
 
@@ -36,8 +36,8 @@ pub(crate) fn collect_joint_feedback_stress(
     let mut command_id = 0u32;
     for (handle, joint) in joints {
         let destructible = body_actors
-            .get(&rigid_body_key(joint.body1))
-            .or_else(|| body_actors.get(&rigid_body_key(joint.body2)))
+            .get(&rigid_body_key(joint.body1()))
+            .or_else(|| body_actors.get(&rigid_body_key(joint.body2())))
             .copied();
         let Some(destructible) = destructible else {
             continue;

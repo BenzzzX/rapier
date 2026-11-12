@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     // Triangle ground.
     let vtx = [
@@ -18,22 +15,27 @@ pub fn init_world(testbed: &mut Testbed) {
     ];
 
     let rigid_body = RigidBodyBuilder::fixed().translation(Vector::new(0.0, 0.0, 0.0));
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::triangle(vtx[0], vtx[1], vtx[2]);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let (_handle, _) = world.insert(rigid_body, collider);
 
     // Dynamic box rigid body.
     let rigid_body = RigidBodyBuilder::dynamic()
         .translation(Vector::new(1.1, 0.01, 0.0))
         // .rotation(Vector3::new(0.8, 0.2, 0.1))
         .can_sleep(false);
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(20.0, 0.1, 1.0);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let (_handle, _) = world.insert(rigid_body, collider);
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

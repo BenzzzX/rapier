@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let mut impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     let radius = 0.5;
     let length = 10.0 * radius;
@@ -19,7 +16,7 @@ pub fn init_world(testbed: &mut Testbed) {
 
     for i in 0..n {
         let (ball_pos, attach) = (
-            Vector::new(i as Real * 2.2 * radius, 0.0, 0.0),
+            Vector::new(i as Real * 2.02 * radius, 0.0, 0.0),
             Vector::Y * length,
         );
         let vel = if i >= n - 1 {
@@ -28,18 +25,26 @@ pub fn init_world(testbed: &mut Testbed) {
             Vector::ZERO
         };
 
-        let ground = bodies.insert(RigidBodyBuilder::fixed().translation(ball_pos + attach));
+        let ground = world
+            .bodies
+            .insert(RigidBodyBuilder::fixed().translation(ball_pos + attach));
         let rb = rb.clone().translation(ball_pos).linvel(vel);
-        let handle = bodies.insert(rb);
-        colliders.insert_with_parent(co.clone(), handle, &mut bodies);
+        let (handle, _) = world.insert(rb, co.clone());
 
         let joint = SphericalJointBuilder::new().local_anchor2(attach);
-        impulse_joints.insert(ground, handle, joint, true);
+        world.insert_impulse_joint(ground, handle, joint);
     }
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

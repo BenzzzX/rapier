@@ -1,11 +1,8 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    let mut world = PhysicsWorld::new();
 
     let rad = 0.5;
 
@@ -15,61 +12,63 @@ pub fn init_world(testbed: &mut Testbed) {
         .into_iter()
         .map(|pos| {
             let rigid_body = RigidBodyBuilder::kinematic_position_based().translation(pos);
-            let handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::cuboid(rad * 10.0, rad);
-            colliders.insert_with_parent(collider, handle, &mut bodies);
+            let (handle, _) = world.insert(rigid_body, collider);
             handle
         })
         .collect::<Vec<_>>();
 
-    // Callback that will be executed on the main loop to handle proximities.
-    testbed.add_callback(move |mut graphics, physics, _, state| {
-        let rot = -state.time;
-        for rb_handle in &platform_handles {
-            let rb = physics.bodies.get_mut(*rb_handle).unwrap();
-            rb.set_next_kinematic_rotation(Rotation::new(rot));
-        }
-
-        if state.timestep_id % 10 == 0 {
-            let x = rand::random::<f32>() * 10.0 - 5.0;
-            let y = rand::random::<f32>() * 10.0 + 10.0;
-            let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y));
-            let handle = physics.bodies.insert(rigid_body);
-            let collider = ColliderBuilder::cuboid(rad, rad);
-            physics
-                .colliders
-                .insert_with_parent(collider, handle, &mut physics.bodies);
-
-            if let Some(graphics) = &mut graphics {
-                graphics.add_body(handle, &physics.bodies, &physics.colliders);
-            }
-        }
-
-        let to_remove: Vec<_> = physics
-            .bodies
-            .iter()
-            .filter(|(_, b)| b.position().translation.y < -10.0)
-            .map(|e| e.0)
-            .collect();
-        for handle in to_remove {
-            physics.bodies.remove(
-                handle,
-                &mut physics.islands,
-                &mut physics.colliders,
-                &mut physics.impulse_joints,
-                &mut physics.multibody_joints,
-                true,
-            );
-
-            if let Some(graphics) = &mut graphics {
-                graphics.remove_body(handle);
-            }
-        }
-    });
-
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::ZERO, 20.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::ZERO, 20.0);
+
+    let mut step_id = 0usize;
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+            step_id += 1;
+
+            let rot = -(step_id as f32 * world.integration_parameters.dt);
+            for rb_handle in &platform_handles {
+                let rb = world.bodies.get_mut(*rb_handle).unwrap();
+                rb.set_next_kinematic_rotation(Rotation::new(rot));
+            }
+
+            if step_id.is_multiple_of(10) {
+                let x = rand::random::<f32>() * 10.0 - 5.0;
+                let y = rand::random::<f32>() * 10.0 + 10.0;
+                let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y));
+                let handle = world.bodies.insert(rigid_body);
+                let collider = ColliderBuilder::cuboid(rad, rad);
+                world
+                    .colliders
+                    .insert_with_parent(collider, handle, &mut world.bodies);
+
+                viewer.add_body(handle, &world);
+            }
+
+            let to_remove: Vec<_> = world
+                .bodies
+                .iter()
+                .filter(|(_, b)| b.position().translation.y < -10.0)
+                .map(|e| e.0)
+                .collect();
+            for handle in to_remove {
+                world.bodies.remove(
+                    handle,
+                    &mut world.islands,
+                    &mut world.colliders,
+                    &mut world.impulse_joints,
+                    &mut world.multibody_joints,
+                    &mut world.soft_bodies,
+                    true,
+                );
+
+                viewer.remove_body(handle);
+            }
+        }
+    }
+    Ok(())
 }

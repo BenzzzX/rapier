@@ -363,6 +363,7 @@ pub struct FxRapierWorld2D {
     pub(crate) colliders: ColliderSet,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
+    soft_bodies: SoftBodySet,
     ccd_solver: CCDSolver,
     hooks: FxContactHooks,
     stress_solver: StressSolver2D,
@@ -427,6 +428,7 @@ impl FxRapierWorld2D {
             colliders: ColliderSet::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
+            soft_bodies: SoftBodySet::new(),
             ccd_solver: CCDSolver::new(),
             hooks: FxContactHooks::new(),
             stress_solver: StressSolver2D::new(StressSettings::default()),
@@ -1102,6 +1104,7 @@ impl FxRapierWorld2D {
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
+            &mut self.soft_bodies,
             &mut self.ccd_solver,
             &self.hooks,
             &(),
@@ -1909,6 +1912,7 @@ impl FxRapierWorld2D {
             &self.colliders,
             &self.impulse_joints,
             &self.multibody_joints,
+            &self.soft_bodies,
             &self.islands,
             &self.broad_phase,
             &self.narrow_phase,
@@ -2023,6 +2027,7 @@ impl FxRapierWorld2D {
         world.colliders = rapier.colliders;
         world.impulse_joints = rapier.impulse_joints;
         world.multibody_joints = rapier.multibody_joints;
+        world.soft_bodies = rapier.soft_bodies;
         world.islands = rapier.islands;
         world.broad_phase = rapier.broad_phase;
         world.narrow_phase = rapier.narrow_phase;
@@ -2802,43 +2807,45 @@ impl FxRapierWorld2D {
             let Some(mut joint) = self.impulse_joints.remove(remap.joint, true) else {
                 continue;
             };
+            let mut body1 = joint.body1();
+            let mut body2 = joint.body2();
             let new_local_anchor = Vector::new(
                 remap.asset_anchor.x - new_state.body_local_origin_in_asset.x,
                 remap.asset_anchor.y - new_state.body_local_origin_in_asset.y,
             );
             match remap.endpoint {
                 JointEndpoint::Body1 => {
-                    if joint.body1 != remap.old_body {
+                    if body1 != remap.old_body {
                         let new =
                             self.impulse_joints
-                                .insert(joint.body1, joint.body2, joint.data, true);
+                                .insert(body1, body2, joint.data, true);
                         replacements.push(ImpulseJointHandleReplacement {
                             old: remap.joint,
                             new,
                         });
                         continue;
                     }
-                    joint.body1 = new_handles.body;
+                    body1 = new_handles.body;
                     joint.data.set_local_anchor1(new_local_anchor);
                 }
                 JointEndpoint::Body2 => {
-                    if joint.body2 != remap.old_body {
+                    if body2 != remap.old_body {
                         let new =
                             self.impulse_joints
-                                .insert(joint.body1, joint.body2, joint.data, true);
+                                .insert(body1, body2, joint.data, true);
                         replacements.push(ImpulseJointHandleReplacement {
                             old: remap.joint,
                             new,
                         });
                         continue;
                     }
-                    joint.body2 = new_handles.body;
+                    body2 = new_handles.body;
                     joint.data.set_local_anchor2(new_local_anchor);
                 }
             }
             let new = self
                 .impulse_joints
-                .insert(joint.body1, joint.body2, joint.data, true);
+                .insert(body1, body2, joint.data, true);
             replacements.push(ImpulseJointHandleReplacement {
                 old: remap.joint,
                 new,
@@ -2969,6 +2976,7 @@ impl FxRapierWorld2D {
             old_handles.collider,
             &mut self.islands,
             &mut self.bodies,
+            &mut self.soft_bodies,
             true,
         );
 
@@ -3084,6 +3092,7 @@ impl FxRapierWorld2D {
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
+            &mut self.soft_bodies,
             true,
         );
         true
@@ -3299,42 +3308,11 @@ fn apply_body_dynamic_state(body: &mut RigidBody, snapshot: BodySnapshot) {
 }
 
 fn integration_to_snapshot(params: &IntegrationParameters) -> crate::snapshot::IntegrationSnapshot {
-    crate::snapshot::IntegrationSnapshot {
-        dt: params.dt,
-        min_ccd_dt: params.min_ccd_dt,
-        contact_softness_natural_frequency: params.contact_softness.natural_frequency,
-        contact_softness_damping_ratio: params.contact_softness.damping_ratio,
-        warmstart_coefficient: params.warmstart_coefficient,
-        length_unit: params.length_unit,
-        normalized_allowed_linear_error: params.normalized_allowed_linear_error,
-        normalized_max_corrective_velocity: params.normalized_max_corrective_velocity,
-        normalized_prediction_distance: params.normalized_prediction_distance,
-        num_solver_iterations: params.num_solver_iterations,
-        num_internal_pgs_iterations: params.num_internal_pgs_iterations,
-        num_internal_stabilization_iterations: params.num_internal_stabilization_iterations,
-        min_island_size: params.min_island_size,
-        max_ccd_substeps: params.max_ccd_substeps,
-    }
+    crate::snapshot::IntegrationSnapshot { params: *params }
 }
 
-fn apply_integration_snapshot(
-    params: &mut IntegrationParameters,
-    snapshot: crate::snapshot::IntegrationSnapshot,
-) {
-    params.dt = snapshot.dt;
-    params.min_ccd_dt = snapshot.min_ccd_dt;
-    params.contact_softness.natural_frequency = snapshot.contact_softness_natural_frequency;
-    params.contact_softness.damping_ratio = snapshot.contact_softness_damping_ratio;
-    params.warmstart_coefficient = snapshot.warmstart_coefficient;
-    params.length_unit = snapshot.length_unit;
-    params.normalized_allowed_linear_error = snapshot.normalized_allowed_linear_error;
-    params.normalized_max_corrective_velocity = snapshot.normalized_max_corrective_velocity;
-    params.normalized_prediction_distance = snapshot.normalized_prediction_distance;
-    params.num_solver_iterations = snapshot.num_solver_iterations;
-    params.num_internal_pgs_iterations = snapshot.num_internal_pgs_iterations;
-    params.num_internal_stabilization_iterations = snapshot.num_internal_stabilization_iterations;
-    params.min_island_size = snapshot.min_island_size;
-    params.max_ccd_substeps = snapshot.max_ccd_substeps;
+fn apply_integration_snapshot(params: &mut IntegrationParameters, snapshot: crate::snapshot::IntegrationSnapshot) {
+    *params = snapshot.params;
 }
 
 fn stress_to_snapshot(settings: StressSettings) -> StressSettingsSnapshot {
@@ -3532,16 +3510,18 @@ fn validate_snapshot_metadata(snapshot: &FxRapierWorldSnapshot) -> Result<(), Fx
 fn validate_integration_snapshot(
     snapshot: crate::snapshot::IntegrationSnapshot,
 ) -> Result<(), FxRapierError> {
+    let p = snapshot.params;
+    let soft = p.soft_bodies;
+    let recovery = soft.recovery;
     let scalars = [
-        snapshot.dt,
-        snapshot.min_ccd_dt,
-        snapshot.contact_softness_natural_frequency,
-        snapshot.contact_softness_damping_ratio,
-        snapshot.warmstart_coefficient,
-        snapshot.length_unit,
-        snapshot.normalized_allowed_linear_error,
-        snapshot.normalized_max_corrective_velocity,
-        snapshot.normalized_prediction_distance,
+        p.dt, p.min_ccd_dt, p.contact_softness.natural_frequency,
+        p.contact_softness.damping_ratio, p.static_contact_softness.natural_frequency,
+        p.static_contact_softness.damping_ratio, p.warmstart_coefficient, p.length_unit,
+        p.normalized_allowed_linear_error, p.normalized_max_corrective_velocity,
+        p.normalized_prediction_distance, p.normalized_max_linear_velocity,
+        p.normalized_contact_recycle_distance, soft.resweep_strain, soft.contact_stiffening,
+        recovery.recovery_pace, recovery.overlap_constraint_pace, recovery.overlap_kept_depth,
+        recovery.overlap_progress_margin,
     ];
     if scalars.into_iter().any(|value| !value.is_finite()) {
         return Err(FxRapierSnapshotError::InvalidValue("integration").into());
@@ -3643,9 +3623,9 @@ fn joint_endpoint_for_body(
     joint: &ImpulseJoint,
     body: RigidBodyHandle,
 ) -> Option<(JointEndpoint, Vector)> {
-    if joint.body1 == body {
+    if joint.body1() == body {
         Some((JointEndpoint::Body1, joint.data.local_anchor1()))
-    } else if joint.body2 == body {
+    } else if joint.body2() == body {
         Some((JointEndpoint::Body2, joint.data.local_anchor2()))
     } else {
         None
@@ -3739,6 +3719,7 @@ fn fx_actor_body_type_from_rapier(body_type: RigidBodyType) -> FxActorBodyType {
         RigidBodyType::KinematicVelocityBased => FxActorBodyType::KinematicVelocityBased,
         RigidBodyType::Fixed => FxActorBodyType::Fixed,
         RigidBodyType::KinematicPositionBased => FxActorBodyType::KinematicPositionBased,
+        RigidBodyType::SoftFrame => unreachable!("fracture actors cannot be soft frames"),
     }
 }
 

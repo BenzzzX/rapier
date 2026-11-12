@@ -91,7 +91,7 @@ pub(crate) fn collect_contact_impulse_inputs(
                 continue;
             }
             let mappings = map_contact_pair_destructibles(pair, registry);
-            for (manifold_index, manifold) in pair.manifolds.iter().enumerate() {
+            for (manifold_index, manifold) in pair.manifolds().iter().enumerate() {
                 for mapping in mappings.iter().copied() {
                     let Some((_, family)) = families
                         .iter()

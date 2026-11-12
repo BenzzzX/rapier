@@ -1,14 +1,11 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Create the boxes
@@ -27,9 +24,8 @@ pub fn init_world(testbed: &mut Testbed) {
 
             // Build the rigid body.
             let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y));
-            let handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::cuboid(rad, rad);
-            colliders.insert_with_parent(collider, handle, &mut bodies);
+            let _ = world.insert(rigid_body, collider);
         }
     }
 
@@ -37,7 +33,7 @@ pub fn init_world(testbed: &mut Testbed) {
      * Setup a velocity-based kinematic rigid body.
      */
     let platform_body = RigidBodyBuilder::kinematic_velocity_based();
-    let velocity_based_platform_handle = bodies.insert(platform_body);
+    let velocity_based_platform_handle = world.insert_body(platform_body);
 
     let sides = [
         (10.0, 0.25, Vector::new(0.0, 10.0)),
@@ -54,26 +50,27 @@ pub fn init_world(testbed: &mut Testbed) {
 
     for (hx, hy, pos) in sides {
         let collider = ColliderBuilder::cuboid(hx, hy).translation(pos);
-        colliders.insert_with_parent(collider, velocity_based_platform_handle, &mut bodies);
+        world.insert_collider(collider, Some(velocity_based_platform_handle));
     }
     for (r, pos) in balls {
         let collider = ColliderBuilder::ball(r).translation(pos);
-        colliders.insert_with_parent(collider, velocity_based_platform_handle, &mut bodies);
+        world.insert_collider(collider, Some(velocity_based_platform_handle));
     }
-
-    /*
-     * Setup a callback to control the platform.
-     */
-    testbed.add_callback(move |_, physics, _, _| {
-        // Update the velocity-based kinematic body by setting its velocity.
-        if let Some(platform) = physics.bodies.get_mut(velocity_based_platform_handle) {
-            platform.set_angvel(-0.15, true);
-        }
-    });
 
     /*
      * Run the simulation.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::new(0.0, 1.0), 40.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::new(0.0, 1.0), 40.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+            // Update the velocity-based kinematic body by setting its velocity.
+            if let Some(platform) = world.bodies.get_mut(velocity_based_platform_handle) {
+                platform.set_angvel(-0.15, true);
+            }
+        }
+    }
+    Ok(())
 }

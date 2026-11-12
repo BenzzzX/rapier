@@ -1,0 +1,33 @@
+[package]
+name = "mjcf-rs"
+version.workspace = true
+authors.workspace = true
+description = "Pure-Rust parser for the MuJoCo MJCF XML format."
+documentation = "https://docs.rs/mjcf-rs"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+categories = [
+    "parser-implementations",
+    "science",
+    "simulation",
+]
+keywords = ["mjcf", "mujoco", "robotics", "parser", "xml"]
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+## Enable parsing MuJoCo's custom binary `.msh` mesh format.
+msh = ["dep:byteorder"]
+
+[dependencies]
+roxmltree.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+log.workspace = true
+byteorder = { version = "1", optional = true }
+glamx = { workspace = true, features = ["std", "f64"] }
+
+[dev-dependencies]
+tempfile.workspace = true

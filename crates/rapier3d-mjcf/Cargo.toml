@@ -1,0 +1,36 @@
+[package]
+name = "rapier3d-mjcf"
+version.workspace = true
+authors.workspace = true
+description = "MuJoCo MJCF loader for the 3D rapier physics engine."
+documentation = "https://docs.rs/rapier3d-mjcf"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+categories.workspace = true
+keywords = ["physics", "joints", "multibody", "robotics", "mjcf"]
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+## Enable loading `.stl` meshes referenced by MJCF `<mesh>` assets.
+stl = ["dep:rapier3d-meshloader", "rapier3d-meshloader/stl", "__meshloader_is_enabled"]
+## Enable loading `.obj` meshes referenced by MJCF `<mesh>` assets.
+wavefront = ["dep:rapier3d-meshloader", "rapier3d-meshloader/wavefront", "__meshloader_is_enabled"]
+## Enable parsing MuJoCo's custom `.msh` mesh format.
+msh = ["mjcf-rs/msh"]
+__meshloader_is_enabled = []
+
+[dependencies]
+log.workspace = true
+anyhow.workspace = true
+bitflags.workspace = true
+
+mjcf-rs.workspace = true
+rapier3d.workspace = true
+rapier3d-meshloader = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

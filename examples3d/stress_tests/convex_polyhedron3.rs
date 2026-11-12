@@ -1,16 +1,13 @@
 use rand::distr::{Distribution, StandardUniform};
 use rand::{SeedableRng, rngs::StdRng};
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground
@@ -19,9 +16,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let ground_height = 0.1;
 
     let rigid_body = RigidBodyBuilder::fixed().translation(Vec3::new(0.0, -ground_height, 0.0));
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(ground_size, ground_height, ground_size);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    let _ = world.insert(rigid_body, collider);
 
     /*
      * Create the cubes
@@ -41,6 +37,17 @@ pub fn init_world(testbed: &mut Testbed) {
     let mut rng = StdRng::seed_from_u64(0);
     let distribution = StandardUniform;
 
+    let poly_shape: Vec<_> = (0..5)
+        .map(|_| {
+            let mut points = Vec::new();
+            for _ in 0..10 {
+                let pt: [f32; 3] = distribution.sample(&mut rng);
+                points.push(Vec3::from(pt) * scale);
+            }
+            SharedShape::round_convex_hull(&points, border_rad).unwrap()
+        })
+        .collect();
+
     for j in 0usize..47 {
         for i in 0..num {
             for k in 0usize..num {
@@ -48,17 +55,10 @@ pub fn init_world(testbed: &mut Testbed) {
                 let y = j as f32 * shift + centery + 3.0;
                 let z = k as f32 * shift - centerz + offset;
 
-                let mut points = Vec::new();
-                for _ in 0..10 {
-                    let pt: [f32; 3] = distribution.sample(&mut rng);
-                    points.push(Vec3::from(pt) * scale);
-                }
-
                 // Build the rigid body.
                 let rigid_body = RigidBodyBuilder::dynamic().translation(Vec3::new(x, y, z));
-                let handle = bodies.insert(rigid_body);
-                let collider = ColliderBuilder::round_convex_hull(&points, border_rad).unwrap();
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                let collider = ColliderBuilder::new(poly_shape[(i + k) % 5].clone());
+                let _ = world.insert(rigid_body, collider);
             }
         }
 
@@ -68,6 +68,13 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

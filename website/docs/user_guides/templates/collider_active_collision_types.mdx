@@ -1,0 +1,100 @@
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+
+By default, collision-detection is completely disabled between two colliders when both are attached to non-dynamic bodies.
+Sometimes, it can be useful to enable collision-detection between, e.g., a collider attached to a kinematic rigid-body
+and a collider attached to a fixed rigid-body. This can be done by modifying the collider's <notc>`ActiveCollisionTypes`</notc><c>active collision types, a bit mask made of the `R3_COLLISION_TYPES_*` flags</c>:
+
+<rapier>
+
+```rust
+<load path='/2d/rust/examples/rs_colliders2.rs' marker='ActiveCollisionTypes1' />
+```
+```rust
+<load path='/2d/rust/examples/rs_colliders2.rs' marker='ActiveCollisionTypes2' />
+```
+
+</rapier>
+<bevy>
+
+```rust
+<load path='/2d/bevy/examples/colliders2.rs' marker='ActiveCollisionTypes1' />
+```
+```rust
+<load path='/2d/bevy/examples/colliders2.rs' marker='ActiveCollisionTypes2' />
+```
+
+</bevy>
+<js>
+
+```js
+<load path='/2d/javascript/src/snippets/colliders.ts' marker='ActiveCollisionTypes1' />
+```
+```js
+<load path='/2d/javascript/src/snippets/colliders.ts' marker='ActiveCollisionTypes2' />
+```
+
+</js>
+<c>
+
+```c
+<load path='/2d/c/examples/colliders2.c' marker='ActiveCollisionTypes1' />
+```
+```c
+<load path='/2d/c/examples/colliders2.c' marker='ActiveCollisionTypes2' />
+```
+
+</c>
+<py>
+
+```python
+<load path='/3d/python/colliders.py' marker='ActiveCollisionTypes1' />
+```
+```python
+<load path='/3d/python/colliders.py' marker='ActiveCollisionTypes2' />
+```
+
+</py>
+
+:::info
+To enable collision-detection between kinematic bodies and fixed bodies (as well as dynamic bodies),
+set its active collision types to:
+
+<rapier>
+
+```rust
+ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_FIXED
+```
+
+</rapier>
+<bevy>
+
+```rust
+ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_STATIC
+```
+
+</bevy>
+
+<js>
+
+```js
+RAPIER.ActiveCollisionTypes.DEFAULT | RAPIER.ActiveCollisionTypes.KINEMATIC_FIXED
+```
+
+</js>
+<c>
+
+```c
+R3_COLLISION_TYPES_DEFAULT | R3_COLLISION_TYPES_KINEMATIC_FIXED
+```
+
+</c>
+<py>
+
+```python
+rp.ActiveCollisionTypes.default_types() | rp.ActiveCollisionTypes.KINEMATIC_FIXED
+```
+
+</py>
+:::

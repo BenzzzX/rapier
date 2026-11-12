@@ -1,0 +1,263 @@
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+
+<rapier>
+
+The character controller implementation is exposed as the `KinematicCharacterController` structure. This structure only
+contains information about the character controller’s behavior. It does not contain any collider-specific or
+rigid-body-specific information like handles, velocities, positions, etc. Therefore, the same instance of `KinematicCharacterController`
+can be used to control multiple rigid-bodies/colliders if they rely on the same set of parameters.
+The `KinematicCharacterController` exposes only two methods:
+- `move_shape` is responsible for calculating the possible movement of a character based on
+  the desired movement, obstacles, and character controller options.
+- `solve_character_collision_impulses` is detailed in the [collisions section](./character_controller.mdx#collisions).
+
+
+<Tabs
+groupId="dim"
+defaultValue="2D"
+values={[
+{label: 'Example 2D', value: '2D'},
+{label: 'Example 3D', value: '3D'},
+]}>
+<TabItem value="2D">
+
+```rust
+<load path='/2d/rust/examples/rs_character_controller2.rs' marker='Setup' />
+```
+
+</TabItem>
+  <TabItem value="3D">
+
+```rust
+<load path='/3d/rust/examples/rs_character_controller3.rs' marker='Setup' />
+```
+
+  </TabItem>
+</Tabs>
+
+The recommended way to update the character’s position depends on its representation:
+- A **collider** not attached to any rigid-body: set the collider’s position directly to the corrected movement added to its current position.
+- A **velocity-based kinematic rigid-body**: set its velocity to the computed movement divided by the timestep length.
+- A **position-based kinematic rigid-body**: set its next kinematic position to the corrected movement added to its current position.
+
+</rapier>
+
+<bevy>
+
+The character controller is used through the `KinematicCharacterController` component. This
+component contains the character controller’s behavior settings, as well as the translation to apply to the character.
+
+The `KinematicCharacterController` component must be added to the same entity as a `Transform` component. If the field
+`KinematicCharacterController::custom_shape` isn’t set, then the entity it is attached to must also contain a `Collider` component.
+That collider can optionally be attached to a rigid-body. At each frame, the `KinematicCharacterController::translation`
+field can be set to the desired translation for that character.
+
+During the next physics update step, that translation will
+be resolved against obstacles, and the resulting movement will be automatically applied to the entity’s transform, or the
+transform of the entity containing the rigid-body the collider to move is attached to.
+
+The applied character motion, and the information of whether the character
+is touching the ground at its final position, can be read with the `KinematicCharacterControllerOutput` component
+(inserted automatically to the same entity as the `KinematicCharacterController` component).
+
+<Tabs
+groupId="dim"
+defaultValue="2D"
+values={[
+{label: 'Example 2D', value: '2D'},
+{label: 'Example 3D', value: '3D'},
+]}>
+<TabItem value="2D">
+
+```rust
+<load path='/2d/bevy/examples/character_controller2.rs' marker='Setup' />
+```
+
+  </TabItem>
+  <TabItem value="3D">
+
+```rust
+<load path='/3d/bevy/examples/character_controller3.rs' marker='Setup' />
+```
+
+  </TabItem>
+</Tabs>
+
+The character controller can also be used without the `KinematicCharacterController` component, by calling
+`RapierContextMut::move_shape` (from the `WriteRapierContext` system parameter) with the desired translation, the shape
+of the character (a `Collider` can be given directly), and its current position. This calculates the possible movement
+right away, based on the positions of the colliders at the end of the last timestep, but doesn't apply it: it is up to
+you to apply the resulting `MoveShapeOutput::effective_translation` to the character. The behavior of the controller is
+configured by the `MoveShapeOptions` argument (which has the same settings as the `KinematicCharacterController`
+component), and its obstacles by the `QueryFilter` argument detailed in the
+[scene query filters](./scene_queries.mdx#query-filters) section. The collisions are given to the last argument, a
+closure called on each obstacle hit along the path:
+
+<Tabs
+groupId="dim"
+defaultValue="2D"
+values={[
+{label: 'Example 2D', value: '2D'},
+{label: 'Example 3D', value: '3D'},
+]}>
+<TabItem value="2D">
+
+```rust
+<load path='/2d/bevy/examples/character_controller2.rs' marker='MoveShape' />
+```
+
+  </TabItem>
+  <TabItem value="3D">
+
+```rust
+<load path='/3d/bevy/examples/character_controller3.rs' marker='MoveShape' />
+```
+
+  </TabItem>
+</Tabs>
+
+:::warning
+Unlike the `KinematicCharacterController` component, `move_shape` doesn't know which collider is the character. If the
+character is a collider (or is attached to a rigid-body) present in the physics scene, the filter **must** exclude that
+collider (and that rigid-body) from the set of obstacles (with `QueryFilter::exclude_collider` and
+`QueryFilter::exclude_rigid_body`) to prevent the character from colliding with itself.
+:::
+
+</bevy>
+
+<js>
+
+A new character controller can be created and removed by the physics `World`:
+
+```js
+<load path='/2d/javascript/src/snippets/character_controller.ts' marker='Setup1' />
+```
+
+Note that the character controller does not store a reference to the rigid-body and collider it controls. Therefore, the
+same instance of the `CharacterController` class can be used to control different colliders. This can be useful if
+you want to apply the same kind of character control settings to multiple characters.
+
+The created character controller can then be used to control the movement of a collider taking into account obstacles
+on its path. This is done in two steps:
+1. Given a desired translation, compute the actual translation that we can apply to the collider based on the obstacles.
+2. Read the result and apply it to the rigid-body or collider (if it isn’t attached to a rigid-body) by setting its
+   position, kinematic velocity, or next kinematic position, depending on the situation.
+
+```js
+<load path='/2d/javascript/src/snippets/character_controller.ts' marker='Setup2' />
+```
+
+The recommended way to update the character’s position depends on its representation:
+- A **collider not attached** to any rigid-body: set the collider’s position directly (with `collider.setTranslation`)
+  to the corrected movement added to its current position.
+- A **velocity-based kinematic rigid-body**: set its velocity (with `rigidBody.setLinvel`) to the computed movement
+  divided by the timestep length.
+- A **position-based kinematic rigid-body**: set its next kinematic position (with `rigidBody.setNextKinematicTranslation`)
+  to the corrected movement added to its current position.
+
+</js>
+
+<c>
+
+The character controller implementation is exposed as the `R3KinematicCharacterController` object, created with its
+default configuration by `r3NewKinematicCharacterController`, and freed by `r3FreeKinematicCharacterController`. This
+object only contains information about the character controller’s behavior (as well as the collisions recorded by its
+last movement calculation, see the [collisions section](./character_controller.mdx#collisions)). It does not contain
+any collider-specific or rigid-body-specific information like handles, velocities, positions, etc. Therefore, the same
+`R3KinematicCharacterController` can be used to control multiple rigid-bodies/colliders if they rely on the same set
+of parameters. Its behavior is configured by its setters (detailed in the next sections), and it is used through the
+following functions:
+- `r3KinematicCharacterController_MoveShape` is responsible for calculating the possible movement of a character based
+  on the desired movement, obstacles, and character controller options. It is given the world containing the
+  obstacles, the `R3QueryOptions` selecting these obstacles (see the [filtering section](./character_controller.mdx#filtering)),
+  the timestep length, the shape of the character, and its current pose. The character’s shape is an `R3SharedShape`,
+  e.g., created with `r3BallSharedShape` or cloned from a collider with `r3Collider_CloneShape` (and freed with
+  `r3FreeSharedShape` once it is no longer needed).
+- `r3KinematicCharacterController_Collisions` and `r3KinematicCharacterController_SolveCharacterCollisionImpulses` are
+  detailed in the [collisions section](./character_controller.mdx#collisions).
+
+<Tabs
+groupId="dim"
+defaultValue="2D"
+values={[
+{label: 'Example 2D', value: '2D'},
+{label: 'Example 3D', value: '3D'},
+]}>
+<TabItem value="2D">
+
+```c
+<load path='/2d/c/examples/character_controller2.c' marker='Setup' />
+```
+
+  </TabItem>
+  <TabItem value="3D">
+
+```c
+<load path='/3d/c/examples/character_controller3.c' marker='Setup' />
+```
+
+  </TabItem>
+</Tabs>
+
+The obstacles are taken at the positions they had at the end of the last `r3Step` (or `r3DetectCollisions`). The
+returned `R3CharacterMovement` contains the corrected movement (its `translation` field), as well as whether the
+character touches the ground at its final position (its `grounded` field), and whether it is sliding down a slope that
+is too steep to climb (its `is_sliding_down_slope` field). The corrected movement isn’t applied automatically: the
+recommended way to update the character’s position depends on its representation:
+- A **collider not attached** to any rigid-body: set the collider’s position directly (with `r3Collider_SetTranslation`)
+  to the corrected movement added to its current position.
+- A **velocity-based kinematic rigid-body**: set its velocity (with `r3RigidBody_SetLinvel`) to the computed movement
+  divided by the timestep length.
+- A **position-based kinematic rigid-body**: set its next kinematic position (with
+  `r3RigidBody_SetNextKinematicTranslation`) to the corrected movement added to its current position.
+
+</c>
+
+<py>
+
+The character controller implementation is exposed as the `KinematicCharacterController` class. This class only
+contains information about the character controller’s behavior. It does not contain any collider-specific or
+rigid-body-specific information like handles, velocities, positions, etc. Therefore, the same instance of
+`KinematicCharacterController` can be used to control multiple rigid-bodies/colliders if they rely on the same set of
+parameters. Its settings (detailed in the next sections) are properties that can also be given as keyword arguments
+to its constructor (e.g. `KinematicCharacterController(slide=False, max_slope_climb_angle=0.5)`). The
+`KinematicCharacterController` exposes only two methods:
+- `move_shape` is responsible for calculating the possible movement of a character based on the desired movement,
+  obstacles, and character controller options. It is given the timestep length, the rigid-body set and the collider
+  set (both unused and kept for backward compatibility: they can be `None`, or must be the sets of the query
+  pipeline), the query pipeline of the world containing the obstacles (e.g. `world.query_pipeline`), the shape of the
+  character (a `SharedShape`, e.g. the `shape` of its `Collider`), its current pose, the desired translation, and
+  optionally the `QueryFilter` selecting the obstacles (see the
+  [filtering section](./character_controller.mdx#filtering)) and a callback receiving the collisions (see the
+  [collisions section](./character_controller.mdx#collisions)).
+- `solve_character_collision_impulses` is detailed in the [collisions section](./character_controller.mdx#collisions).
+
+```python
+<load path='/3d/python/character_controller.py' marker='Setup' />
+```
+
+The obstacles are taken at the positions they had at the end of the last `PhysicsWorld.step` (or the last
+`PhysicsWorld.update_query_pipeline`). The returned `EffectiveCharacterMovement` contains the corrected movement (its
+`translation` property), as well as whether the character touches the ground at its final position (its `grounded`
+property), and whether it is sliding down a slope that is too steep to climb (its `is_sliding_down_slope` property).
+The corrected movement isn’t applied automatically: the recommended way to update the character’s position depends on
+its representation:
+- A **collider not attached** to any rigid-body: set the collider’s position directly (with its `translation`
+  property) to the corrected movement added to its current position.
+- A **velocity-based kinematic rigid-body**: set its velocity (with its `linvel` property) to the computed movement
+  divided by the timestep length.
+- A **position-based kinematic rigid-body**: set its next kinematic position (with
+  `RigidBody.set_next_kinematic_translation`) to the corrected movement added to its current position.
+
+</py>
+
+:::info
+The character’s shape may be any shape supported by Rapier. However, it is recommended to either use a cuboid,
+a ball, or a capsule since they involve less computations and less numerical approximations.
+:::
+
+:::warning
+The built-in character controller **does not** support rotational movement. It only supports translations.
+:::

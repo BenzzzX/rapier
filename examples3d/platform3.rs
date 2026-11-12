@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Ground.
@@ -17,9 +14,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let ground_height = 0.1;
 
     let rigid_body = RigidBodyBuilder::fixed().translation(Vector::new(0.0, -ground_height, 0.0));
-    let handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(ground_size, ground_height, ground_size);
-    colliders.insert_with_parent(collider, handle, &mut bodies);
+    world.insert(rigid_body, collider);
 
     /*
      * Create the boxes
@@ -41,9 +37,8 @@ pub fn init_world(testbed: &mut Testbed) {
 
                 // Build the rigid body.
                 let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y, z));
-                let handle = bodies.insert(rigid_body);
                 let collider = ColliderBuilder::cuboid(rad, rad, rad);
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                world.insert(rigid_body, collider);
             }
         }
     }
@@ -53,9 +48,8 @@ pub fn init_world(testbed: &mut Testbed) {
      */
     let platform_body =
         RigidBodyBuilder::kinematic_velocity_based().translation(Vector::new(0.0, 1.5 + 0.8, 0.0));
-    let velocity_based_platform_handle = bodies.insert(platform_body);
     let collider = ColliderBuilder::cuboid(rad * 10.0, rad, rad * 10.0);
-    colliders.insert_with_parent(collider, velocity_based_platform_handle, &mut bodies);
+    let (velocity_based_platform_handle, _) = world.insert(platform_body, collider);
 
     /*
      * Setup a position-based kinematic rigid body.
@@ -65,40 +59,44 @@ pub fn init_world(testbed: &mut Testbed) {
         3.0 + 1.5 + 0.8,
         0.0,
     ));
-    let position_based_platform_handle = bodies.insert(platform_body);
     let collider = ColliderBuilder::cuboid(rad * 10.0, rad, rad * 10.0);
-    colliders.insert_with_parent(collider, position_based_platform_handle, &mut bodies);
-
-    /*
-     * Setup a callback to control the platform.
-     */
-    testbed.add_callback(move |_, physics, _, run_state| {
-        let velocity = Vector::new(
-            0.0,
-            (run_state.time * 2.0).cos(),
-            run_state.time.sin() * 2.0,
-        );
-
-        // Update the velocity-based kinematic body by setting its velocity.
-        if let Some(platform) = physics.bodies.get_mut(velocity_based_platform_handle) {
-            platform.set_linvel(velocity, true);
-            platform.set_angvel(Vector::new(0.0, 1.0, 0.0), true);
-        }
-
-        // Update the position-based kinematic body by setting its next position.
-        if let Some(platform) = physics.bodies.get_mut(position_based_platform_handle) {
-            let next_tra = platform.translation() + (-velocity * physics.integration_parameters.dt);
-            let next_rot = platform.rotation();
-            let delta_rot = Rotation::from_rotation_y(-0.5 * physics.integration_parameters.dt);
-            let next_rot = delta_rot * next_rot;
-            platform.set_next_kinematic_translation(next_tra);
-            platform.set_next_kinematic_rotation(next_rot);
-        }
-    });
+    let (position_based_platform_handle, _) = world.insert(platform_body, collider);
 
     /*
      * Run the simulation.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(10.0, 5.0, 10.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(10.0, 5.0, 10.0), Vec3::ZERO);
+
+    let mut step_id = 0usize;
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+            step_id += 1;
+
+            let velocity = Vector::new(
+                0.0,
+                ((step_id as f32 * world.integration_parameters.dt) * 2.0).cos(),
+                (step_id as f32 * world.integration_parameters.dt).sin() * 2.0,
+            );
+
+            // Update the velocity-based kinematic body by setting its velocity.
+            if let Some(platform) = world.bodies.get_mut(velocity_based_platform_handle) {
+                platform.set_linvel(velocity, true);
+                platform.set_angvel(Vector::new(0.0, 1.0, 0.0), true);
+            }
+
+            // Update the position-based kinematic body by setting its next position.
+            if let Some(platform) = world.bodies.get_mut(position_based_platform_handle) {
+                let next_tra =
+                    platform.translation() + (-velocity * world.integration_parameters.dt);
+                let next_rot = platform.rotation();
+                let delta_rot = Rotation::from_rotation_y(-0.5 * world.integration_parameters.dt);
+                let next_rot = delta_rot * next_rot;
+                platform.set_next_kinematic_translation(next_tra);
+                platform.set_next_kinematic_rotation(next_rot);
+            }
+        }
+    }
+    Ok(())
 }

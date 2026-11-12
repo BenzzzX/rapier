@@ -2,9 +2,12 @@ use crate::counters::Timer;
 use core::fmt::{Display, Formatter, Result};
 
 /// Performance counters related to continuous collision detection (CCD).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct CCDCounters {
     /// The number of substeps actually performed by the CCD resolution.
+    ///
+    /// This is zero for the steps where the CCD didn't need to act (no CCD-enabled body moving
+    /// fast enough).
     pub num_substeps: usize,
     /// The total time spent for TOI computation in the CCD resolution.
     pub toi_computation_time: Timer,

@@ -1,32 +1,41 @@
 [package]
 name = "rapier-examples-2d"
-version = "0.1.0"
-authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
-edition = "2024"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
 default-run = "all_examples2"
+publish = false
 
 [features]
 parallel = ["rapier2d/parallel", "rapier_testbed2d/parallel", "fracture_rapier/parallel"]
-simd-stable = ["rapier2d/simd-stable", "fracture_rapier/simd-stable"]
-simd-nightly = ["rapier2d/simd-nightly", "fracture_rapier/simd-nightly"]
-other-backends = ["rapier_testbed2d/other-backends"]
 enhanced-determinism = ["rapier2d/enhanced-determinism"]
 
 [dependencies]
-rand = "0.9"
-lyon = "0.17"
-dot_vox = "5"
-kiss3d = { version = "0.40.0", features = ["egui", "parry", "serde"] }
+# Keep the testbed's shader tooling compatible with the project's current Rust toolchain.
+wesl = "=0.4.0"
+wesl-macros = "=0.4.0"
+wgsl-parse = "=0.4.0"
+wgsl-types = "=0.4.0"
+anyhow.workspace = true
+rand.workspace = true
+lyon.workspace = true
+dot_vox.workspace = true
+kiss3d.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-usvg = "0.14"
+usvg.workspace = true
 
 [dependencies.rapier_testbed2d]
-path = "../crates/rapier_testbed2d"
-#features = ["profiler_ui"]
+workspace = true
+features = ["fem"]
 
 [dependencies.rapier2d]
-path = "../crates/rapier2d"
+workspace = true
+features = ["fem"]
+
+[[bin]]
+name = "all_examples2"
+path = "./all_examples2.rs"
 
 [dependencies.fracture_core]
 path = "../crates/fracture_core"
@@ -36,7 +45,3 @@ path = "../crates/fracture_rapier"
 
 [dependencies.fracture_voxel]
 path = "../crates/fracture_voxel"
-
-[[bin]]
-name = "all_examples2"
-path = "./all_examples2.rs"

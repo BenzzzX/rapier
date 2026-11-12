@@ -4,7 +4,9 @@ use simba::scalar::ComplexField;
 use crate::dynamics::solver::MotorParameters;
 use crate::dynamics::solver::joint_constraint::generic_joint_constraint::GenericJointConstraint;
 use crate::dynamics::solver::joint_constraint::joint_velocity_constraint::WritebackId;
-use crate::dynamics::solver::joint_constraint::{JointConstraintHelper, JointSolverBody};
+use crate::dynamics::solver::joint_constraint::{
+    AngularLimitParams, JointConstraintHelper, JointSolverBody,
+};
 use crate::dynamics::{
     GenericJoint, ImpulseJoint, IntegrationParameters, JointIndex, Multibody, MultibodyJointSet,
     MultibodyLinkId, RigidBodySet,
@@ -14,7 +16,7 @@ use crate::utils;
 use crate::utils::{ComponentMul, IndexMut2, MatrixColumn};
 
 use crate::dynamics::integration_parameters::SpringCoefficients;
-use crate::dynamics::solver::ConstraintsCounts;
+use crate::dynamics::solver::joint_num_constraints;
 use crate::dynamics::solver::solver_body::SolverBodies;
 #[cfg(feature = "dim3")]
 use crate::utils::AngularInertiaOps;
@@ -114,22 +116,38 @@ impl JointGenericExternalConstraintBuilder {
             return;
         }
 
-        // For each solver contact we generate up to SPATIAL_DIM constraints, and each
-        // constraints appends the multibodies jacobian and weighted jacobians.
-        // Also note that for impulse_joints, the rigid-bodies will also add their jacobians
-        // to the generic DVector.
-        // TODO: is this count correct when we take both motors and limits into account?
-        let required_jacobian_len = *j_id + multibodies_ndof * 2 * SPATIAL_DIM;
+        // Each row appends `2 * multibodies_ndof` entries (jacobian and weighted jacobian, both
+        // sides); reserve exactly the rows this joint emits (motor plus limit on an axis gives two,
+        // so more than `SPATIAL_DIM`), counted after `strip_soft_frame_angular_axes` runs.
+        let mut masked_data = joint.data;
+        super::strip_soft_frame_angular_axes(&mut masked_data, rb1, rb2);
+        let num_rows = crate::dynamics::solver::joint_data_num_constraints(&masked_data);
+        let required_jacobian_len = *j_id + multibodies_ndof * 2 * num_rows;
+        *j_id += multibodies_ndof * 2 * num_rows;
 
-        // TODO: use a more precise increment.
-        *j_id += multibodies_ndof * 2 * SPATIAL_DIM;
-
-        if jacobians.nrows() < required_jacobian_len && !cfg!(feature = "parallel") {
+        // Grow the jacobian buffer to fit this constraint: runs serially in the staged solver's
+        // pre-phase, so race-free (see `generic_contact_constraint`); the internal-constraint
+        // `generate` below already resizes unconditionally.
+        if jacobians.nrows() < required_jacobian_len {
             jacobians.resize_vertically_mut(required_jacobian_len, 0.0);
         }
 
-        let mut joint_data = joint.data;
-        joint_data.transform_to_solver_body_space(rb1, rb2);
+        let mut joint_data = masked_data;
+        // NOTE: multibody links are positioned by `link.local_to_world` which is
+        //       the body-frame (origin-centered) pose, unlike regular dynamic
+        //       bodies whose solver pose is com-centered. So the com shift from
+        //       `transform_to_solver_body_space` must NOT be applied to sides
+        //       attached to a multibody link.
+        if rb1.is_fixed() {
+            joint_data.local_frame1 = rb1.pos.position * joint_data.local_frame1;
+        } else if matches!(link1, LinkOrBody::Body(_)) {
+            joint_data.local_frame1.translation -= rb1.mprops.local_mprops.local_com;
+        }
+        if rb2.is_fixed() {
+            joint_data.local_frame2 = rb2.pos.position * joint_data.local_frame2;
+        } else if matches!(link2, LinkOrBody::Body(_)) {
+            joint_data.local_frame2.translation -= rb2.mprops.local_mprops.local_com;
+        }
         *out_builder = GenericJointConstraintBuilder::External(Self {
             link1,
             link2,
@@ -142,7 +160,7 @@ impl JointGenericExternalConstraintBuilder {
             constraint_id: *out_constraint_id,
         });
 
-        *out_constraint_id += ConstraintsCounts::from_joint(joint).num_constraints;
+        *out_constraint_id += joint_num_constraints(joint);
     }
 
     pub fn update(
@@ -162,37 +180,45 @@ impl JointGenericExternalConstraintBuilder {
         //       constraints. Could we make this more incremental?
         let pos1;
         let pos2;
-        let mb1;
-        let mb2;
 
-        match self.link1 {
+        let (world_com1, mb1) = match self.link1 {
             LinkOrBody::Link(link) => {
                 let mb = &multibodies[link.multibody];
                 pos1 = mb.link(link.id).unwrap().local_to_world;
-                mb1 = LinkOrBodyRef::Link(mb, link.id);
+                // The link pose is origin-centered; the link’s body jacobian
+                // measures linear velocities at its center-of-mass, so the
+                // lever arms must be taken relative to the world com.
+                (
+                    pos1 * self.local_body1.world_com,
+                    LinkOrBodyRef::Link(mb, link.id),
+                )
             }
             LinkOrBody::Body(body1) => {
                 pos1 = bodies.get_pose(body1).pose();
-                mb1 = LinkOrBodyRef::Body(body1);
+                (pos1.translation, LinkOrBodyRef::Body(body1))
             }
             LinkOrBody::Fixed => {
                 pos1 = Pose::IDENTITY;
-                mb1 = LinkOrBodyRef::Fixed;
+                (pos1.translation, LinkOrBodyRef::Fixed)
             }
         };
-        match self.link2 {
+        let (world_com2, mb2) = match self.link2 {
             LinkOrBody::Link(link) => {
                 let mb = &multibodies[link.multibody];
                 pos2 = mb.link(link.id).unwrap().local_to_world;
-                mb2 = LinkOrBodyRef::Link(mb, link.id);
+                (
+                    pos2 * self.local_body2.world_com,
+                    LinkOrBodyRef::Link(mb, link.id),
+                )
             }
             LinkOrBody::Body(body2) => {
                 pos2 = bodies.get_pose(body2).pose();
-                mb2 = LinkOrBodyRef::Body(body2);
+                // The solver body pose is at the center of mass.
+                (pos2.translation, LinkOrBodyRef::Body(body2))
             }
             LinkOrBody::Fixed => {
                 pos2 = Pose::IDENTITY;
-                mb2 = LinkOrBodyRef::Fixed;
+                (pos2.translation, LinkOrBodyRef::Fixed)
             }
         };
 
@@ -200,11 +226,11 @@ impl JointGenericExternalConstraintBuilder {
         let frame2 = pos2 * self.joint.local_frame2;
 
         let joint_body1 = JointSolverBody {
-            world_com: pos1.translation, // the solver body pose is at the center of mass.
+            world_com: world_com1,
             ..self.local_body1
         };
         let joint_body2 = JointSolverBody {
-            world_com: pos2.translation, // the solver body pose is at the center of mass.
+            world_com: world_com2,
             ..self.local_body2
         };
 
@@ -238,7 +264,11 @@ impl JointGenericInternalConstraintBuilder {
     pub fn num_constraints(multibodies: &MultibodyJointSet, link_id: &MultibodyLinkId) -> usize {
         let multibody = &multibodies[link_id.multibody];
         let link = multibody.link(link_id.id).unwrap();
+        // This link's own motor/limit/friction constraints, plus the DoF
+        // couplings it owns (a coupling is owned by its first joint's link).
         link.joint().num_velocity_constraints()
+            + multibody.num_friction_constraints(link_id.id)
+            + multibody.num_couplings_owned_by(link_id.id)
     }
 
     pub fn generate(
@@ -251,7 +281,9 @@ impl JointGenericInternalConstraintBuilder {
     ) {
         let multibody = &multibodies[link_id.multibody];
         let link = multibody.link(link_id.id).unwrap();
-        let num_constraints = link.joint().num_velocity_constraints();
+        let num_constraints = link.joint().num_velocity_constraints()
+            + multibody.num_friction_constraints(link_id.id)
+            + multibody.num_couplings_owned_by(link_id.id);
 
         if num_constraints == 0 {
             return;
@@ -280,7 +312,7 @@ impl JointGenericInternalConstraintBuilder {
     ) {
         let mb = &multibodies[self.link.multibody];
         let link = mb.link(self.link.id).unwrap();
-        link.joint().velocity_constraints(
+        let n_own = link.joint().velocity_constraints(
             params,
             mb,
             link,
@@ -288,6 +320,19 @@ impl JointGenericInternalConstraintBuilder {
             jacobians,
             &mut out[self.constraint_id..],
         );
+        // DoF couplings owned by this link follow its own constraints, both in
+        // the jacobian buffer (each constraint reserves `2·ndofs`) and in the
+        // output slice.
+        if mb.num_couplings_owned_by(self.link.id) > 0 {
+            let coupling_j_id = self.j_id + n_own * mb.ndofs() * 2;
+            mb.coupling_velocity_constraints(
+                self.link.id,
+                params,
+                coupling_j_id,
+                jacobians,
+                &mut out[self.constraint_id + n_own..],
+            );
+        }
     }
 }
 
@@ -350,6 +395,44 @@ impl JointConstraintHelper<Real> {
         ang_jac1: AngVector,
         ang_jac2: AngVector,
     ) -> GenericJointConstraint {
+        // When both attachment points are links of the same multibody (e.g. a
+        // loop closure), the two jacobian blocks act on the same generalized
+        // velocities and must be combined into a single relative jacobian
+        // `J2 − J1`. Keeping one block per link would lose the `J1ᵀ·W·J2`
+        // coupling in the constraint’s effective mass, yielding wildly wrong
+        // impulses (and divisions by noise when the blocks nearly cancel).
+        // The block is stored on the "2" side so that the solver’s
+        // `vel2 - vel1` measurement reads `(J2 − J1)·v` as expected.
+        if let (LinkOrBodyRef::Link(mb_a, link_id1), LinkOrBodyRef::Link(mb_b, link_id2)) =
+            (mb1, mb2)
+            && core::ptr::eq(mb_a, mb_b)
+        {
+            let block_j_id = *j_id;
+            mb_a.fill_relative_jacobians(
+                link_id1, lin_jac, ang_jac1, link_id2, lin_jac, ang_jac2, j_id, jacobians,
+            );
+
+            return GenericJointConstraint {
+                is_rigid_body1: true,
+                is_rigid_body2: false,
+                solver_vel1: u32::MAX,
+                solver_vel2: mb_a.solver_id,
+                ndofs1: 0,
+                j_id1: block_j_id,
+                ndofs2: mb_a.ndofs(),
+                j_id2: block_j_id,
+                joint_id,
+                impulse: 0.0,
+                impulse_bounds: [-Real::MAX, Real::MAX],
+                inv_lhs: 0.0,
+                rhs: 0.0,
+                rhs_wo_bias: 0.0,
+                cfm_coeff: 0.0,
+                cfm_gain: 0.0,
+                writeback_id,
+            };
+        }
+
         let j_id1 = *j_id;
         let (ndofs1, solver_vel1, is_rigid_body1) = match mb1 {
             LinkOrBodyRef::Link(mb1, link_id1) => {
@@ -476,7 +559,10 @@ impl JointConstraintHelper<Real> {
 
         let erp_inv_dt = softness.erp_inv_dt(params.dt);
 
-        let rhs_bias = ((dist - limits[1]).max(0.0) - (limits[0] - dist).max(0.0)) * erp_inv_dt;
+        // See `limit_linear`: the bias is capped so deep violations don't catapult.
+        let max_bias = params.max_corrective_velocity();
+        let rhs_bias = (((dist - limits[1]).max(0.0) - (limits[0] - dist).max(0.0)) * erp_inv_dt)
+            .clamp(-max_bias, max_bias);
         constraint.rhs += rhs_bias;
         constraint.impulse_bounds = [
             min_enabled as u32 as Real * -Real::MAX,
@@ -598,10 +684,14 @@ impl JointConstraintHelper<Real> {
         softness: SpringCoefficients<Real>,
         writeback_id: WritebackId,
     ) -> GenericJointConstraint {
+        // See `AngularLimitParams`: the row measures the wrapped angle from the middle of
+        // the allowed range; the measure's gradient is the plain joint axis (like the
+        // angular motor row).
+        let limit = AngularLimitParams::new(limits[0], limits[1]);
         #[cfg(feature = "dim2")]
         let ang_jac: AngVector = 1.0;
         #[cfg(feature = "dim3")]
-        let ang_jac = self.ang_basis.column(_limited_axis);
+        let ang_jac = self.basis.col(_limited_axis);
 
         let mut constraint = self.lock_jacobians_generic(
             jacobians,
@@ -617,21 +707,21 @@ impl JointConstraintHelper<Real> {
             ang_jac,
         );
 
-        let s_limits = [(limits[0] / 2.0).sin(), (limits[1] / 2.0).sin()];
-        #[cfg(feature = "dim2")]
-        let s_ang = (self.ang_err.angle() / 2.0).sin();
-        #[cfg(feature = "dim3")]
-        let s_ang = self.ang_err.xyz()[_limited_axis];
-        let min_enabled = s_ang <= s_limits[0];
-        let max_enabled = s_limits[1] <= s_ang;
+        let ang_limits = [-limit.half_range, limit.half_range];
+        let ang = self.recentered_angle(_limited_axis, &limit);
+        let min_enabled = ang <= ang_limits[0];
+        let max_enabled = ang_limits[1] <= ang;
         let impulse_bounds = [
             min_enabled as u32 as Real * -Real::MAX,
             max_enabled as u32 as Real * Real::MAX,
         ];
 
         let erp_inv_dt = softness.erp_inv_dt(params.dt);
-        let rhs_bias =
-            ((s_ang - s_limits[1]).max(0.0) - (s_limits[0] - s_ang).max(0.0)) * erp_inv_dt;
+        // See `limit_angular`: the bias is capped so deep violations don't catapult.
+        let max_bias = params.max_corrective_velocity();
+        let rhs_bias = (((ang - ang_limits[1]).max(0.0) - (ang_limits[0] - ang).max(0.0))
+            * erp_inv_dt)
+            .clamp(-max_bias, max_bias);
 
         constraint.rhs += rhs_bias;
         constraint.impulse_bounds = impulse_bounds;

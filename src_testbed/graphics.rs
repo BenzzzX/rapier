@@ -2,10 +2,22 @@
 
 use crate::testbed::TestbedStateFlags;
 use kiss3d::prelude::*;
-use rand_pcg::Pcg32;
-use rapier::dynamics::{RigidBodyHandle, RigidBodySet};
-use rapier::geometry::{ColliderHandle, ColliderSet, Shape, ShapeType};
+use rapier::dynamics::{RigidBodyHandle, RigidBodySet, SoftBodySet};
+use rapier::geometry::{ColliderHandle, ColliderSet, Shape, ShapeType, SharedShape};
 use std::collections::HashMap;
+use std::path::Path;
+
+use graphics_polyline::polyline_geometry;
+#[cfg(feature = "dim2")]
+use graphics_polyline::stroked_polyline;
+#[cfg(feature = "dim3")]
+use graphics_polyline::tube_polyline;
+use graphics_soft_bodies::SoftBodyGraphics;
+#[cfg(feature = "dim3")]
+use graphics_soft_bodies::is_hidden_by_skin;
+
+mod graphics_polyline;
+mod graphics_soft_bodies;
 
 #[cfg(feature = "dim2")]
 pub use kiss3d::prelude::SceneNode2d as SceneNode;
@@ -22,6 +34,88 @@ pub enum ShapeTemplateType {
     Cylinder,
     #[cfg(feature = "dim3")]
     Cone,
+    /// A convex hull (polyhedron in 3D, polygon in 2D), keyed by a hash of its
+    /// vertices so that identical hulls (e.g. thousands of copies of the same
+    /// shape) share one instanced mesh instead of one individual mesh each.
+    Convex(u64),
+}
+
+/// Hash a convex polyhedron's vertices so identical hulls map to the same
+/// instancing template. Returns `None` for non-convex shapes.
+#[cfg(feature = "dim3")]
+fn convex_shape_hash(shape: &dyn Shape) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let poly = shape
+        .as_convex_polyhedron()
+        .or_else(|| shape.as_round_convex_polyhedron().map(|rp| &rp.inner_shape))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let points = poly.points();
+    points.len().hash(&mut hasher);
+    for p in points {
+        (p.x as f32).to_bits().hash(&mut hasher);
+        (p.y as f32).to_bits().hash(&mut hasher);
+        (p.z as f32).to_bits().hash(&mut hasher);
+    }
+    // Fold in the border radius so round/non-round variants don't collide.
+    if let Some(rp) = shape.as_round_convex_polyhedron() {
+        (rp.border_radius as f32).to_bits().hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// 2D counterpart: hash a convex polygon's vertices.
+#[cfg(feature = "dim2")]
+fn convex_shape_hash(shape: &dyn Shape) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let poly = shape
+        .as_convex_polygon()
+        .or_else(|| shape.as_round_convex_polygon().map(|rp| &rp.inner_shape))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let points = poly.points();
+    points.len().hash(&mut hasher);
+    for p in points {
+        (p.x as f32).to_bits().hash(&mut hasher);
+        (p.y as f32).to_bits().hash(&mut hasher);
+    }
+    if let Some(rp) = shape.as_round_convex_polygon() {
+        (rp.border_radius as f32).to_bits().hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Whether a triangle mesh has a boundary (an edge belonging to a single triangle): a cloth, a
+/// torn piece, an open shell, as opposed to a closed surface.
+#[cfg(feature = "dim3")]
+pub(super) fn is_open_surface(indices: &[[u32; 3]]) -> bool {
+    let mut edges = std::collections::HashMap::with_capacity(indices.len() * 3);
+    for [a, b, c] in indices {
+        for (i, j) in [(a, b), (b, c), (c, a)] {
+            *edges.entry((i.min(j), i.max(j))).or_insert(0u32) += 1;
+        }
+    }
+    edges.values().any(|&count| count == 1)
+}
+
+/// Build a kiss3d render mesh for a convex polyhedron (used as an instancing
+/// template). Returns `None` for non-convex shapes.
+#[cfg(feature = "dim3")]
+fn convex_render_mesh(shape: &dyn Shape) -> Option<kiss3d::procedural::RenderMesh> {
+    use kiss3d::procedural::{IndexBuffer, RenderMesh};
+
+    let poly = shape
+        .as_convex_polyhedron()
+        .or_else(|| shape.as_round_convex_polyhedron().map(|rp| &rp.inner_shape))?;
+    let (vertices, indices) = poly.to_trimesh();
+    let vtx = vertices
+        .iter()
+        .map(|pt| Vec3::new(pt.x as f32, pt.y as f32, pt.z as f32))
+        .collect();
+    let mut mesh = RenderMesh::new(vtx, None, None, Some(IndexBuffer::Unified(indices)));
+    mesh.replicate_vertices();
+    mesh.recompute_normals();
+    Some(mesh)
 }
 
 /// Info about an instanced collider
@@ -35,9 +129,20 @@ pub struct InstancedCollider {
     pub tmp_color: Option<Color>,
 }
 
-/// A template node that can render multiple instances
+/// A template node that can render multiple instances.
+///
+/// The instances are split across two scene nodes sharing the same geometry:
+/// opaque instances render through `node`, translucent ones through
+/// `transparent_node`. kiss3d classifies a whole instanced node into a single
+/// render pass (opaque vs. order-independent transparency) from that node's
+/// base-color alpha, so opaque and translucent instances — e.g. a solid box
+/// next to a semi-transparent sensor of the same shape — cannot coexist in one
+/// node without the translucent ones being drawn opaque.
 pub struct ShapeTemplate {
+    /// Opaque instances (`color.a >= 1.0`), drawn in the opaque pass.
     pub node: SceneNode,
+    /// Translucent instances (`color.a < 1.0`), drawn in the transparent pass.
+    pub transparent_node: SceneNode,
     pub colliders: Vec<InstancedCollider>,
 }
 
@@ -48,6 +153,25 @@ pub struct IndividualNode {
     pub delta: rapier::math::Pose,
     pub color: Color,
     pub tmp_color: Option<Color>,
+    /// Whether the node's mesh shares its vertices between elements (smooth normals): how it
+    /// was built, and how a deformable collider's geometry is written back into it.
+    pub smooth: bool,
+}
+
+/// A render-only scene node anchored to a rigid body rather than to a
+/// collider. Used for visualization meshes that participate in *no*
+/// physics — typical MJCF case: `<geom type="mesh">` with
+/// `contype=conaffinity=0`.
+pub struct BodyAttachedNode {
+    pub node: SceneNode,
+    pub body: RigidBodyHandle,
+    pub delta: rapier::math::Pose,
+    pub color: Color,
+    /// The shape the renderer is drawing, kept alive so the "Frame
+    /// all" command can union visual-mesh AABBs into its computation
+    /// without having to dig the geometry back out of the kiss3d
+    /// `SceneNode`.
+    pub shape: SharedShape,
 }
 
 /// Location of a collider in the graphics system
@@ -64,11 +188,32 @@ pub enum NodeLocation {
 
 pub struct GraphicsManager {
     scene: SceneNode,
-    rand: Pcg32,
+    curr_color_index: usize,
+    /// Number of fixed bodies colored so far (the first one gets the ground color).
+    num_fixed_colored: usize,
     /// Template nodes for instanced primitives
     templates: HashMap<ShapeTemplateType, ShapeTemplate>,
     /// Individual nodes for complex shapes (trimesh, heightfield, etc.)
     individual_nodes: Vec<IndividualNode>,
+    /// Body-attached render-only meshes (no physics counterpart).
+    body_attached_nodes: Vec<BodyAttachedNode>,
+    /// Soft-body colors and the render nodes of the meshes soft bodies only draw.
+    soft_graphics: SoftBodyGraphics,
+    /// Per-channel visibility — `false` hides every collider-derived node
+    /// (instanced + individual). Composed with the global `DRAW_SURFACES`
+    /// flag, which still wins when off.
+    colliders_visible: bool,
+    /// Per-channel visibility for body-attached render-only meshes
+    /// (e.g. MJCF visual meshes added via [`Self::add_body_render_mesh`]).
+    body_render_meshes_visible: bool,
+    /// Last-known state of the global `DRAW_SURFACES` flag, updated on every
+    /// [`Self::draw`]. Nodes created between two `draw` calls (e.g. during a
+    /// scene reset) are spawned with this visibility so they don't flash for
+    /// one frame when surface rendering is disabled (see #843).
+    draw_surfaces: bool,
+    /// Mesh colliders drawn with shared vertices (smooth normals) instead of flat shading
+    /// (3D only: a 2D mesh collider is a polyline).
+    smooth_mesh_colliders: bool,
     /// Map from collider to its render nodes
     c2nodes: HashMap<ColliderHandle, NodeLocation>,
     /// Colliders attached to a particular body, used to identify the
@@ -95,13 +240,64 @@ const GROUND_COLOR: Color = Color {
     a: 1.0,
 };
 
+/// Color of the fixed bodies other than the first one (the ground, in practice): lighter than
+/// the ground so a fixed box does not blend into the floor it stands on.
+const FIXED_COLOR: Color = Color {
+    r: 0.72,
+    g: 0.68,
+    b: 0.62,
+    a: 1.0,
+};
+
+/// Base-color alpha applied to the transparent instance node of every shape
+/// template. kiss3d routes an entire instanced node to either the opaque or the
+/// order-independent-transparency pass based on the node's base-color alpha
+/// (`< 1.0` ⇒ transparent). The fragment shader then multiplies each instance's
+/// own alpha by this base alpha, so we keep it a hair under 1.0: close enough to
+/// leave per-instance alpha visually untouched, yet still `< 1.0` so translucent
+/// instances land in the transparency pass instead of being drawn opaque.
+#[cfg(feature = "dim3")]
+const TRANSPARENT_NODE_BASE_ALPHA: f32 = 1.0 - f32::EPSILON;
+
+/// PBR shading parameters for a body render mesh, applied on top of its base
+/// color/texture.
+#[derive(Copy, Clone, Debug)]
+pub struct RenderMaterial {
+    /// Metallic factor in `[0, 1]`.
+    pub metallic: f32,
+    /// Surface roughness in `[0, 1]`.
+    pub roughness: f32,
+    /// Dielectric specular reflectance in `[0, 1]` (mapped to the F0 term).
+    pub reflectance: f32,
+    /// Emissive color (added on top of lit shading); `[0, 0, 0]` for none.
+    pub emissive: [f32; 3],
+}
+
+impl Default for RenderMaterial {
+    fn default() -> Self {
+        Self {
+            metallic: 0.0,
+            roughness: 0.7,
+            reflectance: 0.5,
+            emissive: [0.0; 3],
+        }
+    }
+}
+
 impl GraphicsManager {
     pub fn new() -> GraphicsManager {
         GraphicsManager {
             scene: Default::default(),
-            rand: Pcg32::new(0, 1),
+            curr_color_index: 0,
+            num_fixed_colored: 0,
             templates: HashMap::new(),
             individual_nodes: Vec::new(),
+            body_attached_nodes: Vec::new(),
+            soft_graphics: SoftBodyGraphics::default(),
+            colliders_visible: true,
+            body_render_meshes_visible: true,
+            draw_surfaces: true,
+            smooth_mesh_colliders: false,
             c2nodes: HashMap::new(),
             b2colliders: HashMap::new(),
             b2color: HashMap::new(),
@@ -115,28 +311,219 @@ impl GraphicsManager {
 
     pub fn clear(&mut self) {
         self.scene = SceneNode::empty();
+        self.curr_color_index = 0;
+        self.num_fixed_colored = 0;
         #[cfg(feature = "dim3")]
         {
-            // Setup lights.
-            let mut light = self
+            // A key light off the (1, 1, 1) diagonal, so the three faces of a box seen from the
+            // usual eye get three different shades, and a weak fill from the other side so the
+            // faces it misses are not flat ambient.
+            let mut key = self
                 .scene
-                .add_light(Light::directional(Vec3::new(-1.0, -1.0, -1.0)));
-            light.set_position(Vec3::new(100.0, 100.0, 100.0));
-
-            let mut light = self
-                .scene
-                .add_light(Light::point(10000.0).with_intensity(1.0));
-            light.set_position(Vec3::new(-100.0, 100.0, -100.0));
+                .add_light(Light::directional(Vec3::new(-0.35, -1.0, -0.6)));
+            key.set_position(Vec3::new(100.0, 100.0, 100.0));
+            self.scene
+                .add_light(Light::directional(Vec3::new(0.6, -0.25, 0.75)).with_intensity(0.8));
         }
 
         self.templates.clear();
         self.individual_nodes.clear();
+        self.body_attached_nodes.clear();
+        self.soft_graphics.clear();
         self.c2nodes.clear();
         self.b2colliders.clear();
         self.c2color.clear();
         self.b2color.clear();
         self.b2wireframe.clear();
-        self.rand = Pcg32::new(0, 1);
+        // Per-channel visibility is also reset so example A doesn't leak
+        // its rendering choices into example B after a swap. `draw_surfaces`
+        // is NOT reset: it mirrors a global testbed flag that persists across
+        // scene swaps, so freshly created nodes must honor it immediately.
+        self.colliders_visible = true;
+        self.body_render_meshes_visible = true;
+    }
+
+    /// Show or hide every collider-derived render node (instanced
+    /// primitives + complex individual meshes). The global
+    /// `DRAW_SURFACES` flag still wins when off.
+    pub fn set_colliders_visible(&mut self, visible: bool) {
+        self.colliders_visible = visible;
+    }
+
+    /// Show or hide body-attached render-only meshes registered via
+    /// [`Self::add_body_render_mesh`].
+    pub fn set_body_render_meshes_visible(&mut self, visible: bool) {
+        self.body_render_meshes_visible = visible;
+    }
+
+    /// Attach a render-only mesh to a rigid body. The mesh follows the
+    /// body's pose at every frame, transformed by `local_pose`. It does
+    /// not participate in physics in any way — this is purely a
+    /// visualization channel for things like MJCF `<geom>` elements with
+    /// `contype = conaffinity = 0`.
+    ///
+    /// `uvs` is an optional per-vertex UV buffer (parallel to the
+    /// `shape`'s vertex buffer when the shape is a `TriMesh`). It's
+    /// only consulted when `texture` is also `Some` — there's no point
+    /// uploading UVs that no shader can sample.
+    ///
+    /// `texture` is a path to a 2D color image on disk. kiss3d loads
+    /// it via `set_texture_from_file` and caches it under the path's
+    /// string form, so multiple meshes referencing the same file share
+    /// a single GPU texture.
+    pub fn add_body_render_mesh(
+        &mut self,
+        _window: &mut Window,
+        body: RigidBodyHandle,
+        shape: &SharedShape,
+        local_pose: rapier::math::Pose,
+        color: Color,
+        uvs: Option<&[[f32; 2]]>,
+        normals: Option<&[[f32; 3]]>,
+        texture: Option<&Path>,
+        material: Option<RenderMaterial>,
+    ) {
+        // Plumbing per-vertex UVs into a custom kiss3d mesh is only
+        // supported in 3D; 2D always uses the standard node path.
+        #[cfg(feature = "dim3")]
+        let mut node = {
+            if matches!(shape.shape_type(), ShapeType::TriMesh) {
+                // Build the kiss3d mesh ourselves so we can plumb the
+                // authored UVs *and* normals straight through. The standard
+                // `create_individual_node` path handles neither and always
+                // recomputes flat per-face normals — for a visual mesh
+                // that replaces the default collider render we instead want
+                // to match the source asset exactly.
+                let trimesh = shape.as_trimesh().unwrap();
+                let vtx: Vec<Vec3> = trimesh
+                    .vertices()
+                    .iter()
+                    .map(|pt| Vec3::new(pt.x as f32, pt.y as f32, pt.z as f32))
+                    .collect();
+                let idx = trimesh.indices().to_vec();
+
+                // UVs are only meaningful with a texture. OBJ stores UV
+                // `v=0` at the *bottom* of the image while wgpu samples
+                // textures from the top — flip `v` so the texture lands
+                // the right way up. A UV count that doesn't match the
+                // vertex buffer is dropped (`replicate_vertices` would
+                // otherwise panic).
+                let uvs_opt = if texture.is_some() {
+                    uvs.filter(|uvs| uvs.len() == trimesh.vertices().len())
+                        .map(|uvs| uvs.iter().map(|uv| Vec2::new(uv[0], 1.0 - uv[1])).collect())
+                } else {
+                    None
+                };
+
+                // Use the authored normals verbatim when they line up with
+                // the vertex buffer — this preserves smooth shading where
+                // the artist made it smooth instead of faceting everything.
+                let normals_opt: Option<Vec<Vec3>> = normals
+                    .filter(|n| n.len() == trimesh.vertices().len())
+                    .map(|n| {
+                        n.iter()
+                            .map(|nrm| Vec3::new(nrm[0], nrm[1], nrm[2]))
+                            .collect()
+                    });
+
+                let have_normals = normals_opt.is_some();
+                let mut mesh = kiss3d::procedural::RenderMesh::new(
+                    vtx,
+                    normals_opt,
+                    uvs_opt,
+                    Some(kiss3d::procedural::IndexBuffer::Unified(idx)),
+                );
+                if !have_normals {
+                    // No usable authored normals (e.g. an STL/OBJ that
+                    // had none): fall back to flat shading so the mesh
+                    // still lights. This splits shared vertices, so it must
+                    // run *only* when we didn't supply normals above —
+                    // never on the smooth path.
+                    mesh.replicate_vertices();
+                    mesh.recompute_normals();
+                }
+                Some(self.scene.add_render_mesh(mesh, Vec3::ONE))
+            } else {
+                Self::create_individual_node(&mut self.scene, &**shape, color, false, false)
+            }
+        };
+        #[cfg(feature = "dim2")]
+        let mut node = {
+            // Custom UV/normal plumbing and PBR materials are unsupported in 2D.
+            let _ = (uvs, normals, material);
+            Self::create_individual_node(&mut self.scene, &**shape, color, false, false)
+        };
+
+        if let Some(n) = node.as_mut() {
+            n.set_color(color);
+            // The custom trimesh path above builds the node directly rather
+            // than through `create_individual_node`, so disable backface
+            // culling here too — visual meshes are routinely viewed from
+            // both sides and authored winding isn't guaranteed.
+            #[cfg(feature = "dim3")]
+            {
+                n.enable_backface_culling_recursive(false);
+                if let Some(mat) = material {
+                    n.set_metallic_recursive(mat.metallic);
+                    n.set_roughness_recursive(mat.roughness);
+                    n.set_reflectance(mat.reflectance);
+                    n.set_emissive_recursive(Color::new(
+                        mat.emissive[0],
+                        mat.emissive[1],
+                        mat.emissive[2],
+                        1.0,
+                    ));
+                }
+                // A translucent base color needs the blend pass; opaque meshes
+                // keep the default opaque path.
+                if color.a < 1.0 {
+                    n.set_alpha_mode(kiss3d::scene::AlphaMode::Blend);
+                }
+            }
+            if let Some(tex_path) = texture {
+                // The cache key uses the absolute path string so the
+                // same texture file is uploaded only once across the
+                // whole scene.
+                let key = tex_path.to_string_lossy();
+                n.set_texture_from_file(tex_path, &key);
+            }
+        }
+
+        let Some(mut node) = node else {
+            return;
+        };
+        // Honor the current visibility flags immediately so the mesh doesn't
+        // flash for one frame before the next `draw` (see #843).
+        node.set_visible(self.draw_surfaces && self.body_render_meshes_visible);
+        self.body_attached_nodes.push(BodyAttachedNode {
+            node,
+            body,
+            delta: local_pose,
+            color,
+            shape: shape.clone(),
+        });
+    }
+
+    /// Rebuilds the node of a collider whose shape was replaced (a tear), or whose shading
+    /// changed.
+    fn rebuild_individual_node(&mut self, index: usize, collider: &rapier::geometry::Collider) {
+        let smooth = self.smooth_mesh_colliders;
+        let visible = self.draw_surfaces && self.colliders_visible;
+        let node = &mut self.individual_nodes[index];
+        let color = node.color;
+        node.node.detach();
+        if let Some(mut fresh) = Self::create_individual_node(
+            &mut self.scene,
+            collider.shape(),
+            color,
+            collider.is_sensor(),
+            smooth,
+        ) {
+            fresh.set_visible(visible);
+            let node = &mut self.individual_nodes[index];
+            node.node = fresh;
+            node.smooth = smooth;
+        }
     }
 
     pub fn scene(&self) -> &SceneNode {
@@ -147,43 +534,105 @@ impl GraphicsManager {
         &mut self.scene
     }
 
+    /// Iterator over every render-only mesh attached to a rigid body
+    /// via [`Self::add_body_render_mesh`]. Lets "Frame all" union the
+    /// visual meshes' AABBs alongside the colliders' so models whose
+    /// visual extent is bigger than their collision extent (or whose
+    /// physics-significant geoms are tiny next to the rendered mesh)
+    /// still fit in the frame.
+    pub fn body_attached_nodes(&self) -> impl Iterator<Item = &BodyAttachedNode> {
+        self.body_attached_nodes.iter()
+    }
+
     /// Get or create a template node for a shape type
     #[cfg(feature = "dim3")]
-    fn get_or_create_template(&mut self, template_type: ShapeTemplateType) -> &mut ShapeTemplate {
+    fn get_or_create_template(
+        &mut self,
+        template_type: ShapeTemplateType,
+        shape: &dyn Shape,
+    ) -> &mut ShapeTemplate {
+        // Nodes created between two `draw` calls must honor the current
+        // visibility flags immediately (see #843).
+        let visible = self.draw_surfaces && self.colliders_visible;
         self.templates
             .entry(template_type.clone())
             .or_insert_with(|| {
-                // Create a unit-sized template node
-                let node = match template_type {
-                    ShapeTemplateType::Ball => self.scene.add_sphere_with_subdiv(1.0, 20, 20),
-                    ShapeTemplateType::Cuboid => self.scene.add_cube(2.0, 2.0, 2.0),
-                    // ShapeTemplateType::Capsule => self.scene.add_capsule(1.0, 2.0),
-                    ShapeTemplateType::Cylinder => self.scene.add_cylinder(1.0, 2.0),
-                    ShapeTemplateType::Cone => self.scene.add_cone(1.0, 2.0),
+                // Create a unit-sized template node. Built twice so opaque and
+                // translucent instances get their own node in the right pass.
+                let make_node = |scene: &mut SceneNode| match template_type {
+                    ShapeTemplateType::Ball => scene.add_sphere_with_subdiv(1.0, 20, 20),
+                    ShapeTemplateType::Cuboid => scene.add_cube(2.0, 2.0, 2.0),
+                    // ShapeTemplateType::Capsule => scene.add_capsule(1.0, 2.0),
+                    ShapeTemplateType::Cylinder => scene.add_cylinder(1.0, 2.0),
+                    ShapeTemplateType::Cone => scene.add_cone(1.0, 2.0),
+                    // The convex mesh is baked at unit scale from the first
+                    // hull with this key; all instances share that geometry.
+                    ShapeTemplateType::Convex(_) => {
+                        scene.add_render_mesh(convex_render_mesh(shape).unwrap(), Vec3::ONE)
+                    }
                 };
+                let mut node = make_node(&mut self.scene);
+                let mut transparent_node = make_node(&mut self.scene);
+                node.set_visible(visible);
+                transparent_node.set_visible(visible);
+                // Force this node into the transparency pass: base alpha `< 1.0`
+                // routes it to OIT, and an explicit Blend mode makes the
+                // classification independent of the node's default.
+                transparent_node.set_alpha_mode(kiss3d::scene::AlphaMode::Blend);
+                transparent_node.set_color(Color::new(1.0, 1.0, 1.0, TRANSPARENT_NODE_BASE_ALPHA));
                 ShapeTemplate {
                     node,
+                    transparent_node,
                     colliders: Vec::new(),
                 }
             })
     }
 
     #[cfg(feature = "dim2")]
-    fn get_or_create_template(&mut self, template_type: ShapeTemplateType) -> &mut ShapeTemplate {
+    fn get_or_create_template(
+        &mut self,
+        template_type: ShapeTemplateType,
+        _shape: &dyn Shape,
+    ) -> &mut ShapeTemplate {
+        // Nodes created between two `draw` calls must honor the current
+        // visibility flags immediately (see #843).
+        let visible = self.draw_surfaces && self.colliders_visible;
         self.templates
             .entry(template_type.clone())
             .or_insert_with(|| {
-                // Create a unit-sized template node
-                let node = match template_type {
-                    ShapeTemplateType::Ball => self.scene.add_circle(1.0),
-                    ShapeTemplateType::Cuboid => self.scene.add_rectangle(2.0, 2.0),
+                // Create a unit-sized template node. Built twice so opaque and
+                // translucent instances get their own node, mirroring the 3D
+                // path; in 2D everything already alpha-blends, so the split
+                // only affects draw order (translucent instances drawn last).
+                let make_node = |scene: &mut SceneNode| match template_type {
+                    ShapeTemplateType::Ball => scene.add_circle(1.0),
+                    ShapeTemplateType::Cuboid => scene.add_rectangle(2.0, 2.0),
                     // ShapeTemplateType::Capsule => {
                     //     // Use proper 2D capsule with unit radius and unit half-height
-                    //     window.add_capsule_2d(1.0, 2.0)
+                    //     scene.add_capsule_2d(1.0, 2.0)
                     // }
+                    // The polygon is baked at unit scale from the first hull
+                    // with this key; all instances share that geometry.
+                    ShapeTemplateType::Convex(_) => {
+                        let poly = _shape
+                            .as_convex_polygon()
+                            .or_else(|| _shape.as_round_convex_polygon().map(|rp| &rp.inner_shape))
+                            .unwrap();
+                        let vertices: Vec<Vec2> = poly
+                            .points()
+                            .iter()
+                            .map(|pt| Vec2::new(pt.x as f32, pt.y as f32))
+                            .collect();
+                        scene.add_convex_polygon(vertices, Vec2::ONE)
+                    }
                 };
+                let mut node = make_node(&mut self.scene);
+                let mut transparent_node = make_node(&mut self.scene);
+                node.set_visible(visible);
+                transparent_node.set_visible(visible);
                 ShapeTemplate {
                     node,
+                    transparent_node,
                     colliders: Vec::new(),
                 }
             })
@@ -199,6 +648,14 @@ impl GraphicsManager {
             ShapeType::Cylinder | ShapeType::RoundCylinder => Some(ShapeTemplateType::Cylinder),
             #[cfg(feature = "dim3")]
             ShapeType::Cone | ShapeType::RoundCone => Some(ShapeTemplateType::Cone),
+            #[cfg(feature = "dim3")]
+            ShapeType::ConvexPolyhedron | ShapeType::RoundConvexPolyhedron => {
+                convex_shape_hash(shape).map(ShapeTemplateType::Convex)
+            }
+            #[cfg(feature = "dim2")]
+            ShapeType::ConvexPolygon | ShapeType::RoundConvexPolygon => {
+                convex_shape_hash(shape).map(ShapeTemplateType::Convex)
+            }
             _ => None,
         }
     }
@@ -302,6 +759,14 @@ impl GraphicsManager {
                 self.remove_collider_nodes(collider);
             }
         }
+        // Drop any render-only meshes anchored to this body. We walk the
+        // list in reverse so the swap_remove doesn't disturb earlier
+        // indices we still need to visit.
+        for i in (0..self.body_attached_nodes.len()).rev() {
+            if self.body_attached_nodes[i].body == body {
+                let _ = self.body_attached_nodes.swap_remove(i);
+            }
+        }
     }
 
     pub fn set_body_color(&mut self, b: RigidBodyHandle, color: Color, tmp_color: bool) {
@@ -314,7 +779,8 @@ impl GraphicsManager {
                 match &self.c2nodes[co] {
                     NodeLocation::Individual { index } => {
                         if tmp_color {
-                            self.individual_nodes[*index].tmp_color = Some(color);
+                            let alpha = self.individual_nodes[*index].color.a;
+                            self.individual_nodes[*index].tmp_color = Some(color.with_alpha(alpha));
                         } else {
                             self.individual_nodes[*index].color = color;
                         }
@@ -322,7 +788,8 @@ impl GraphicsManager {
                     NodeLocation::Instanced { template, index } => {
                         let instances = &mut self.templates.get_mut(template).unwrap();
                         if tmp_color {
-                            instances.colliders[*index].tmp_color = Some(color);
+                            let alpha = instances.colliders[*index].color.a;
+                            instances.colliders[*index].tmp_color = Some(color.with_alpha(alpha));
                         } else {
                             instances.colliders[*index].color = color;
                         }
@@ -371,22 +838,32 @@ impl GraphicsManager {
     }
 
     pub fn next_color(&mut self) -> Rgba<f32> {
-        Self::gen_color(&mut self.rand)
+        Self::gen_color(&mut self.curr_color_index)
     }
 
-    fn gen_color(rng: &mut Pcg32) -> Rgba<f32> {
-        use rand::Rng;
-        let [r, g, b]: [f32; 3] = rng.random();
-        [r, g, b, 1.0].into()
+    fn gen_color(curr_color_index: &mut usize) -> Rgba<f32> {
+        let palette = [
+            [0.02, 0.44, 0.19, 1.0],
+            [0.36, 0.13, 0.66, 1.0],
+            [0.44, 0.94, 0.23, 1.0],
+            [0.85, 0.51, 0.98, 1.0],
+        ];
+        *curr_color_index += 1;
+        palette[*curr_color_index % palette.len()].into()
     }
 
     fn alloc_color(&mut self, handle: RigidBodyHandle, is_fixed: bool) -> Color {
         let mut color = self.ground_color;
 
-        if !is_fixed {
+        if is_fixed {
+            if self.num_fixed_colored > 0 {
+                color = FIXED_COLOR;
+            }
+            self.num_fixed_colored += 1;
+        } else {
             match self.b2color.get(&handle).cloned() {
                 Some(c) => color = c,
-                None => color = Self::gen_color(&mut self.rand),
+                None => color = Self::gen_color(&mut self.curr_color_index),
             }
         }
 
@@ -491,12 +968,12 @@ impl GraphicsManager {
             return;
         }
 
-        let opacity = if sensor { 0.5 } else { 1.0 };
+        let opacity = if sensor { 0.3 } else { color.a };
 
         // Try to use instancing for primitive shapes
         if let Some(template_type) = Self::shape_template_type(shape) {
             let half_extents = Self::shape_half_extents(shape);
-            let template = self.get_or_create_template(template_type.clone());
+            let template = self.get_or_create_template(template_type.clone(), shape);
             let index = template.colliders.len();
             template.colliders.push(InstancedCollider {
                 collider: handle,
@@ -515,8 +992,13 @@ impl GraphicsManager {
             );
         } else {
             // Create individual node for complex shapes
-            if let Some(node) = Self::create_individual_node(&mut self.scene, shape, color, sensor)
+            let smooth = self.smooth_mesh_colliders;
+            if let Some(mut node) =
+                Self::create_individual_node(&mut self.scene, shape, color, sensor, smooth)
             {
+                // Honor the current visibility flags immediately so the node
+                // doesn't flash for one frame before the next `draw` (see #843).
+                node.set_visible(self.draw_surfaces && self.colliders_visible);
                 let index = self.individual_nodes.len();
                 self.individual_nodes.push(IndividualNode {
                     node,
@@ -524,6 +1006,7 @@ impl GraphicsManager {
                     delta,
                     color: color.with_alpha(opacity),
                     tmp_color: None,
+                    smooth,
                 });
                 self.c2nodes
                     .insert(handle, NodeLocation::Individual { index });
@@ -537,18 +1020,34 @@ impl GraphicsManager {
         shape: &dyn Shape,
         color: Color,
         sensor: bool,
+        smooth: bool,
     ) -> Option<SceneNode3d> {
         use kiss3d::procedural::{IndexBuffer, RenderMesh};
 
-        fn to_render_mesh(trimesh: &rapier::geometry::TriMesh) -> RenderMesh {
-            let vtx = trimesh
+        fn to_render_mesh(trimesh: &rapier::geometry::TriMesh, smooth: bool) -> RenderMesh {
+            let mut vtx: Vec<Vec3> = trimesh
                 .vertices()
                 .iter()
                 .map(|pt| Vec3::new(pt.x as f32, pt.y as f32, pt.z as f32))
                 .collect();
-            let idx = trimesh.indices().to_vec();
+            let mut idx = trimesh.indices().to_vec();
+            // An open surface is seen from both sides but the shader lights a face by its own
+            // normal, so the back side gets its own triangles wound the other way (and its own
+            // vertices when shared, so normals can differ); `write_mesh_vertices` matches.
+            if is_open_surface(&idx) {
+                let n = if smooth { vtx.len() as u32 } else { 0 };
+                let back: Vec<[u32; 3]> =
+                    idx.iter().map(|[a, b, c]| [a + n, c + n, b + n]).collect();
+                if smooth {
+                    vtx.extend_from_within(..);
+                }
+                idx.extend(back);
+            }
             let mut mesh = RenderMesh::new(vtx, None, None, Some(IndexBuffer::Unified(idx)));
-            mesh.replicate_vertices();
+            // Unshared vertices (three per triangle) give per-face normals: flat shading.
+            if !smooth {
+                mesh.replicate_vertices();
+            }
             mesh.recompute_normals();
             mesh
         }
@@ -556,13 +1055,13 @@ impl GraphicsManager {
         let mut node = match shape.shape_type() {
             ShapeType::TriMesh => {
                 let trimesh = shape.as_trimesh().unwrap();
-                Some(scene.add_render_mesh(to_render_mesh(trimesh), Vec3::ONE))
+                Some(scene.add_render_mesh(to_render_mesh(trimesh, smooth), Vec3::ONE))
             }
             ShapeType::HeightField => {
                 let heightfield = shape.as_heightfield().unwrap();
                 let (vertices, indices) = heightfield.to_trimesh();
                 let trimesh = rapier::geometry::TriMesh::new(vertices, indices).unwrap();
-                Some(scene.add_render_mesh(to_render_mesh(&trimesh), Vec3::ONE))
+                Some(scene.add_render_mesh(to_render_mesh(&trimesh, smooth), Vec3::ONE))
             }
             ShapeType::ConvexPolyhedron | ShapeType::RoundConvexPolyhedron => {
                 let poly = shape
@@ -571,7 +1070,7 @@ impl GraphicsManager {
                 poly.map(|p| {
                     let (vertices, indices) = p.to_trimesh();
                     let trimesh = rapier::geometry::TriMesh::new(vertices, indices).unwrap();
-                    scene.add_render_mesh(to_render_mesh(&trimesh), Vec3::ONE)
+                    scene.add_render_mesh(to_render_mesh(&trimesh, smooth), Vec3::ONE)
                 })
             }
             ShapeType::Capsule => {
@@ -588,7 +1087,7 @@ impl GraphicsManager {
                 let vertices = vec![tri.a, tri.b, tri.c];
                 let indices = vec![[0u32, 1, 2], [0u32, 2, 1]];
                 let trimesh = rapier::geometry::TriMesh::new(vertices, indices).unwrap();
-                Some(scene.add_render_mesh(to_render_mesh(&trimesh), Vec3::ONE))
+                Some(scene.add_render_mesh(to_render_mesh(&trimesh, smooth), Vec3::ONE))
             }
             ShapeType::HalfSpace => {
                 let mut parent = scene.add_group();
@@ -596,20 +1095,37 @@ impl GraphicsManager {
                 let node = parent.add_quad(2000.0, 2000.0, 1, 1);
                 Some(node)
             }
+            ShapeType::Polyline => {
+                // A wire (a soft rope) is drawn as a tube: raw lines have no thickness to
+                // shade, and a deforming wire needs geometry it can follow.
+                let (vertices, segments) = polyline_geometry(shape)?;
+                let (vtx, idx) = tube_polyline(&vertices, &segments);
+                let mut mesh = RenderMesh::new(vtx, None, None, Some(IndexBuffer::Unified(idx)));
+                mesh.recompute_normals();
+                Some(scene.add_render_mesh(mesh, Vec3::ONE))
+            }
             ShapeType::Voxels => {
                 let voxels = shape.as_voxels().unwrap();
                 let (vertices, indices) = voxels.to_trimesh();
                 let trimesh = rapier::geometry::TriMesh::new(vertices, indices).unwrap();
-                Some(scene.add_render_mesh(to_render_mesh(&trimesh), Vec3::ONE))
+                Some(scene.add_render_mesh(to_render_mesh(&trimesh, smooth), Vec3::ONE))
             }
             _ => None,
         };
 
         if let Some(ref mut n) = node {
-            n.set_color(color);
+            n.set_color_recursive(color);
+            // Meshes are drawn from both sides: a soft body's surface is routinely seen from
+            // the inside (a crushed or inverted body), and an authored mesh's winding is not
+            // guaranteed either.
+            n.enable_backface_culling_recursive(false);
             if sensor {
-                n.set_surface_rendering_activation(false);
-                n.set_lines_width(1.0, false);
+                // Sensors are translucent, like their instanced counterparts: an explicit
+                // Blend mode routes the node to the transparency pass whatever its default
+                // (see `ShapeTemplate`), and its color includes the sensor opacity.
+                n.apply_to_objects_mut_recursive(&mut |o| {
+                    o.set_alpha_mode(kiss3d::scene::AlphaMode::Blend)
+                });
             }
         }
 
@@ -622,6 +1138,7 @@ impl GraphicsManager {
         shape: &dyn Shape,
         color: Color,
         _sensor: bool,
+        _smooth: bool,
     ) -> Option<SceneNode2d> {
         let mut node = match shape.shape_type() {
             ShapeType::Triangle => {
@@ -674,32 +1191,14 @@ impl GraphicsManager {
                 ];
                 Some(scene.add_polyline(vertices, None, 0.1))
             }
-            ShapeType::Polyline => {
-                // Render polyline as connected thin quads
-                let polyline = shape.as_polyline().unwrap();
-                let vertices: Vec<Vec2> = polyline
-                    .vertices()
-                    .iter()
-                    .map(|pt| Vec2::new(pt.x as f32, pt.y as f32))
-                    .collect();
-                Some(
-                    scene
-                        .add_polyline(vertices, Some(polyline.indices().to_vec()), 0.2)
-                        .set_lines_color(Some(GROUND_COLOR)),
-                )
-            }
-            ShapeType::HeightField => {
-                let hf = shape.as_heightfield().unwrap();
-                let (polyline_verts, indices) = hf.to_polyline();
-                let vertices: Vec<Vec2> = polyline_verts
-                    .iter()
-                    .map(|pt| Vec2::new(pt.x as f32, pt.y as f32))
-                    .collect();
-                Some(
-                    scene
-                        .add_polyline(vertices, Some(indices), 0.2)
-                        .set_lines_color(Some(GROUND_COLOR)),
-                )
+            ShapeType::Polyline | ShapeType::HeightField => {
+                // A stroked mesh rather than raw lines: the joins are covered, the stroke takes
+                // the collider's color like any other surface, and a deforming polyline can be
+                // followed by rewriting its vertices.
+                let (vertices, segments) = polyline_geometry(shape)?;
+                let (vtx, idx) = stroked_polyline(&vertices, &segments);
+                let mesh = GpuMesh2d::new(vtx, idx, None, false);
+                Some(scene.add_mesh(Rc::new(RefCell::new(mesh)), Vec2::ONE))
             }
             ShapeType::Voxels => {
                 let voxels = shape.as_voxels().unwrap();
@@ -727,7 +1226,7 @@ impl GraphicsManager {
         };
 
         if let Some(ref mut n) = node {
-            n.set_color(color);
+            n.set_color_recursive(color);
         }
 
         node
@@ -737,16 +1236,21 @@ impl GraphicsManager {
     pub fn draw(
         &mut self,
         flags: TestbedStateFlags,
-        _bodies: &RigidBodySet,
+        bodies: &RigidBodySet,
         colliders: &ColliderSet,
+        soft_bodies: &SoftBodySet,
     ) {
-        let draw_surfaces = flags.contains(TestbedStateFlags::DRAW_SURFACES);
+        self.draw_surfaces = flags.contains(TestbedStateFlags::DRAW_SURFACES);
+        self.smooth_mesh_colliders = flags.contains(TestbedStateFlags::SMOOTH_MESH_COLLIDERS);
+        let show_colliders = self.draw_surfaces && self.colliders_visible;
+        let show_body_meshes = self.draw_surfaces && self.body_render_meshes_visible;
+        self.update_soft_mesh_nodes(soft_bodies, show_colliders);
 
         // Update instance data for all templates
         for (template_type, template) in &mut self.templates {
-            template
-                .node
-                .set_visible(draw_surfaces && !template.colliders.is_empty());
+            let visible = show_colliders && !template.colliders.is_empty();
+            template.node.set_visible(visible);
+            template.transparent_node.set_visible(visible);
 
             if template.colliders.is_empty() {
                 continue;
@@ -825,6 +1329,9 @@ impl GraphicsManager {
                                 ic.half_extents.z as f32,
                             )
                         }
+                        // Convex meshes bake their geometry into the template
+                        // at unit scale, so no per-instance scaling.
+                        ShapeTemplateType::Convex(_) => Vec3::ONE,
                     };
 
                     let scale_mat = Mat3::from_diagonal(scale);
@@ -842,19 +1349,58 @@ impl GraphicsManager {
                 })
                 .collect();
 
-            template.node.set_instances(&instances);
+            // Route each instance to the node whose pass matches its opacity so
+            // translucent instances (e.g. sensors) blend instead of drawing
+            // opaque (see `ShapeTemplate`).
+            let (transparent, opaque): (Vec<_>, Vec<_>) =
+                instances.into_iter().partition(|i| i.color.a < 1.0);
+            template.node.set_instances(&opaque);
+            template.transparent_node.set_instances(&transparent);
         }
 
-        // Update individual nodes
-        for node in &mut self.individual_nodes {
-            node.node.set_visible(draw_surfaces);
+        // Update individual nodes. Colliders are colliders — whatever
+        // their shape — and follow the collider visibility toggle.
+        // The MJCF loader synthesizes a separate visual-mesh entry for
+        // any mesh-typed collision-active geom that isn't otherwise
+        // mirrored by a visual-only counterpart on the same body, so
+        // "Render visual meshes" still shows the full geometry of
+        // those models without conflating channels.
+        for index in 0..self.individual_nodes.len() {
+            let Some(co) = colliders.get(self.individual_nodes[index].collider) else {
+                self.individual_nodes[index]
+                    .node
+                    .set_visible(show_colliders);
+                continue;
+            };
+            let hidden_by_skin = is_hidden_by_skin(co, soft_bodies);
+            self.individual_nodes[index]
+                .node
+                .set_visible(show_colliders && !hidden_by_skin);
+            // The shading choice changed under a mesh: its vertices are shared or unshared, so
+            // the node is built anew.
+            if co.shape().as_trimesh().is_some()
+                && self.individual_nodes[index].smooth != self.smooth_mesh_colliders
+            {
+                self.rebuild_individual_node(index, co);
+            }
+            self.update_deformable_collider(index, co);
+            let node = &mut self.individual_nodes[index];
+            let co_pos = *co.position() * node.delta;
+            node.node
+                .set_pose(co_pos.append_translation(self.gfx_shift).into());
+            node.node
+                .set_color_recursive(node.tmp_color.take().unwrap_or(node.color));
+        }
 
-            if let Some(co) = colliders.get(node.collider) {
-                let co_pos = *co.position() * node.delta;
+        // Update body-attached render-only nodes (e.g. MJCF visual meshes).
+        for node in &mut self.body_attached_nodes {
+            node.node.set_visible(show_body_meshes);
+
+            if let Some(rb) = bodies.get(node.body) {
+                let pose = *rb.position() * node.delta;
                 node.node
-                    .set_pose(co_pos.append_translation(self.gfx_shift).into());
-                node.node
-                    .set_color(node.tmp_color.take().unwrap_or(node.color));
+                    .set_pose(pose.append_translation(self.gfx_shift).into());
+                node.node.set_color(node.color);
             }
         }
     }
@@ -865,14 +1411,17 @@ impl GraphicsManager {
         flags: TestbedStateFlags,
         _bodies: &RigidBodySet,
         colliders: &ColliderSet,
+        soft_bodies: &SoftBodySet,
     ) {
-        let draw_surfaces = flags.contains(TestbedStateFlags::DRAW_SURFACES);
+        self.draw_surfaces = flags.contains(TestbedStateFlags::DRAW_SURFACES);
+        let show_colliders = self.draw_surfaces && self.colliders_visible;
+        self.update_soft_mesh_nodes(soft_bodies, show_colliders);
 
         // Update instance data for all templates
         for (template_type, template) in &mut self.templates {
-            template
-                .node
-                .set_visible(draw_surfaces && !template.colliders.is_empty());
+            let visible = show_colliders && !template.colliders.is_empty();
+            template.node.set_visible(visible);
+            template.transparent_node.set_visible(visible);
 
             if template.colliders.is_empty() {
                 continue;
@@ -921,6 +1470,9 @@ impl GraphicsManager {
                             // Cuboid template is 2x2, scale by half_extents
                             Vec2::new(ic.half_extents.x as f32, ic.half_extents.y as f32)
                         }
+                        // Convex polygons bake their geometry into the template
+                        // at unit scale, so no per-instance scaling.
+                        ShapeTemplateType::Convex(_) => Vec2::ONE,
                     };
 
                     let scale_mat = Mat2::from_diagonal(scale);
@@ -938,23 +1490,34 @@ impl GraphicsManager {
                 })
                 .collect();
 
-            template.node.set_instances(&instances);
+            // Split opaque and translucent instances into their respective
+            // nodes, mirroring the 3D path (see `ShapeTemplate`). 2D always
+            // alpha-blends, so this only affects draw order.
+            let (transparent, opaque): (Vec<_>, Vec<_>) =
+                instances.into_iter().partition(|i| i.color[3] < 1.0);
+            template.node.set_instances(&opaque);
+            template.transparent_node.set_instances(&transparent);
         }
 
         // Update individual nodes
-        for node in &mut self.individual_nodes {
-            node.node.set_visible(draw_surfaces);
+        for index in 0..self.individual_nodes.len() {
+            self.individual_nodes[index]
+                .node
+                .set_visible(show_colliders);
 
-            if let Some(co) = colliders.get(node.collider) {
-                let co_pos = *co.position() * node.delta;
-                node.node.set_position(Vec2::new(
-                    (co_pos.translation.x + self.gfx_shift.x) as f32,
-                    (co_pos.translation.y + self.gfx_shift.y) as f32,
-                ));
-                node.node.set_rotation(co_pos.rotation.angle() as f32);
-                node.node
-                    .set_color(node.tmp_color.take().unwrap_or(node.color));
-            }
+            let Some(co) = colliders.get(self.individual_nodes[index].collider) else {
+                continue;
+            };
+            self.update_deformable_collider(index, co);
+            let node = &mut self.individual_nodes[index];
+            let co_pos = *co.position() * node.delta;
+            node.node.set_position(Vec2::new(
+                (co_pos.translation.x + self.gfx_shift.x) as f32,
+                (co_pos.translation.y + self.gfx_shift.y) as f32,
+            ));
+            node.node.set_rotation(co_pos.rotation.angle() as f32);
+            node.node
+                .set_color_recursive(node.tmp_color.take().unwrap_or(node.color));
         }
     }
 }

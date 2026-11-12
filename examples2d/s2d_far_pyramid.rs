@@ -1,14 +1,11 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     let origin = Vector::new(100_000.0, -80_000.0);
     let friction = 0.6;
@@ -17,9 +14,8 @@ pub fn init_world(testbed: &mut Testbed) {
      * Ground
      */
     let rigid_body = RigidBodyBuilder::fixed().translation(Vector::new(0.0, -1.0) + origin);
-    let ground_handle = bodies.insert(rigid_body);
     let collider = ColliderBuilder::cuboid(100.0, 1.0).friction(friction);
-    colliders.insert_with_parent(collider, ground_handle, &mut bodies);
+    let _ = world.insert(rigid_body, collider);
 
     /*
      * Create the cubes
@@ -36,15 +32,21 @@ pub fn init_world(testbed: &mut Testbed) {
             let x = (i as f32 + 1.0) * shift + 2.0 * (j as f32 - i as f32) * shift
                 - h * base_count as f32;
             let rigid_body = RigidBodyBuilder::dynamic().translation(Vector::new(x, y) + origin);
-            let ground_handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::cuboid(h, h).friction(friction);
-            colliders.insert_with_parent(collider, ground_handle, &mut bodies);
+            let _ = world.insert(rigid_body, collider);
         }
     }
 
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::new(origin.x + 0.0, origin.y + 2.5), 20.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::new(origin.x + 0.0, origin.y + 2.5), 20.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

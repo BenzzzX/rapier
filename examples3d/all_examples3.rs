@@ -1,18 +1,33 @@
 #![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 
-use rapier_testbed3d::{Example, TestbedApp};
+use rapier_testbed3d::{ExampleEntry, TestbedViewer};
+use std::future::Future;
+use std::pin::Pin;
 
 mod utils;
 
+// Examples gated on `not(target_arch = "wasm32")` load meshes, robot
+// descriptions or scene dumps from disk, so they can't run in a browser.
+
+mod b3d_joint_grid;
+mod b3d_junkyard;
+mod b3d_large_pyramid;
+mod b3d_large_world;
+mod b3d_many_pyramids;
+mod b3d_rain;
+mod b3d_trees;
+mod b3d_washer;
 mod ccd3;
 mod character_controller3;
 mod collision_groups3;
 mod compound3;
+#[cfg(not(target_arch = "wasm32"))]
 mod convex_decomposition3;
 mod convex_polyhedron3;
 mod damping3;
 mod debug_add_remove_collider3;
+mod debug_angular_limits3;
 mod debug_articulations3;
 mod debug_balls3;
 mod debug_big_colliders3;
@@ -20,6 +35,7 @@ mod debug_boxes3;
 mod debug_chain_high_mass_ratio3;
 mod debug_cube_high_mass_ratio3;
 mod debug_cylinder3;
+#[cfg(not(target_arch = "wasm32"))]
 mod debug_deserialize3;
 mod debug_disabled3;
 mod debug_dynamic_collider_add3;
@@ -27,10 +43,12 @@ mod debug_friction3;
 mod debug_infinite_fall3;
 mod debug_internal_edges3;
 mod debug_long_chain3;
+mod debug_multi_collider_body3;
 mod debug_multibody_ang_motor_pos3;
 mod debug_pop3;
 mod debug_prismatic3;
 mod debug_rollback3;
+mod debug_self_intersect3;
 mod debug_shape_modification3;
 mod debug_sleeping_kinematic3;
 mod debug_thin_cube_on_mesh3;
@@ -38,6 +56,7 @@ mod debug_triangle3;
 mod debug_trimesh3;
 mod debug_two_cubes3;
 mod domino3;
+#[cfg(not(target_arch = "wasm32"))]
 mod dynamic_trimesh3;
 mod fountain3;
 mod gyroscopic3;
@@ -47,6 +66,10 @@ mod joint_motor_position3;
 mod joints3;
 mod keva3;
 mod locked_rotations3;
+#[cfg(not(target_arch = "wasm32"))]
+mod mjcf3;
+#[cfg(not(target_arch = "wasm32"))]
+mod mujoco_menagerie3;
 mod newton_cradle3;
 mod one_way_platforms3;
 mod platform3;
@@ -54,163 +77,208 @@ mod primitives3;
 mod restitution3;
 mod rope_joints3;
 mod sensor3;
+mod soft_bodies3;
+mod soft_cloth3;
+mod soft_cloth_stress3;
+mod soft_dress3;
+mod soft_fem3;
+mod soft_jelly3;
+mod soft_joints3;
+mod soft_meshes3;
+mod soft_pile3;
+mod soft_plasticity3;
+mod soft_surface3;
+mod soft_tearing3;
+mod soft_thin_features3;
+#[cfg(not(target_arch = "wasm32"))]
+mod soft_trimesh3;
 mod spring_joints3;
 mod stress_tests;
 mod trimesh3;
+#[cfg(not(target_arch = "wasm32"))]
 mod urdf3;
 mod vehicle_controller3;
 mod vehicle_joints3;
 mod voxels3;
 
+/// A registered example: a fn pointer running the example's owned loop.
+/// (A non-capturing closure coerces to this higher-ranked fn pointer.)
+type ExampleFn =
+    for<'a> fn(&'a mut TestbedViewer) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+
+/// `(group, name, run-fn)` -> `(ExampleEntry, ExampleFn)`.
+/// Entries accept attributes so an example can be `#[cfg]`-ed out (e.g. on wasm).
+macro_rules! examples {
+    ($($(#[$meta:meta])* $group:ident, $name:expr, $run:path);* $(;)?) => {{
+        let mut entries: Vec<(ExampleEntry, ExampleFn)> = Vec::new();
+        $(
+            $(#[$meta])*
+            entries.push((ExampleEntry::new($group, $name), (|v| Box::pin($run(v))) as ExampleFn));
+        )*
+        entries
+    }};
+}
+
 #[kiss3d::main]
 pub async fn main() {
     const COLLISIONS: &str = "Collisions";
     const DYNAMICS: &str = "Dynamics";
-    const COMPLEX: &str = "Complex Shapes";
     const JOINTS: &str = "Joints";
     const CONTROLS: &str = "Controls";
+    const SOFT: &str = "Soft bodies";
     const DEBUG: &str = "Debug";
     const ROBOTICS: &str = "Robotics";
+    const STRESS: &str = "Stress tests";
+    const B3D: &str = "Third-party benchmarks";
 
-    let mut builders: Vec<Example> = vec![
-        // ── Collisions ──────────────────────────────────────────────────────────
-        Example::new(COLLISIONS, "Fountain", fountain3::init_world),
-        Example::new(COLLISIONS, "Primitives", primitives3::init_world),
-        Example::new(COLLISIONS, "Keva tower", keva3::init_world),
-        Example::new(COLLISIONS, "Newton cradle", newton_cradle3::init_world),
-        Example::new(COLLISIONS, "Domino", domino3::init_world),
-        Example::new(COLLISIONS, "Platform", platform3::init_world),
-        Example::new(COLLISIONS, "Sensor", sensor3::init_world),
-        Example::new(COLLISIONS, "Compound", compound3::init_world),
+    // Not a `vec![]`: entries can be individually `#[cfg]`-ed out.
+    #[allow(clippy::vec_init_then_push)]
+    let examples: Vec<(ExampleEntry, ExampleFn)> = examples![
+        // ── Collisions ──────────────────────────────────────────────────────
+        COLLISIONS, "Fountain", fountain3::run;
+        COLLISIONS, "Primitives", primitives3::run;
+        COLLISIONS, "Keva tower", keva3::run;
+        COLLISIONS, "Newton cradle", newton_cradle3::run;
+        COLLISIONS, "Domino", domino3::run;
+        COLLISIONS, "Platform", platform3::run;
+        COLLISIONS, "Sensor", sensor3::run;
+        COLLISIONS, "Compound", compound3::run;
         #[cfg(not(target_arch = "wasm32"))]
-        Example::new(
-            COLLISIONS,
-            "Convex decomposition",
-            convex_decomposition3::init_world,
-        ),
-        Example::new(
-            COLLISIONS,
-            "Convex polyhedron",
-            convex_polyhedron3::init_world,
-        ),
-        Example::new(COLLISIONS, "TriMesh", trimesh3::init_world),
+        COLLISIONS, "Convex decomposition", convex_decomposition3::run;
+        COLLISIONS, "Convex polyhedron", convex_polyhedron3::run;
+        COLLISIONS, "TriMesh", trimesh3::run;
         #[cfg(not(target_arch = "wasm32"))]
-        Example::new(
-            COLLISIONS,
-            "Dynamic trimeshes",
-            dynamic_trimesh3::init_world,
-        ),
-        Example::new(COLLISIONS, "Heightfield", heightfield3::init_world),
-        Example::new(COLLISIONS, "Voxels", voxels3::init_world),
-        Example::new(
-            COLLISIONS,
-            "Collision groups",
-            collision_groups3::init_world,
-        ),
-        Example::new(
-            COLLISIONS,
-            "One-way platforms",
-            one_way_platforms3::init_world,
-        ),
-        // ── Dynamics ─────────────────────────────────────────────────────────
-        Example::new(DYNAMICS, "Locked rotations", locked_rotations3::init_world),
-        Example::new(DYNAMICS, "Restitution", restitution3::init_world),
-        Example::new(DYNAMICS, "Damping", damping3::init_world),
-        Example::new(DYNAMICS, "Gyroscopic", gyroscopic3::init_world),
-        Example::new(DYNAMICS, "CCD", ccd3::init_world),
-        // ── Joints ─────────────────────────────────────────────────────────
-        Example::new(JOINTS, "Impulse Joints", joints3::init_world_with_joints),
-        Example::new(
-            JOINTS,
-            "Multibody Joints",
-            joints3::init_world_with_articulations,
-        ),
-        Example::new(JOINTS, "Rope Joints", rope_joints3::init_world),
-        Example::new(JOINTS, "Spring Joints", spring_joints3::init_world),
-        Example::new(
-            JOINTS,
-            "Joint Motor Position",
-            joint_motor_position3::init_world,
-        ),
-        Example::new(
-            JOINTS,
-            "Inverse kinematics",
-            inverse_kinematics3::init_world,
-        ),
-        // ── Controls ─────────────────────────────────────────────────────
-        Example::new(
-            CONTROLS,
-            "Character controller",
-            character_controller3::init_world,
-        ),
-        Example::new(
-            CONTROLS,
-            "Vehicle controller",
-            vehicle_controller3::init_world,
-        ),
-        Example::new(CONTROLS, "Vehicle joints", vehicle_joints3::init_world),
-        // ── Robotics ───────────────────────────────────────────────────────
+        COLLISIONS, "Dynamic trimeshes", dynamic_trimesh3::run;
+        COLLISIONS, "Heightfield", heightfield3::run;
+        COLLISIONS, "Voxels", voxels3::run;
+        COLLISIONS, "Collision groups", collision_groups3::run;
+        COLLISIONS, "One-way platforms", one_way_platforms3::run;
+        // ── Dynamics ────────────────────────────────────────────────────────
+        DYNAMICS, "Locked rotations", locked_rotations3::run;
+        DYNAMICS, "Restitution", restitution3::run;
+        DYNAMICS, "Damping", damping3::run;
+        DYNAMICS, "Gyroscopic", gyroscopic3::run;
+        DYNAMICS, "CCD", ccd3::run;
+        // ── Joints ──────────────────────────────────────────────────────────
+        JOINTS, "Impulse Joints", joints3::run_impulse_joints;
+        JOINTS, "Multibody Joints", joints3::run_multibody_joints;
+        JOINTS, "Rope Joints", rope_joints3::run;
+        JOINTS, "Spring Joints", spring_joints3::run;
+        JOINTS, "Joint Motor Position", joint_motor_position3::run;
+        JOINTS, "Inverse kinematics", inverse_kinematics3::run;
+        // ── Soft bodies ─────────────────────────────────────────────────────
+        SOFT, "Soft bodies", soft_bodies3::run;
+        SOFT, "Cloth", soft_cloth3::run;
+        SOFT, "Jelly", soft_jelly3::run;
+        SOFT, "Soft joints", soft_joints3::run;
+        SOFT, "Cluster meshes", soft_meshes3::run;
+        SOFT, "Deformable trimeshes", soft_surface3::run;
+        SOFT, "Soft pile", soft_pile3::run;
+        SOFT, "Thin features", soft_thin_features3::run;
+        SOFT, "Cloth stress", soft_cloth_stress3::run;
+        SOFT, "Plasticity", soft_plasticity3::run;
+        SOFT, "Tearing", soft_tearing3::run;
+        SOFT, "Dancing dress", soft_dress3::run;
+        SOFT, "Soft FEM", soft_fem3::run;
         #[cfg(not(target_arch = "wasm32"))]
-        Example::new(ROBOTICS, "URDF", urdf3::init_world),
-        // ── Debug ──────────────────────────────────────────────────────────
-        Example::new(DEBUG, "Multibody joints", debug_articulations3::init_world),
-        Example::new(
-            DEBUG,
-            "Add/rm collider",
-            debug_add_remove_collider3::init_world,
-        ),
-        Example::new(DEBUG, "Big colliders", debug_big_colliders3::init_world),
-        Example::new(DEBUG, "Boxes", debug_boxes3::init_world),
-        Example::new(DEBUG, "Balls", debug_balls3::init_world),
-        Example::new(DEBUG, "Disabled", debug_disabled3::init_world),
-        Example::new(DEBUG, "Two cubes", debug_two_cubes3::init_world),
-        Example::new(DEBUG, "Pop", debug_pop3::init_world),
-        Example::new(
-            DEBUG,
-            "Dyn. collider add",
-            debug_dynamic_collider_add3::init_world,
-        ),
-        Example::new(DEBUG, "Friction", debug_friction3::init_world),
-        Example::new(DEBUG, "Internal edges", debug_internal_edges3::init_world),
-        Example::new(DEBUG, "Long chain", debug_long_chain3::init_world),
-        Example::new(
-            DEBUG,
-            "High mass ratio: chain",
-            debug_chain_high_mass_ratio3::init_world,
-        ),
-        Example::new(
-            DEBUG,
-            "High mass ratio: cube",
-            debug_cube_high_mass_ratio3::init_world,
-        ),
-        Example::new(DEBUG, "Triangle", debug_triangle3::init_world),
-        Example::new(DEBUG, "Trimesh", debug_trimesh3::init_world),
-        Example::new(DEBUG, "Thin cube", debug_thin_cube_on_mesh3::init_world),
-        Example::new(DEBUG, "Cylinder", debug_cylinder3::init_world),
-        Example::new(DEBUG, "Infinite fall", debug_infinite_fall3::init_world),
-        Example::new(DEBUG, "Prismatic", debug_prismatic3::init_world),
-        Example::new(DEBUG, "Rollback", debug_rollback3::init_world),
-        Example::new(
-            DEBUG,
-            "Shape modification",
-            debug_shape_modification3::init_world,
-        ),
-        Example::new(
-            DEBUG,
-            "Sleeping kinematics",
-            debug_sleeping_kinematic3::init_world,
-        ),
+        SOFT, "Soft trimeshes", soft_trimesh3::run;
+        // ── Controls ────────────────────────────────────────────────────────
+        CONTROLS, "Character controller", character_controller3::run;
+        CONTROLS, "Vehicle controller", vehicle_controller3::run;
+        CONTROLS, "Vehicle joints", vehicle_joints3::run;
+        // ── Robotics ────────────────────────────────────────────────────────
         #[cfg(not(target_arch = "wasm32"))]
-        Example::new(DEBUG, "Deserialize", debug_deserialize3::init_world),
-        Example::new(
-            DEBUG,
-            "Multibody ang. motor pos.",
-            debug_multibody_ang_motor_pos3::init_world,
-        ),
+        ROBOTICS, "URDF", urdf3::run;
+        #[cfg(not(target_arch = "wasm32"))]
+        ROBOTICS, "MJCF", mjcf3::run;
+        #[cfg(not(target_arch = "wasm32"))]
+        ROBOTICS, "Mujoco Menagerie", mujoco_menagerie3::run;
+        // ── Debug ───────────────────────────────────────────────────────────
+        DEBUG, "Angular limits", debug_angular_limits3::run;
+        DEBUG, "Multibody joints", debug_articulations3::run;
+        DEBUG, "Add/rm collider", debug_add_remove_collider3::run;
+        DEBUG, "Multi-collider body", debug_multi_collider_body3::run;
+        DEBUG, "Big colliders", debug_big_colliders3::run;
+        DEBUG, "Boxes", debug_boxes3::run;
+        DEBUG, "Balls", debug_balls3::run;
+        DEBUG, "Disabled", debug_disabled3::run;
+        DEBUG, "Two cubes", debug_two_cubes3::run;
+        DEBUG, "Pop", debug_pop3::run;
+        DEBUG, "Dyn. collider add", debug_dynamic_collider_add3::run;
+        DEBUG, "Friction", debug_friction3::run;
+        DEBUG, "Internal edges", debug_internal_edges3::run;
+        DEBUG, "Self intersect", debug_self_intersect3::run;
+        DEBUG, "Long chain", debug_long_chain3::run;
+        DEBUG, "High mass ratio: chain", debug_chain_high_mass_ratio3::run;
+        DEBUG, "High mass ratio: cube", debug_cube_high_mass_ratio3::run;
+        DEBUG, "Triangle", debug_triangle3::run;
+        DEBUG, "Trimesh", debug_trimesh3::run;
+        DEBUG, "Thin cube", debug_thin_cube_on_mesh3::run;
+        DEBUG, "Cylinder", debug_cylinder3::run;
+        DEBUG, "Infinite fall", debug_infinite_fall3::run;
+        DEBUG, "Prismatic", debug_prismatic3::run;
+        DEBUG, "Rollback", debug_rollback3::run;
+        DEBUG, "Shape modification", debug_shape_modification3::run;
+        DEBUG, "Sleeping kinematics", debug_sleeping_kinematic3::run;
+        #[cfg(not(target_arch = "wasm32"))]
+        DEBUG, "Deserialize", debug_deserialize3::run;
+        DEBUG, "Multibody ang. motor pos.", debug_multibody_ang_motor_pos3::run;
+        // ── Stress tests ────────────────────────────────────────────────────
+        STRESS, "Balls", stress_tests::balls3::run;
+        STRESS, "Boxes", stress_tests::boxes3::run;
+        STRESS, "Capsules", stress_tests::capsules3::run;
+        STRESS, "CCD", stress_tests::ccd3::run;
+        STRESS, "Compound", stress_tests::compound3::run;
+        STRESS, "Convex polyhedron", stress_tests::convex_polyhedron3::run;
+        STRESS, "Many kinematics", stress_tests::many_kinematics3::run;
+        STRESS, "Many static", stress_tests::many_static3::run;
+        STRESS, "Many sleep", stress_tests::many_sleep3::run;
+        STRESS, "Heightfield", stress_tests::heightfield3::run;
+        STRESS, "Stacks", stress_tests::stacks3::run;
+        STRESS, "Pyramid", stress_tests::pyramid3::run;
+        STRESS, "Trimesh", stress_tests::trimesh3::run;
+        STRESS, "ImpulseJoint ball", stress_tests::joint_ball3::run;
+        STRESS, "ImpulseJoint fixed", stress_tests::joint_fixed3::run;
+        STRESS, "ImpulseJoint revolute", stress_tests::joint_revolute3::run;
+        STRESS, "ImpulseJoint prismatic", stress_tests::joint_prismatic3::run;
+        STRESS, "Ragdoll piles", stress_tests::ragdolls3::run;
+        STRESS, "Ropes", stress_tests::ropes3::run;
+        STRESS, "Many pyramids", stress_tests::many_pyramids3::run;
+        STRESS, "Keva tower", stress_tests::keva3::run;
+        STRESS, "Ray cast", stress_tests::ray_cast3::run;
+        STRESS, "Soft blobs", stress_tests::soft_blobs3::run;
+        STRESS, "Soft jellies", stress_tests::soft_jellies3::run;
+        STRESS, "Soft ropes", stress_tests::soft_ropes3::run;
+        STRESS, "Soft cloth drape", stress_tests::soft_cloth_drape3::run;
+        STRESS, "Soft cloth on Keva tower", stress_tests::soft_cloth_keva3::run;
+        STRESS, "Soft slab shower", stress_tests::soft_slab3::run;
+        STRESS, "Soft FEM beams", stress_tests::soft_fem_beams3::run;
+        // ── Box3D benchmarks (ports of box3d/benchmark) ─────────────────────
+        B3D, "Large pyramid", b3d_large_pyramid::run;
+        B3D, "Many pyramids", b3d_many_pyramids::run;
+        B3D, "Joint grid", b3d_joint_grid::run;
+        B3D, "Junkyard", b3d_junkyard::run;
+        B3D, "Washer", b3d_washer::run;
+        B3D, "Trees 100", b3d_trees::run100;
+        B3D, "Trees 50", b3d_trees::run50;
+        B3D, "Trees 25", b3d_trees::run25;
+        B3D, "Rain", b3d_rain::run;
+        B3D, "Large world", b3d_large_world::run;
     ];
-    let mut benches = stress_tests::builders();
-    builders.append(&mut benches);
 
-    let testbed = TestbedApp::from_builders(builders);
-    testbed.run().await
+    let (entries, run_fns): (Vec<_>, Vec<ExampleFn>) = examples.into_iter().unzip();
+    let mut viewer = TestbedViewer::new(entries).await;
+
+    // The example owns its physics state and render loop; this outer loop just
+    // (re)dispatches the example the UI has selected, nexus-style.
+    loop {
+        viewer.clear_scene();
+        let idx = viewer.selected();
+        if let Err(e) = run_fns[idx](&mut viewer).await {
+            eprintln!("example #{idx} failed: {e:?}");
+        }
+        if viewer.quitting() {
+            break;
+        }
+    }
 }

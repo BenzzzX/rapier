@@ -1,13 +1,8 @@
 //! Testbed state types and flags.
 
 use bitflags::bitflags;
-use na::Point3;
 
-#[cfg(feature = "dim3")]
-use rapier::control::DynamicRayCastVehicleController;
-
-use crate::harness::RapierBroadPhaseType;
-use crate::physics::PhysicsSnapshot;
+use crate::physics::{PhysicsSnapshot, RapierBroadPhaseType};
 use crate::save::SerializableTestbedState;
 use crate::settings::ExampleSettings;
 
@@ -18,6 +13,17 @@ pub enum RunMode {
     #[default]
     Stop,
     Step,
+}
+
+/// A loop transition requested from the UI: stop entirely, or switch to another
+/// example (or re-run the current one). The target is stored in
+/// [`TestbedState::selected_display_index`]; this only signals the
+/// example-owned `while viewer.render_frame()` loop to exit so the outer demo
+/// runner can dispatch the next example.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Transition {
+    Quit,
+    Switch,
 }
 
 bitflags! {
@@ -35,6 +41,9 @@ bitflags! {
         const WIREFRAME = 1 << 8;
         const STATISTICS = 1 << 9;
         const DRAW_SURFACES = 1 << 10;
+        /// Soft-body surfaces rendered with shared vertices (smooth per-vertex normals)
+        /// instead of flat-shaded triangles (3D).
+        const SMOOTH_MESH_COLLIDERS = 1 << 11;
     }
 }
 
@@ -45,22 +54,22 @@ impl Default for TestbedStateFlags {
 }
 
 bitflags! {
-    /// Flags for testbed actions that need to be processed
+    /// Flags for in-frame testbed actions applied to the borrowed world.
+    ///
+    /// Example switching / restart / backend changes are no longer flags — they
+    /// are handled by [`Transition`], which makes the example's render loop exit
+    /// so the outer demo runner re-dispatches.
     #[derive(Copy, Clone, PartialEq, Eq, Debug)]
     pub struct TestbedActionFlags: u32 {
         const RESET_WORLD_GRAPHICS = 1 << 0;
-        const EXAMPLE_CHANGED = 1 << 1;
-        const RESTART = 1 << 2;
-        const BACKEND_CHANGED = 1 << 3;
         const TAKE_SNAPSHOT = 1 << 4;
         const RESTORE_SNAPSHOT = 1 << 5;
         const APP_STARTED = 1 << 6;
+        /// Recenter the camera so the entire scene is visible and fills
+        /// the viewport.
+        const FRAME_SCENE = 1 << 7;
     }
 }
-
-pub(crate) const RAPIER_BACKEND: usize = 0;
-pub(crate) const PHYSX_BACKEND_PATCH_FRICTION: usize = 1;
-pub(crate) const PHYSX_BACKEND_TWO_FRICTION_DIR: usize = 2;
 
 /// Which tab is currently selected in the UI
 #[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
@@ -69,91 +78,182 @@ pub enum UiTab {
     Examples,
     Settings,
     Performance,
+    /// What the debug renderer draws, and how.
+    DebugRender,
 }
 
-/// Information about an example for UI display
+/// Information about an example for UI display.
 #[derive(Clone, Debug)]
 pub struct ExampleEntry {
     pub name: &'static str,
     pub group: &'static str,
-    /// Index in the original builders array
-    pub builder_index: usize,
+}
+
+impl ExampleEntry {
+    pub fn new(group: &'static str, name: &'static str) -> Self {
+        Self { name, group }
+    }
+}
+
+/// Wall-clock times of the recent frames, for the performance tab: the step counters only hold
+/// the last step, and a frame also spends time outside of it (scene update, UI). The renderer's
+/// present (which waits for vsync) is left out, so the numbers do not saturate at the refresh rate.
+#[derive(Default)]
+pub struct FrameStats {
+    /// When the renderer last handed control back, or `None` before the first render.
+    resumed_at: Option<web_time::Instant>,
+    last_timestep: usize,
+    /// `(frame_ms, step_ms)` of the recent frames, oldest first.
+    samples: std::collections::VecDeque<(f64, f64)>,
+}
+
+impl FrameStats {
+    /// The number of frames the statistics cover.
+    pub const WINDOW: usize = 60;
+
+    /// Records the frame that just ended (everything since the last [`Self::resume`]), with
+    /// `step_ms` counted only if a step ran during it. Called right before rendering.
+    pub fn record(&mut self, timestep_id: usize, step_ms: f64) {
+        if let Some(resumed_at) = self.resumed_at.take() {
+            let step_ms = if timestep_id != self.last_timestep {
+                step_ms
+            } else {
+                0.0
+            };
+            if self.samples.len() == Self::WINDOW {
+                let _ = self.samples.pop_front();
+            }
+            let frame_ms = resumed_at.elapsed().as_secs_f64() * 1000.0;
+            self.samples.push_back((frame_ms, step_ms));
+        }
+        self.last_timestep = timestep_id;
+    }
+
+    /// Starts timing the next frame. Called right after the renderer returns, so the time it
+    /// spends presenting (and waiting for vsync) is not counted.
+    pub fn resume(&mut self) {
+        self.resumed_at = Some(web_time::Instant::now());
+    }
+
+    /// The mean `(frame, step)` times over the window, in milliseconds.
+    pub fn mean_ms(&self) -> (f64, f64) {
+        let n = self.samples.len().max(1) as f64;
+        let (frame, step) = self
+            .samples
+            .iter()
+            .fold((0.0, 0.0), |acc, s| (acc.0 + s.0, acc.1 + s.1));
+        (frame / n, step / n)
+    }
+
+    /// The longest `(frame, step)` times over the window, in milliseconds.
+    pub fn max_ms(&self) -> (f64, f64) {
+        self.samples
+            .iter()
+            .fold((0.0, 0.0), |acc, s| (acc.0.max(s.0), acc.1.max(s.1)))
+    }
 }
 
 /// State for the testbed application
 pub struct TestbedState {
     pub running: RunMode,
-    pub draw_colls: bool,
-    #[cfg(feature = "dim3")]
-    pub vehicle_controller: Option<DynamicRayCastVehicleController>,
-    pub grabbed_object_plane: (Point3<f32>, na::Vector3<f32>),
     pub can_grab_behind_ground: bool,
-    pub drawing_ray: Option<na::Point2<f32>>,
     pub prev_flags: TestbedStateFlags,
     pub flags: TestbedStateFlags,
     pub action_flags: TestbedActionFlags,
-    pub backend_names: Vec<&'static str>,
+    /// Pending loop transition (example switch / quit) requested from the UI.
+    pub transition: Option<Transition>,
+    /// `true` while a restart / solver-parameter change is the reason for a
+    /// pending [`Transition::Switch`]; such switches preserve the user's
+    /// example-setting edits, whereas selecting a different example clears them.
+    pub preserve_settings_on_switch: bool,
     /// Examples in display order (grouped, then by original order within group)
     pub examples: Vec<ExampleEntry>,
     /// Unique group names in order of first appearance
     pub example_groups: Vec<&'static str>,
     /// Currently selected position in the display order
     pub selected_display_index: usize,
-    pub selected_backend: usize,
     pub example_settings: ExampleSettings,
+    /// The soft-body recovery toggles (see `SoftRecoverySettings`): owned by the testbed
+    /// and stamped onto the running world every frame, so the panel's choices survive
+    /// demo restarts and switches.
+    pub soft_recovery: rapier::dynamics::SoftRecoverySettings,
+    /// Extra PGS iterations the solver panel's slider applies to every soft body when moved.
+    pub soft_additional_pgs: usize,
     pub broad_phase_type: RapierBroadPhaseType,
-    pub physx_use_two_friction_directions: bool,
     pub snapshot: Option<PhysicsSnapshot>,
-    pub nsteps: usize,
+    /// Number of physics steps run since the example was (re)started. Bumped by
+    /// [`crate::TestbedViewer::simulating`], and kept through snapshot
+    /// save/restore so a restored world reports the step it was saved at.
+    pub timestep_id: usize,
     pub camera_locked: bool,
     pub selected_tab: UiTab,
     pub prev_save_data: SerializableTestbedState,
+    /// Unit up-vector kept in sync with the camera (see
+    /// [`crate::TestbedViewer::set_up_axis`]). The gravity slider in the
+    /// testbed UI reads this so it can keep gravity aligned with "down"
+    /// (`-up_axis`) instead of the hard-coded Y-axis it used to assume.
+    /// Defaults to `Vector::Y`.
+    pub up_axis: rapier::math::Vector,
+    /// Recent frame and step times, shown by the performance tab.
+    pub frame_stats: FrameStats,
+    /// Thread pool running the physics step, shared across example reloads: sized
+    /// to the performance cores (efficiency cores stall the solver's
+    /// barrier-paced parallel stages). Built lazily on the first `set_world`.
+    #[cfg(feature = "parallel")]
+    pub physics_thread_pool: Option<std::sync::Arc<rapier::rayon::ThreadPool>>,
 }
 
 impl Default for TestbedState {
     fn default() -> Self {
-        #[allow(unused_mut)]
-        let mut backend_names = vec!["rapier"];
-        #[cfg(all(feature = "dim3", feature = "other-backends"))]
-        backend_names.push("physx (patch friction)");
-        #[cfg(all(feature = "dim3", feature = "other-backends"))]
-        backend_names.push("physx (two friction dir)");
-
         let flags = TestbedStateFlags::default();
         Self {
             running: RunMode::Running,
-            draw_colls: false,
-            #[cfg(feature = "dim3")]
-            vehicle_controller: None,
-            grabbed_object_plane: (Point3::origin(), na::zero()),
             can_grab_behind_ground: false,
-            drawing_ray: None,
             snapshot: None,
+            timestep_id: 0,
             prev_flags: flags,
             flags,
-            action_flags: TestbedActionFlags::APP_STARTED | TestbedActionFlags::EXAMPLE_CHANGED,
-            backend_names,
+            action_flags: TestbedActionFlags::APP_STARTED,
+            transition: None,
+            preserve_settings_on_switch: false,
             examples: Vec::new(),
             example_groups: Vec::new(),
             example_settings: ExampleSettings::default(),
+            soft_recovery: Default::default(),
+            soft_additional_pgs: 3,
             selected_display_index: 0,
-            selected_backend: RAPIER_BACKEND,
             broad_phase_type: RapierBroadPhaseType::default(),
-            physx_use_two_friction_directions: true,
-            nsteps: 1,
             camera_locked: false,
             selected_tab: UiTab::default(),
             prev_save_data: SerializableTestbedState::default(),
+            up_axis: rapier::math::Vector::Y,
+            frame_stats: FrameStats::default(),
+            #[cfg(feature = "parallel")]
+            physics_thread_pool: None,
         }
     }
 }
 
 impl TestbedState {
-    /// Get the builder index for the currently selected example
-    pub fn selected_builder_index(&self) -> usize {
-        self.examples
-            .get(self.selected_display_index)
-            .map(|e| e.builder_index)
-            .unwrap_or(0)
+    /// Builds the grouped display order from a flat list of examples.
+    pub fn set_examples(&mut self, examples: Vec<ExampleEntry>) {
+        use indexmap::IndexSet;
+
+        let mut groups: IndexSet<&'static str> = IndexSet::new();
+        for example in &examples {
+            groups.insert(example.group);
+        }
+
+        let mut ordered = Vec::new();
+        for group in &groups {
+            for example in &examples {
+                if example.group == *group {
+                    ordered.push(example.clone());
+                }
+            }
+        }
+
+        self.example_groups = groups.into_iter().collect();
+        self.examples = ordered;
     }
 }

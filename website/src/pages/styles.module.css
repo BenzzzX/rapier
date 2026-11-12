@@ -1,0 +1,71 @@
+/* stylelint-disable docusaurus/copyright-header */
+
+/**
+ * CSS files with the .module.css suffix will be treated as CSS modules
+ * and scoped locally.
+ */
+
+.heroBanner {
+  padding: 4rem 0;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  /* Warm parchment band, tuned for the logo's copper/teal palette. */
+  background-image: linear-gradient(160deg, #f7f1e8 0%, #e0cdb6 100%);
+  --ifm-hero-text-color: #3a241b;
+}
+
+/* Slightly deeper in dark mode so the band doesn't glare. */
+html[data-theme='dark'] .heroBanner {
+  background-image: linear-gradient(160deg, #e9dccb 0%, #cbb69c 100%);
+}
+
+@media screen and (max-width: 966px) {
+  .heroBanner {
+    padding: 2rem;
+  }
+}
+
+.getStarted {
+  color: #3a241b;
+  border-color: #3a241b;
+}
+
+.getStarted:hover {
+  background-color: #3a241b;
+  border-color: #3a241b;
+  color: #f7f1e8;
+}
+
+.buttons {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.features {
+  display: flex;
+  align-items: center;
+  padding: 2rem 0;
+  width: 100%;
+}
+
+.sponsors {
+  display: flex;
+  align-items: center;
+  padding: 2rem 0;
+  width: 100%;
+  background: var(--ifm-color-primary-lightest);
+  color: var(--ifm-font-color-base-inverse);
+  font-size: 1.25em;
+}
+
+.featureImage {
+  height: 200px;
+  width: 200px;
+}
+
+iframe {
+  width: 100%;
+  border: none;
+}

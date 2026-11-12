@@ -4,6 +4,12 @@ members = [
     "crates/fracture_core",
     "crates/fracture_rapier",
     "crates/fracture_voxel",
+    "bindings/c/testbed/tools/logo-mesh",
+    "bindings/c/rapier-c-macros",
+    "bindings/c/rapier2d-ffi",
+    "bindings/c/rapier3d-ffi",
+    "bindings/c/rapier2d-f64-ffi",
+    "bindings/c/rapier3d-f64-ffi",
     "crates/rapier2d",
     "crates/rapier2d-f64",
     "crates/rapier_testbed2d",
@@ -17,11 +23,40 @@ members = [
     "examples3d-f64",
     "crates/rapier3d-urdf",
     "crates/rapier3d-meshloader",
+    "crates/mjcf-rs",
+    "crates/rapier3d-mjcf",
+    "bindings/python/rapier-py-3d",
 ]
+# Bare `cargo build` / `cargo test` / `cargo clippy` only touches the
+# pure-Rust crates. The Python-binding crates need a Python build env
+# (pyo3 `extension-module`) and are exercised by the dedicated
+# `.github/workflows/python-bindings.yml` workflow via explicit
+# `-p rapier-py-*` invocations. C ABI crates are tested separately by
+# `.github/workflows/c-bindings.yml`, including native C/C++ consumers.
+default-members = [
+    "crates/rapier2d",
+    "crates/rapier2d-f64",
+    "crates/rapier_testbed2d",
+    "crates/rapier_testbed2d-f64",
+    "examples2d",
+    "crates/rapier3d",
+    "crates/rapier3d-f64",
+    "crates/rapier_testbed3d",
+    "crates/rapier_testbed3d-f64",
+    "examples3d",
+    "examples3d-f64",
+    "crates/rapier3d-urdf",
+    "crates/rapier3d-meshloader",
+    "crates/mjcf-rs",
+    "crates/rapier3d-mjcf",
+]
+# `bindings/typescript/` and `bindings/bevy_rapier/` have their own Cargo workspaces; keep them out of
+# this one so root-level `cargo` commands never try to absorb their crates.
+exclude = ["bindings/typescript", "bindings/bevy_rapier"]
 resolver = "2"
 
 [workspace.package]
-version = "0.32.0"
+version = "0.36.1"
 authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
 homepage = "https://rapier.rs"
 repository = "https://github.com/dimforge/rapier"
@@ -41,38 +76,85 @@ needless_lifetimes = "allow"
 
 [workspace.dependencies]
 # Core math
-nalgebra = { version = "0.34", default-features = false, features = ["macros", "alloc"] }
-glamx = { version = "0.1", default-features = false, features = ["nalgebra"] }
-simba = { version = "0.9.1", default-features = false }
+nalgebra = { version = "0.35", default-features = false, features = ["macros"] }
+glamx = { version = "0.3.1", default-features = false }
+simba = { version = "0.10.2", default-features = false }
 num-traits = { version = "0.2", default-features = false }
 approx = { version = "0.5", default-features = false }
 
 # Parry (each crate picks its own variant)
-parry2d = { version = "0.26.0", default-features = false, features = ["required-features", "alloc"] }
-parry3d = { version = "0.26.0", default-features = false, features = ["required-features", "alloc"] }
-parry2d-f64 = { version = "0.26.0", default-features = false, features = ["required-features", "alloc"] }
-parry3d-f64 = { version = "0.26.0", default-features = false, features = ["required-features", "alloc"] }
+parry2d = { version = "0.31.1", default-features = false, features = ["required-features"] }
+parry3d = { version = "0.31.1", default-features = false, features = ["required-features"] }
+parry2d-f64 = { version = "0.31.1", default-features = false, features = ["required-features"] }
+parry3d-f64 = { version = "0.31.1", default-features = false, features = ["required-features"] }
 
 # Utilities
+arrayvec = { version = "0.7", default-features = false }
 bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 thiserror = { version = "2", default-features = false }
 profiling = "1.0"
 static_assertions = "1"
-wide = { version = "0.7.1", default-features = false }
+wide = { version = "1", default-features = false }
 
 # Optional (optional = true must be set per-crate, not here)
 web-time = "1.1"
 rayon = "1"
-serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+
+# Testbed / rendering / tooling
+rand = "0.10"
+rand_pcg = "0.10"
+num_cpus = "1"
+libc = "0.2"
+Inflector = "0.11"
+md5 = "0.8"
+egui = "0.34"
+puffin_egui = "0.30"
+indexmap = { version = "2", features = ["serde"] }
+kiss3d = { version = "0.45.0", features = ["egui", "serde"] }
+env_logger = "0.11"
+anyhow = "1"
+
+# Loaders / assets
+urdf-rs = "0.9"
+mesh-loader = "0.1.13"
+roxmltree = "0.20"
+
+# Example-only
+lyon = "0.17"
+dot_vox = "5"
+usvg = "0.14"
+obj-rs = { version = "0.7", default-features = false }
+# NOTE: no `fast-math` — cargo feature unification would switch it on for every
+# build whose graph includes the examples, and it re-enables FMA contraction in
+# glam's sse2 backend (a cross-platform determinism hazard).
+glam = { version = "0.33" }
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+
+# Internal crates (paths are relative to the workspace root)
+rapier2d = { version = "0.36.1", path = "crates/rapier2d" }
+rapier2d-f64 = { version = "0.36.1", path = "crates/rapier2d-f64" }
+rapier3d = { version = "0.36.1", path = "crates/rapier3d" }
+rapier3d-f64 = { version = "0.36.1", path = "crates/rapier3d-f64" }
+rapier_testbed2d = { version = "0.36.1", path = "crates/rapier_testbed2d" }
+rapier_testbed2d-f64 = { version = "0.36.1", path = "crates/rapier_testbed2d-f64" }
+rapier_testbed3d = { version = "0.36.1", path = "crates/rapier_testbed3d" }
+rapier_testbed3d-f64 = { version = "0.36.1", path = "crates/rapier_testbed3d-f64" }
+rapier3d-urdf = { version = "0.36.1", path = "crates/rapier3d-urdf" }
+rapier3d-meshloader = { version = "0.36.1", path = "crates/rapier3d-meshloader", default-features = false }
+mjcf-rs = { version = "0.36.1", path = "crates/mjcf-rs" }
+rapier3d-mjcf = { version = "0.36.1", path = "crates/rapier3d-mjcf" }
 
 # Dev
 bincode = "1"
 serde_json = "1"
 oorandom = { version = "11", default-features = false }
+tempfile = "3"
 
 [patch.crates-io]
-#wrapped2d = { git = "https://github.com/Bastacyclop/rust_box2d.git" }
 #xurdf = { path = "../xurdf/xurdf" }
 
 #simba = { path = "../simba" }
@@ -86,22 +168,21 @@ oorandom = { version = "11", default-features = false }
 #wide = { path = "../wide" }
 #glamx = { path = "../glamx" }
 
-#kiss3d = { git = "https://github.com/sebcrozet/kiss3d" }
+#kiss3d = { git = "https://github.com/sebcrozet/kiss3d", branch = "render-2d" }
 #nalgebra = { git = "https://github.com/dimforge/nalgebra", branch = "dev" }
-#parry2d = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry3d = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry2d-f64 = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry3d-f64 = { git = "https://github.com/dimforge/parry", branch = "master" }
+#glamx = { git = "https://github.com/dimforge/glamx", branch = "fix-lerp2" }
+#parry2d = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry3d = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry2d-f64 = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry3d-f64 = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
 
-# See https://github.com/EmbarkStudios/puffin/pull/234
-puffin_egui = { git = "https://github.com/tedsteen/puffin.git", rev = "11771ebe00fd257aedbb545df3339ad597b1cc34" }
 
 
 # # For feature unstable-puffin-pr-235
 # # See https://github.com/dimforge/rapier/issues/760.
 # puffin_egui = { version = "0.29", optional = true, git = "https://github.com/Vrixyz/puffin.git", branch = "expose_ui_options" }
 # puffin = { version = "0.19", optional = true, git = "https://github.com/Vrixyz/puffin.git", branch = "expose_ui_options" }
-# # 
+
 
 [profile.release]
 #debug = true

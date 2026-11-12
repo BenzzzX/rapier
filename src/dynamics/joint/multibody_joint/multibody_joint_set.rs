@@ -3,46 +3,10 @@ use parry::utils::hashset::HashSet;
 
 use crate::data::{Arena, Coarena, Index};
 use crate::dynamics::joint::MultibodyLink;
-use crate::dynamics::{GenericJoint, Multibody, MultibodyJoint, RigidBodyHandle};
+use crate::dynamics::{
+    GenericJoint, Multibody, MultibodyIndex, MultibodyJoint, MultibodyJointHandle, RigidBodyHandle,
+};
 use crate::geometry::{InteractionGraph, RigidBodyGraphIndex};
-
-/// The unique handle of an multibody_joint added to a `MultibodyJointSet`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
-#[repr(transparent)]
-pub struct MultibodyJointHandle(pub Index);
-
-/// The temporary index of a multibody added to a `MultibodyJointSet`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
-#[repr(transparent)]
-pub struct MultibodyIndex(pub Index);
-
-impl MultibodyJointHandle {
-    /// Converts this handle into its (index, generation) components.
-    pub fn into_raw_parts(self) -> (u32, u32) {
-        self.0.into_raw_parts()
-    }
-
-    /// Reconstructs an handle from its (index, generation) components.
-    pub fn from_raw_parts(id: u32, generation: u32) -> Self {
-        Self(Index::from_raw_parts(id, generation))
-    }
-
-    /// An always-invalid rigid-body handle.
-    pub fn invalid() -> Self {
-        Self(Index::from_raw_parts(
-            crate::INVALID_U32,
-            crate::INVALID_U32,
-        ))
-    }
-}
-
-impl Default for MultibodyJointHandle {
-    fn default() -> Self {
-        Self::invalid()
-    }
-}
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -98,6 +62,17 @@ pub struct MultibodyJointSet {
     pub(crate) to_wake_up: HashSet<RigidBodyHandle>,
     /// A set of rigid-body pairs to join in the island manager during the next timestep.
     pub(crate) to_join: HashSet<(RigidBodyHandle, RigidBodyHandle)>,
+    /// Multibodies whose structure changed (created, merged, split, removed):
+    /// the persistent islands update each one's internal connectivity chain
+    /// at the start of the next timestep, in order. Ids of *removed*
+    /// multibodies are pushed too (the update then only unlinks).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) island_chain_events: Vec<MultibodyIndex>,
+    /// Epoch bumped whenever a rigid-body's multibody membership can change
+    /// (multibody joint insertion/removal). Lets the narrow-phase's persistent
+    /// solver contact graph detect that its two-body vs. generic (multibody)
+    /// manifold classification may be stale and must be rebuilt.
+    pub(crate) topology_epoch: u32,
 }
 
 impl MultibodyJointSet {
@@ -109,6 +84,8 @@ impl MultibodyJointSet {
             connectivity_graph: InteractionGraph::new(),
             to_wake_up: HashSet::default(),
             to_join: HashSet::default(),
+            island_chain_events: Vec::new(),
+            topology_epoch: 0,
         }
     }
 
@@ -192,6 +169,7 @@ impl MultibodyJointSet {
             .add_edge(link1.graph_id, link2.graph_id, ());
         self.rb2mb.insert(body1.0, link1);
         self.rb2mb.insert(body2.0, link2);
+        self.topology_epoch = self.topology_epoch.wrapping_add(1);
 
         let mb2 = self.multibodies.remove(link2.multibody.0).unwrap();
         let multibody1 = &mut self.multibodies[link1.multibody.0];
@@ -210,6 +188,9 @@ impl MultibodyJointSet {
         }
 
         self.to_join.insert((body1, body2));
+        // `link2.multibody` was consumed by the merge; `link1.multibody` grew.
+        self.island_chain_events.push(link2.multibody);
+        self.island_chain_events.push(link1.multibody);
 
         // Because each rigid-body can only have one parent link,
         // we can use the second rigid-body’s handle as the multibody_joint’s
@@ -221,7 +202,9 @@ impl MultibodyJointSet {
     #[profiling::function]
     pub fn remove(&mut self, handle: MultibodyJointHandle, wake_up: bool) {
         if let Some(removed) = self.rb2mb.get(handle.0).copied() {
+            self.topology_epoch = self.topology_epoch.wrapping_add(1);
             let multibody = self.multibodies.remove(removed.multibody.0).unwrap();
+            self.island_chain_events.push(removed.multibody);
 
             // Remove the edge from the connectivity graph.
             if let Some(parent_link) = multibody.link(removed.id).unwrap().parent_id() {
@@ -245,11 +228,17 @@ impl MultibodyJointSet {
                     if multibody.num_links() == 1 {
                         // We don’t have any multibody_joint attached to this body, remove it.
                         let isolated_link = multibody.link(0).unwrap();
-                        let isolated_graph_id =
-                            self.rb2mb.get(isolated_link.rigid_body.0).unwrap().graph_id;
-                        if let Some(other) = self.connectivity_graph.remove_node(isolated_graph_id)
+
+                        // This body no longer has any multibody_joint attached: remove it from
+                        // the `rb2mb` mapping since it doesn’t have any multibody associated anymore.
+                        let isolated = self
+                            .rb2mb
+                            .remove(isolated_link.rigid_body.0, Default::default())
+                            .unwrap();
+                        if let Some(other) = self.connectivity_graph.remove_node(isolated.graph_id)
                         {
-                            self.rb2mb.get_mut(other.0).unwrap().graph_id = isolated_graph_id;
+                            // Update graph index due to the `remove_node` swap-remove.
+                            self.rb2mb.get_mut(other.0).unwrap().graph_id = isolated.graph_id;
                         }
                     } else {
                         let mb_id = self.multibodies.insert(multibody);
@@ -258,6 +247,7 @@ impl MultibodyJointSet {
                             ids.multibody = MultibodyIndex(mb_id);
                             ids.id = link.internal_id;
                         }
+                        self.island_chain_events.push(MultibodyIndex(mb_id));
                     }
                 }
             }
@@ -268,8 +258,10 @@ impl MultibodyJointSet {
     #[profiling::function]
     pub fn remove_multibody_articulations(&mut self, handle: RigidBodyHandle, wake_up: bool) {
         if let Some(removed) = self.rb2mb.get(handle.0).copied() {
+            self.topology_epoch = self.topology_epoch.wrapping_add(1);
             // Remove the multibody.
             let multibody = self.multibodies.remove(removed.multibody.0).unwrap();
+            self.island_chain_events.push(removed.multibody);
             for link in multibody.links() {
                 let rb_handle = link.rigid_body;
 
@@ -312,7 +304,7 @@ impl MultibodyJointSet {
 
     /// Returns the link of this multibody attached to the given rigid-body.
     ///
-    /// Returns `None` if `rb` isn’t part of any rigid-body.
+    /// Returns `None` if `rb` isn’t part of any multibody.
     pub fn rigid_body_link(&self, rb: RigidBodyHandle) -> Option<&MultibodyLinkId> {
         self.rb2mb.get(rb.0)
     }

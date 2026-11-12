@@ -517,7 +517,7 @@ impl GenericContactConstraint {
         #[cfg(feature = "dim3")] tangent1: Vector,
         im1: Vector,
         im2: Vector,
-        limit: Real,
+        limits: &[Real],
         // ndofs is 0 for a non-multibody body, or a multibody with zero
         // degrees of freedom.
         ndofs1: usize,
@@ -562,8 +562,8 @@ impl GenericContactConstraint {
             let tangents1 = [dir1.orthonormal_vector()];
             let mut tng_j_id = tangent_j_id(j_id, ndofs1, ndofs2);
 
-            for (normal_part, tangent_part) in normal_parts.iter().zip(tangent_parts.iter_mut()) {
-                let limit = limit * normal_part.impulse;
+            for ((normal_part, tangent_part), friction) in normal_parts.iter().zip(tangent_parts.iter_mut()).zip(limits) {
+                let limit = *friction * normal_part.impulse;
                 tangent_part.generic_solve(
                     tng_j_id,
                     jacobians,

@@ -1,0 +1,899 @@
+//! TestbedViewer — the example-owned-loop testbed.
+//!
+//! The viewer owns the window, graphics, cameras, input and UI. The *example*
+//! owns the [`PhysicsWorld`] and drives the loop:
+//!
+//! ```ignore
+//! pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+//!     let mut world = PhysicsWorld::new();
+//!     /* build scene */
+//!     viewer.set_world(&mut world);
+//!     viewer.look_at(eye, at);
+//!     while viewer.render_frame(&mut world).await {
+//!         if viewer.simulating() {
+//!             world.step();
+//!         }
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The example calls `world.step()` (or `world.step_with_events(&hooks, &events)`
+//! with its own [`ChannelEventCollector`]) directly — the viewer is not involved
+//! in stepping or event collection.
+
+#![allow(clippy::unnecessary_cast)] // Casts are needed for switching between f32/f64.
+
+use kiss3d::color::Color;
+use kiss3d::event::{Action, Key, WindowEvent};
+use kiss3d::window::Window;
+use rapier::dynamics::{RigidBodyActivation, RigidBodyHandle, SoftBodyHandle};
+use rapier::geometry::{ColliderHandle, SharedShape};
+use rapier::pipeline::PhysicsWorld;
+
+#[cfg(feature = "dim3")]
+use glamx::Vec3;
+
+use crate::Camera;
+use crate::debug_render::{DebugRenderPipelineResource, debug_render_scene};
+use crate::grab::MouseGrab;
+use crate::graphics::{GraphicsManager, RenderMaterial};
+use crate::mouse::SceneMouse;
+use crate::physics::{restore_world, snapshot_world};
+use crate::settings::ExampleSettings;
+use crate::testbed::hover::highlight_hovered_body;
+use crate::testbed::keys::KeysState;
+use crate::testbed::state::{
+    ExampleEntry, RunMode, TestbedActionFlags, TestbedState, TestbedStateFlags, Transition,
+};
+use crate::ui;
+use kiss3d::prelude::NumSamples;
+
+/// Saves and restores additional simulation state owned by an example.
+pub trait SnapshotHook {
+    fn snapshot_id(&self) -> &'static str;
+    fn save_snapshot(&mut self) -> Result<Vec<u8>, String>;
+    fn restore_snapshot(&mut self, data: &[u8], world: &mut PhysicsWorld) -> Result<(), String>;
+}
+
+/// The example-owned-loop testbed viewer.
+///
+/// The viewer renders the world and drives the UI, but does **not** step the
+/// simulation or collect events — the example does that itself via
+/// [`PhysicsWorld::step`] / [`PhysicsWorld::step_with_events`].
+pub struct TestbedViewer {
+    window: Window,
+    graphics: GraphicsManager,
+    camera: Camera,
+    scene_mouse: SceneMouse,
+    grab: MouseGrab,
+    keys: KeysState,
+    debug_render: DebugRenderPipelineResource,
+    state: TestbedState,
+    snapshot_hooks: Vec<Box<dyn SnapshotHook>>,
+}
+
+fn save_file_path() -> String {
+    format!("testbed_state_{}.autosave.json", env!("CARGO_CRATE_NAME"))
+}
+
+impl TestbedViewer {
+    /// Creates the viewer window and registers the list of examples shown in the
+    /// UI (used by the outer demo runner to dispatch the selected example).
+    pub async fn new(examples: Vec<ExampleEntry>) -> Self {
+        // Install a default logger so warnings emitted by the examples (e.g. the
+        // MJCF loader complaining about missing meshes) actually print.
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .try_init();
+
+        #[cfg(feature = "profiler_ui")]
+        profiling::puffin::set_scopes_on(true);
+
+        let title = if cfg!(feature = "dim2") {
+            "Rapier: 2D demos"
+        } else {
+            "Rapier: 3D demos"
+        };
+
+        let mut window = Window::new_with_size(title, 1280, 720).await;
+        window.set_background_color(Color::new(245.0 / 255.0, 245.0 / 255.0, 236.0 / 255.0, 1.0));
+        window.set_ambient(0.1);
+        window.set_samples(NumSamples::One);
+        window.set_shadows_enabled(false);
+
+        let mut camera = Camera::default();
+
+        let mut state = TestbedState::default();
+        state.set_examples(examples);
+
+        // Restore the autosaved UI state + camera (selected example, flags, ...).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(saved) = std::fs::read(save_file_path())
+                .ok()
+                .and_then(|data| serde_json::from_slice(&data).ok())
+            {
+                state.apply_saved_data(saved, &mut camera);
+                // Keep the restored camera: the first example's `look_at` must
+                // not override it.
+                state.camera_locked = true;
+            }
+        }
+        state.action_flags.remove(TestbedActionFlags::APP_STARTED);
+
+        Self {
+            window,
+            graphics: GraphicsManager::new(),
+            camera,
+            scene_mouse: SceneMouse::new(),
+            grab: MouseGrab::default(),
+            keys: KeysState::default(),
+            debug_render: DebugRenderPipelineResource::default(),
+            state,
+            snapshot_hooks: Vec::new(),
+        }
+    }
+
+    // ───────────────────────────── loop driving ─────────────────────────────
+
+    /// Renders one frame (presents the scene built last frame, processes input
+    /// and UI). Returns `false` when the example's loop should end — either the
+    /// window was closed or a [`Transition`] (example switch / quit) was
+    /// requested from the UI.
+    pub async fn render_frame(&mut self, world: &mut PhysicsWorld) -> bool {
+        profiling::finish_frame!();
+        // A frame spans two calls (the example's step runs in between) minus the render below.
+        self.state.frame_stats.record(
+            self.state.timestep_id,
+            world.physics_pipeline.counters.step_time_ms(),
+        );
+
+        #[cfg(feature = "dim3")]
+        let keep_open = self
+            .window
+            .render_3d(self.graphics.scene_mut(), &mut self.camera)
+            .await;
+        #[cfg(feature = "dim2")]
+        let keep_open = self
+            .window
+            .render_2d(self.graphics.scene_mut(), &mut self.camera)
+            .await;
+
+        self.state.frame_stats.resume();
+
+        if !keep_open {
+            self.state.transition = Some(Transition::Quit);
+            return false;
+        }
+
+        // The testbed owns the soft-recovery settings: stamped onto the (possibly fresh)
+        // world every frame, so the panel's choices survive demo restarts and switches.
+        world.integration_parameters.soft_bodies.recovery = self.state.soft_recovery;
+
+        // Update the world-space cursor before the event pass: a mouse press picks with it.
+        let cursor_pos = self.window.cursor_pos();
+        self.scene_mouse
+            .update_from_window(cursor_pos, self.window.size().into(), &self.camera);
+
+        self.handle_events(world);
+        self.update_grab(world);
+
+        self.handle_action_flags(world);
+        self.handle_sleep_settings(world);
+        self.autosave();
+
+        highlight_hovered_body(&mut self.graphics, &self.scene_mouse, world);
+        // The pieces a tear split off during the step, and what moved between bodies.
+        self.graphics.add_missing_soft_body_graphics(
+            &mut self.window,
+            &world.bodies,
+            &world.colliders,
+            &world.soft_bodies,
+        );
+        self.graphics.draw(
+            self.state.flags,
+            &world.bodies,
+            &world.colliders,
+            &world.soft_bodies,
+        );
+        debug_render_scene(&mut self.window, &mut self.debug_render, world);
+
+        // Snapshot flags before the UI runs (`draw_ui` mutates `state.flags`) so next frame's
+        // handlers can detect toggles; syncing after `draw_ui` would consume the diff on the
+        // same frame and the handlers would never see it.
+        self.state.prev_flags = self.state.flags;
+
+        // Disjoint field borrows: the closure captures `state`/`debug` while
+        // `self.window` is the receiver.
+        let state = &mut self.state;
+        let debug = &mut self.debug_render;
+        self.window
+            .draw_ui(|ctx| ui::update_ui(ctx, state, world, debug));
+
+        self.state.transition.is_none()
+    }
+
+    /// Whether the simulation should advance this frame, honoring run/pause/step.
+    /// A pending single-step is consumed (returns `true` once, then pauses).
+    pub fn simulating(&mut self) -> bool {
+        let simulating = match self.state.running {
+            RunMode::Stop => false,
+            RunMode::Running => true,
+            RunMode::Step => {
+                self.state.running = RunMode::Stop;
+                true
+            }
+        };
+
+        if simulating {
+            self.state.timestep_id += 1;
+        }
+
+        simulating
+    }
+
+    // ───────────────────────── scene registration ───────────────────────────
+
+    /// Registers render nodes for the world the example just built, configures the selected
+    /// broad-phase, and enables the profiling counters. Render-node creation is deferred to
+    /// the next frame so example code can still set initial colors after calling this.
+    pub fn set_world(&mut self, world: &mut PhysicsWorld) {
+        world.broad_phase = self.state.broad_phase_type.init_broad_phase();
+        world.physics_pipeline.counters.enable();
+
+        // Dedicated physics pool of `cores - 1` threads capped at 8: leave a core for the
+        // render thread and avoid heterogeneous CPUs' efficiency cores (they stall the solver's
+        // barrier-paced stages). Built once, shared across example reloads.
+        #[cfg(feature = "parallel")]
+        {
+            if self.state.physics_thread_pool.is_none() {
+                let num_threads = (num_cpus::get().saturating_sub(1)).clamp(1, 8);
+                if let Err(e) = world.configure_thread_pool(num_threads) {
+                    eprintln!("Failed to build the physics thread pool: {e}");
+                }
+                self.state.physics_thread_pool = world.thread_pool();
+            } else {
+                world.clear_thread_pool();
+            }
+        }
+        self.state
+            .action_flags
+            .set(TestbedActionFlags::RESET_WORLD_GRAPHICS, true);
+
+        // Honor the current sleep setting on the freshly built bodies: the
+        // flag-diff handler only fires on toggles, so without this a restart
+        // with sleeping disabled would silently let the new bodies sleep again.
+        self.apply_sleep_flag(world);
+    }
+
+    /// Clears the scene and resets per-example viewer state (called by the outer demo runner
+    /// between examples). A restart / backend / solver-parameter switch preserves the camera
+    /// and the user's setting edits; selecting a different example resets both.
+    pub fn clear_scene(&mut self) {
+        // The grabbed handles belong to the world being discarded.
+        self.grab.forget();
+        self.graphics.clear();
+        self.state.transition = None;
+        self.state.snapshot = None;
+        self.snapshot_hooks.clear();
+        self.state.timestep_id = 0;
+        // The next example's scene building is not a frame.
+        self.state.frame_stats = Default::default();
+        self.state.action_flags = TestbedActionFlags::empty();
+
+        if self.state.preserve_settings_on_switch {
+            self.state.camera_locked = true;
+        } else {
+            self.camera = Camera::default();
+            self.state.camera_locked = false;
+            self.state.example_settings.clear();
+            // An example may switch the debug renderer on for itself (see
+            // `set_debug_render`): the next one starts from the defaults.
+            self.debug_render = DebugRenderPipelineResource::default();
+        }
+        self.state.preserve_settings_on_switch = false;
+    }
+
+    /// Switches the debug renderer on or off, drawing what `mode` selects (see
+    /// `DebugRenderMode`): what the debug-render tab of the settings panel toggles, for an
+    /// example whose point is a debug overlay. Reset when another example is selected.
+    /// Registers an extension for this example's snapshot state.
+    pub fn add_snapshot_hook(&mut self, hook: impl SnapshotHook + 'static) {
+        self.snapshot_hooks.push(Box::new(hook));
+    }
+
+    pub fn set_debug_render(&mut self, enabled: bool, mode: rapier::pipeline::DebugRenderMode) {
+        self.debug_render.enabled = enabled;
+        self.debug_render.pipeline.mode = mode;
+    }
+
+    // ──────────────────────────── camera / scene ────────────────────────────
+
+    pub fn allow_grabbing_behind_ground(&mut self, allow: bool) {
+        self.state.can_grab_behind_ground = allow;
+    }
+
+    pub fn set_graphics_shift(&mut self, shift: rapier::math::Vector) {
+        if !self.state.camera_locked {
+            self.graphics.gfx_shift = shift;
+        }
+    }
+
+    #[cfg(feature = "dim2")]
+    pub fn look_at(&mut self, at: glamx::Vec2, zoom: f32) {
+        if !self.state.camera_locked {
+            self.camera.set_at(at);
+            self.camera.set_zoom(zoom);
+        }
+    }
+
+    #[cfg(feature = "dim3")]
+    pub fn look_at(&mut self, eye: Vec3, at: Vec3) {
+        if !self.state.camera_locked {
+            self.camera.look_at(eye, at);
+        }
+    }
+
+    /// Sets the world-up direction the orbit camera uses (call before
+    /// [`Self::look_at`]). Keeps the gravity slider aligned with "down".
+    #[cfg(feature = "dim3")]
+    pub fn set_up_axis(&mut self, up_axis: Vec3) {
+        #[allow(clippy::useless_conversion)]
+        {
+            self.state.up_axis = up_axis.normalize().into();
+        }
+        if !self.state.camera_locked {
+            self.camera.set_up_axis(up_axis);
+        }
+    }
+
+    /// Camera orientation as a unit quaternion (3D only). OpenGL convention: the camera looks
+    /// down its local -z, so `rot * z` points from the scene back toward the eye.
+    #[cfg(feature = "dim3")]
+    pub fn camera_rotation(&self) -> na::UnitQuaternion<f32> {
+        use kiss3d::camera::Camera3d;
+        let eye = self.camera.eye();
+        let at = self.camera.at();
+        let backward = na::Vector3::new(eye.x - at.x, eye.y - at.y, eye.z - at.z);
+        let Some(backward) = na::Unit::try_new(backward, 1.0e-6) else {
+            return na::UnitQuaternion::identity();
+        };
+        let backward = backward.into_inner();
+        let up = na::Vector3::new(
+            self.state.up_axis.x as f32,
+            self.state.up_axis.y as f32,
+            self.state.up_axis.z as f32,
+        );
+        // Degenerate up (looking straight along it): substitute any non-parallel axis.
+        let up = if up.dot(&backward).abs() > 0.999 {
+            let alt = na::Vector3::x();
+            if alt.dot(&backward).abs() > 0.999 {
+                na::Vector3::y()
+            } else {
+                alt
+            }
+        } else {
+            up
+        };
+        na::UnitQuaternion::face_towards(&backward, &up)
+    }
+
+    /// Camera forward direction, from the eye toward the look-at point (3D only).
+    #[cfg(feature = "dim3")]
+    pub fn camera_fwd_dir(&self) -> na::Vector3<f32> {
+        self.camera_rotation() * -na::Vector3::z()
+    }
+
+    /// Recenters the camera so the whole scene fills the viewport (deferred to
+    /// the next frame, when collider AABBs are available).
+    pub fn request_frame_all(&mut self) {
+        self.state
+            .action_flags
+            .set(TestbedActionFlags::FRAME_SCENE, true);
+    }
+
+    // ─────────────────────────── render helpers ─────────────────────────────
+
+    pub fn set_initial_body_color(&mut self, body: RigidBodyHandle, color: Color) {
+        self.graphics.set_initial_body_color(body, color);
+    }
+
+    pub fn set_initial_collider_color(&mut self, collider: ColliderHandle, color: Color) {
+        self.graphics.set_initial_collider_color(collider, color);
+    }
+
+    pub fn set_initial_soft_body_color(&mut self, soft_body: SoftBodyHandle, color: Color) {
+        self.graphics.set_initial_soft_body_color(soft_body, color);
+    }
+
+    pub fn set_body_wireframe(&mut self, body: RigidBodyHandle, wireframe_enabled: bool) {
+        self.graphics.set_body_wireframe(body, wireframe_enabled);
+    }
+
+    /// Attaches a render-only mesh to `body` (does not participate in physics).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_body_render_mesh(
+        &mut self,
+        body: RigidBodyHandle,
+        shape: &SharedShape,
+        local_pose: rapier::math::Pose,
+        color: Color,
+        uvs: Option<&[[f32; 2]]>,
+        normals: Option<&[[f32; 3]]>,
+        texture: Option<&std::path::Path>,
+        material: Option<RenderMaterial>,
+    ) {
+        self.graphics.add_body_render_mesh(
+            &mut self.window,
+            body,
+            shape,
+            local_pose,
+            color,
+            uvs,
+            normals,
+            texture,
+            material,
+        );
+    }
+
+    pub fn set_colliders_visible(&mut self, visible: bool) {
+        self.graphics.set_colliders_visible(visible);
+    }
+
+    pub fn set_body_render_meshes_visible(&mut self, visible: bool) {
+        self.graphics.set_body_render_meshes_visible(visible);
+    }
+
+    // ──────────────────────── runtime graphics (in-loop) ─────────────────────
+    // Examples that add/remove bodies or change colors while the simulation runs
+    // (formerly inside an `add_callback` closure) call these from their loop.
+
+    /// Sets a body's render color. With `tmp_color`, the color is transient (it is
+    /// reset to the body's base color next frame — used for hover/transient cues);
+    /// otherwise it becomes the body's persistent color.
+    pub fn set_body_color(&mut self, body: RigidBodyHandle, color: Color, tmp_color: bool) {
+        self.graphics.set_body_color(body, color, tmp_color);
+    }
+
+    /// Creates render nodes for a body inserted into `world` after [`Self::set_world`].
+    pub fn add_body(&mut self, handle: RigidBodyHandle, world: &PhysicsWorld) {
+        self.graphics
+            .add_body_colliders(&mut self.window, handle, &world.bodies, &world.colliders);
+    }
+
+    /// Removes the render nodes of a body removed from the world.
+    pub fn remove_body(&mut self, handle: RigidBodyHandle) {
+        self.graphics.remove_body_nodes(handle);
+    }
+
+    /// Creates render nodes for a parentless collider inserted after [`Self::set_world`].
+    pub fn add_collider(&mut self, handle: ColliderHandle, world: &PhysicsWorld) {
+        self.graphics
+            .add_collider(&mut self.window, handle, &world.colliders);
+    }
+
+    /// Removes the render nodes of a collider removed from the world.
+    pub fn remove_collider(&mut self, handle: ColliderHandle) {
+        self.graphics.remove_collider_nodes(handle);
+    }
+
+    /// Updates a collider's render nodes after its shape was modified in place.
+    pub fn update_collider(&mut self, handle: ColliderHandle, world: &PhysicsWorld) {
+        self.graphics.remove_collider_nodes(handle);
+        self.graphics
+            .add_collider(&mut self.window, handle, &world.colliders);
+    }
+
+    // ───────────────────────────── input / events ───────────────────────────
+
+    pub fn keys(&self) -> &KeysState {
+        &self.keys
+    }
+
+    pub fn mouse(&self) -> &SceneMouse {
+        &self.scene_mouse
+    }
+
+    pub fn egui_context(&self) -> &egui::Context {
+        self.window.egui_context()
+    }
+
+    pub fn egui_context_mut(&mut self) -> &mut egui::Context {
+        self.window.egui_context_mut()
+    }
+
+    /// The underlying kiss3d window.
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    /// The graphics manager owning the kiss3d scene.
+    pub fn graphics(&self) -> &GraphicsManager {
+        &self.graphics
+    }
+
+    /// Mutable access to the graphics manager owning the kiss3d scene, e.g. to
+    /// add custom render nodes from an example's render loop.
+    pub fn graphics_mut(&mut self) -> &mut GraphicsManager {
+        &mut self.graphics
+    }
+
+    /// Mutable access to the underlying kiss3d window, e.g. for immediate-mode
+    /// drawing (`draw_point`, `draw_line`, ...) from an example's render loop.
+    pub fn window_mut(&mut self) -> &mut Window {
+        &mut self.window
+    }
+
+    // ───────────────────────────── registry / loop ──────────────────────────
+
+    /// Display index of the example the UI currently has selected, clamped to a
+    /// valid range (a stale autosave may hold an index past the current list).
+    pub fn selected(&self) -> usize {
+        self.state
+            .selected_display_index
+            .min(self.state.examples.len().saturating_sub(1))
+    }
+
+    /// Name of the example the UI currently has selected (for dispatch).
+    pub fn selected_name(&self) -> Option<&'static str> {
+        self.state
+            .examples
+            .get(self.state.selected_display_index)
+            .map(|e| e.name)
+    }
+
+    /// Whether the user requested the whole testbed to quit.
+    pub fn quitting(&self) -> bool {
+        matches!(self.state.transition, Some(Transition::Quit))
+    }
+
+    /// Read-only access to the underlying example settings (for examples that
+    /// read live-tunable values declared via [`Self::example_settings_mut`]).
+    pub fn example_settings(&self) -> &ExampleSettings {
+        &self.state.example_settings
+    }
+
+    pub fn example_settings_mut(&mut self) -> &mut ExampleSettings {
+        &mut self.state.example_settings
+    }
+
+    // ───────────────────────────── internals ────────────────────────────────
+
+    fn handle_events(&mut self, world: &mut PhysicsWorld) {
+        // Mouse events are handled live so a grab can inhibit them (an inhibited event never
+        // reaches the camera). Key events are collected and processed after the loop, since
+        // their handlers borrow `self` as a whole.
+        let egui_wants_pointer = {
+            let ctx = self.window.egui_context();
+            ctx.egui_wants_pointer_input() || ctx.is_pointer_over_egui()
+        };
+
+        let mut key_events = Vec::new();
+        for mut event in self.window.events().iter() {
+            match event.value {
+                WindowEvent::MouseButton(kiss3d::event::MouseButton::Button1, action, _) => {
+                    match action {
+                        Action::Press => {
+                            if !egui_wants_pointer && self.grab.try_grab(&self.scene_mouse, world) {
+                                event.inhibited = true;
+                            }
+                        }
+                        Action::Release => {
+                            if self.grab.active() {
+                                self.grab.release(world);
+                                event.inhibited = true;
+                            }
+                        }
+                    }
+                }
+                // The cameras poll the button state on cursor moves, so freezing the camera
+                // during a grab means swallowing the cursor events themselves.
+                WindowEvent::CursorPos(..) if self.grab.active() => {
+                    event.inhibited = true;
+                }
+                WindowEvent::Key(key, action, _) => key_events.push((key, action)),
+                _ => {}
+            }
+        }
+
+        for (key, action) in key_events {
+            match action {
+                Action::Press => {
+                    if !self.keys.pressed_keys.contains(&key) {
+                        self.keys.pressed_keys.push(key);
+                    }
+                    match key {
+                        Key::LShift | Key::RShift => self.keys.shift = true,
+                        Key::LControl | Key::RControl => self.keys.ctrl = true,
+                        Key::LAlt | Key::RAlt => self.keys.alt = true,
+                        _ => {}
+                    }
+                }
+                Action::Release => {
+                    self.keys.pressed_keys.retain(|k| *k != key);
+                    match key {
+                        Key::T => {
+                            self.state.running = if self.state.running == RunMode::Stop {
+                                RunMode::Running
+                            } else {
+                                RunMode::Stop
+                            };
+                        }
+                        Key::S => self.state.running = RunMode::Step,
+                        Key::R => self.request_restart(),
+                        Key::LShift | Key::RShift => self.keys.shift = false,
+                        Key::LControl | Key::RControl => self.keys.ctrl = false,
+                        Key::LAlt | Key::RAlt => self.keys.alt = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retargets the mouse joint's kinematic anchor and draws the grab cue line.
+    fn update_grab(&mut self, world: &mut PhysicsWorld) {
+        #[cfg(feature = "dim3")]
+        {
+            let fwd = self.camera_fwd_dir();
+            let fwd = rapier::math::Vector::new(fwd.x as _, fwd.y as _, fwd.z as _);
+            self.grab.update(&self.scene_mouse, fwd, world);
+        }
+        #[cfg(feature = "dim2")]
+        self.grab.update(&self.scene_mouse, world);
+
+        if let Some((a, b)) = self.grab.cue_line(world) {
+            let color = Color::new(0.9, 0.4, 0.1, 1.0);
+            #[cfg(feature = "dim3")]
+            self.window.draw_line(
+                glamx::Vec3::new(a.x as f32, a.y as f32, a.z as f32),
+                glamx::Vec3::new(b.x as f32, b.y as f32, b.z as f32),
+                color,
+                4.0,
+                false,
+            );
+            #[cfg(feature = "dim2")]
+            self.window.draw_line_2d(
+                glamx::Vec2::new(a.x as f32, a.y as f32),
+                glamx::Vec2::new(b.x as f32, b.y as f32),
+                color,
+                4.0,
+            );
+        }
+    }
+
+    fn request_restart(&mut self) {
+        self.state.preserve_settings_on_switch = true;
+        self.state.transition = Some(Transition::Switch);
+    }
+
+    fn handle_action_flags(&mut self, world: &mut PhysicsWorld) {
+        if self
+            .state
+            .action_flags
+            .contains(TestbedActionFlags::TAKE_SNAPSHOT)
+        {
+            self.state
+                .action_flags
+                .set(TestbedActionFlags::TAKE_SNAPSHOT, false);
+            let mut snapshot = snapshot_world(world, self.state.timestep_id);
+            for hook in &mut self.snapshot_hooks {
+                match hook.save_snapshot() {
+                    Ok(data) => snapshot.set_extension(hook.snapshot_id(), data),
+                    Err(err) => eprintln!("Failed to save {} snapshot: {err}", hook.snapshot_id()),
+                }
+            }
+            self.state.snapshot = Some(snapshot);
+        }
+
+        if self
+            .state
+            .action_flags
+            .contains(TestbedActionFlags::RESTORE_SNAPSHOT)
+        {
+            self.state
+                .action_flags
+                .set(TestbedActionFlags::RESTORE_SNAPSHOT, false);
+            if let Some(snapshot) = &self.state.snapshot {
+                self.state.timestep_id = restore_world(world, snapshot);
+                for hook in &mut self.snapshot_hooks {
+                    if let Some(data) = snapshot.extension(hook.snapshot_id()) {
+                        if let Err(err) = hook.restore_snapshot(data, world) {
+                            eprintln!("Failed to restore {} snapshot: {err}", hook.snapshot_id());
+                        }
+                    }
+                }
+                self.state
+                    .action_flags
+                    .set(TestbedActionFlags::RESET_WORLD_GRAPHICS, true);
+            }
+        }
+
+        if self
+            .state
+            .action_flags
+            .contains(TestbedActionFlags::RESET_WORLD_GRAPHICS)
+        {
+            self.state
+                .action_flags
+                .set(TestbedActionFlags::RESET_WORLD_GRAPHICS, false);
+            // Soft bodies: one color per soft body, worn by every one of its cluster proxies so
+            // its collision meshes (colliders like any other) come out in that color.
+            for (sb_handle, sb) in world.soft_bodies.iter() {
+                let color = self.graphics.soft_body_color(sb_handle);
+                for (_, cluster) in sb.live_clusters() {
+                    self.graphics.set_initial_body_color(cluster.proxy(), color);
+                }
+            }
+            // The meshes a soft body only draws (its skin) have no collider to be picked up by
+            // the collider pass below.
+            for (sb_handle, _) in world.soft_bodies.iter() {
+                self.graphics
+                    .add_soft_body_meshes(sb_handle, &world.soft_bodies);
+            }
+            for (handle, _) in world.bodies.iter() {
+                self.graphics.add_body_colliders(
+                    &mut self.window,
+                    handle,
+                    &world.bodies,
+                    &world.colliders,
+                );
+            }
+            for (handle, co) in world.colliders.iter() {
+                if co.parent().is_none() {
+                    self.graphics
+                        .add_collider(&mut self.window, handle, &world.colliders);
+                }
+            }
+
+            // Honor the current wireframe flag on freshly created nodes.
+            if self.state.flags.contains(TestbedStateFlags::WIREFRAME) {
+                self.graphics.toggle_wireframe_mode(&world.colliders, true);
+            }
+        }
+
+        if self.state.prev_flags.contains(TestbedStateFlags::WIREFRAME)
+            != self.state.flags.contains(TestbedStateFlags::WIREFRAME)
+        {
+            self.graphics.toggle_wireframe_mode(
+                &world.colliders,
+                self.state.flags.contains(TestbedStateFlags::WIREFRAME),
+            );
+        }
+
+        if self
+            .state
+            .action_flags
+            .contains(TestbedActionFlags::FRAME_SCENE)
+        {
+            self.state
+                .action_flags
+                .set(TestbedActionFlags::FRAME_SCENE, false);
+            frame_scene(
+                &world.colliders,
+                &world.bodies,
+                &self.graphics,
+                &mut self.camera,
+            );
+        }
+    }
+
+    fn handle_sleep_settings(&mut self, world: &mut PhysicsWorld) {
+        if self.state.prev_flags.contains(TestbedStateFlags::SLEEP)
+            != self.state.flags.contains(TestbedStateFlags::SLEEP)
+        {
+            self.apply_sleep_flag(world);
+        }
+    }
+
+    /// Applies the current `SLEEP` flag to every body (and the selected sleep strategy to the
+    /// island manager). Called on toggle *and* on fresh-world builds (restart / scene switch),
+    /// so newly created bodies honor the setting.
+    fn apply_sleep_flag(&self, world: &mut PhysicsWorld) {
+        if self.state.flags.contains(TestbedStateFlags::SLEEP) {
+            for (_, body) in world.bodies.iter_mut() {
+                body.activation_mut().normalized_linear_threshold =
+                    RigidBodyActivation::default_normalized_linear_threshold();
+                body.activation_mut().angular_threshold =
+                    RigidBodyActivation::default_angular_threshold();
+            }
+        } else {
+            for (_, body) in world.bodies.iter_mut() {
+                body.wake_up(true);
+                body.activation_mut().normalized_linear_threshold = -1.0;
+            }
+        }
+    }
+
+    fn autosave(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let new_save_data = self.state.save_data(self.camera);
+            if self.state.prev_save_data != new_save_data {
+                let data = serde_json::to_string_pretty(&new_save_data).unwrap();
+                if let Err(e) = std::fs::write(save_file_path(), &data) {
+                    eprintln!("Failed to write autosave file: {e}");
+                }
+                self.state.prev_save_data = new_save_data;
+            }
+        }
+    }
+}
+
+/// Recenter the camera so the AABB of all the collider and visual-mesh shapes in
+/// the scene fills the viewport ("frame all" / "best view").
+fn frame_scene(
+    colliders: &rapier::geometry::ColliderSet,
+    bodies: &rapier::dynamics::RigidBodySet,
+    graphics: &GraphicsManager,
+    camera: &mut Camera,
+) {
+    use rapier::parry::bounding_volume::BoundingVolume;
+    use rapier::parry::math::Real;
+
+    fn is_finite_aabb(a: &rapier::parry::bounding_volume::Aabb) -> bool {
+        if !a.mins.x.is_finite()
+            || !a.mins.y.is_finite()
+            || !a.maxs.x.is_finite()
+            || !a.maxs.y.is_finite()
+        {
+            return false;
+        }
+        #[cfg(feature = "dim3")]
+        if !a.mins.z.is_finite() || !a.maxs.z.is_finite() {
+            return false;
+        }
+        true
+    }
+
+    let mut aabb: Option<rapier::parry::bounding_volume::Aabb> = None;
+    let mut merge = |a: rapier::parry::bounding_volume::Aabb| {
+        if !is_finite_aabb(&a) {
+            return;
+        }
+        aabb = Some(match aabb {
+            None => a,
+            Some(prev) => prev.merged(&a),
+        });
+    };
+    for (_, co) in colliders.iter() {
+        merge(co.compute_aabb());
+    }
+    for vm in graphics.body_attached_nodes() {
+        let Some(rb) = bodies.get(vm.body) else {
+            continue;
+        };
+        let world_pose = *rb.position() * vm.delta;
+        merge(vm.shape.compute_aabb(&world_pose));
+    }
+    let Some(aabb) = aabb else {
+        return;
+    };
+
+    let center = aabb.center();
+    let extents = aabb.extents();
+
+    #[cfg(feature = "dim3")]
+    {
+        let half = extents * 0.5 as Real;
+        let radius = (half.x * half.x + half.y * half.y + half.z * half.z)
+            .sqrt()
+            .max(0.5);
+        let fov = camera.fov();
+        let dist = radius / (fov as Real * 0.5).sin().max(1e-3) * 1.1;
+
+        let kiss_center =
+            kiss3d::glamx::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+        let dir = kiss3d::glamx::Vec3::new(1.0, 1.0, 1.0).normalize();
+        let eye = kiss_center + dir * dist as f32;
+        camera.look_at(eye, kiss_center);
+    }
+
+    #[cfg(feature = "dim2")]
+    {
+        let kiss_center = kiss3d::glamx::Vec2::new(center.x as f32, center.y as f32);
+        let max_extent = extents.x.max(extents.y).max(0.5);
+        let zoom = (600.0 as Real / max_extent / 1.2) as f32;
+        camera.look_at(kiss_center, zoom);
+    }
+}

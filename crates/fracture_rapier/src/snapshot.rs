@@ -14,7 +14,7 @@ use crate::world::{FractureField2D, FractureFieldMode};
 pub use fracture_core::snapshot::SnapshotMode as SnapshotReplayMode;
 
 const MAGIC: [u8; 8] = *b"RFXSR2\0\0";
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const HEADER_LEN: usize = 34;
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -66,6 +66,7 @@ impl BodyTypeSnapshot {
             RigidBodyType::Fixed => Self::Fixed,
             RigidBodyType::KinematicPositionBased => Self::KinematicPositionBased,
             RigidBodyType::KinematicVelocityBased => Self::KinematicVelocityBased,
+            RigidBodyType::SoftFrame => unreachable!("fracture actors cannot be soft frames"),
         }
     }
 
@@ -92,6 +93,7 @@ struct RapierOwnedStateRef<'a> {
     colliders: &'a ColliderSet,
     impulse_joints: &'a ImpulseJointSet,
     multibody_joints: &'a MultibodyJointSet,
+    soft_bodies: &'a SoftBodySet,
     islands: &'a IslandManager,
     broad_phase: &'a BroadPhaseBvh,
     narrow_phase: &'a NarrowPhase,
@@ -104,6 +106,7 @@ pub struct RapierOwnedState {
     pub colliders: ColliderSet,
     pub impulse_joints: ImpulseJointSet,
     pub multibody_joints: MultibodyJointSet,
+    pub soft_bodies: SoftBodySet,
     pub islands: IslandManager,
     pub broad_phase: BroadPhaseBvh,
     pub narrow_phase: NarrowPhase,
@@ -255,20 +258,9 @@ pub struct FxRapierWorldSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IntegrationSnapshot {
-    pub dt: f32,
-    pub min_ccd_dt: f32,
-    pub contact_softness_natural_frequency: f32,
-    pub contact_softness_damping_ratio: f32,
-    pub warmstart_coefficient: f32,
-    pub length_unit: f32,
-    pub normalized_allowed_linear_error: f32,
-    pub normalized_max_corrective_velocity: f32,
-    pub normalized_prediction_distance: f32,
-    pub num_solver_iterations: usize,
-    pub num_internal_pgs_iterations: usize,
-    pub num_internal_stabilization_iterations: usize,
-    pub min_island_size: usize,
-    pub max_ccd_substeps: usize,
+    // Version 8 records the complete upstream settings so new soft-body and
+    // solver options survive restore alongside the rigid-body parameters.
+    pub params: IntegrationParameters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -333,6 +325,7 @@ pub fn encode_rapier_owned_state(
     colliders: &ColliderSet,
     impulse_joints: &ImpulseJointSet,
     multibody_joints: &MultibodyJointSet,
+    soft_bodies: &SoftBodySet,
     islands: &IslandManager,
     broad_phase: &BroadPhaseBvh,
     narrow_phase: &NarrowPhase,
@@ -343,6 +336,7 @@ pub fn encode_rapier_owned_state(
         colliders,
         impulse_joints,
         multibody_joints,
+        soft_bodies,
         islands,
         broad_phase,
         narrow_phase,
@@ -680,44 +674,16 @@ fn write_integration(
     writer: &mut Writer,
     params: IntegrationSnapshot,
 ) -> Result<(), FxRapierSnapshotError> {
-    writer.f32(params.dt)?;
-    writer.f32(params.min_ccd_dt)?;
-    writer.f32(params.contact_softness_natural_frequency)?;
-    writer.f32(params.contact_softness_damping_ratio)?;
-    writer.f32(params.warmstart_coefficient)?;
-    writer.f32(params.length_unit)?;
-    writer.f32(params.normalized_allowed_linear_error)?;
-    writer.f32(params.normalized_max_corrective_velocity)?;
-    writer.f32(params.normalized_prediction_distance)?;
-    writer.len(params.num_solver_iterations)?;
-    writer.len(params.num_internal_pgs_iterations)?;
-    writer.len(params.num_internal_stabilization_iterations)?;
-    writer.len(params.min_island_size)?;
-    writer.len(params.max_ccd_substeps)?;
-    Ok(())
+    let bytes = bincode::serialize(&params.params)
+        .map_err(|_| FxRapierSnapshotError::StateMismatch("integration serialization failed"))?;
+    writer.bytes(&bytes)
 }
 
 fn read_integration(reader: &mut Reader<'_>) -> Result<IntegrationSnapshot, FxRapierSnapshotError> {
-    Ok(IntegrationSnapshot {
-        dt: reader.f32("integration.dt")?,
-        min_ccd_dt: reader.f32("integration.min_ccd_dt")?,
-        contact_softness_natural_frequency: reader
-            .f32("integration.contact_softness_natural_frequency")?,
-        contact_softness_damping_ratio: reader.f32("integration.contact_softness_damping_ratio")?,
-        warmstart_coefficient: reader.f32("integration.warmstart_coefficient")?,
-        length_unit: reader.f32("integration.length_unit")?,
-        normalized_allowed_linear_error: reader
-            .f32("integration.normalized_allowed_linear_error")?,
-        normalized_max_corrective_velocity: reader
-            .f32("integration.normalized_max_corrective_velocity")?,
-        normalized_prediction_distance: reader.f32("integration.normalized_prediction_distance")?,
-        num_solver_iterations: reader.len("integration.num_solver_iterations")?,
-        num_internal_pgs_iterations: reader.len("integration.num_internal_pgs_iterations")?,
-        num_internal_stabilization_iterations: reader
-            .len("integration.num_internal_stabilization_iterations")?,
-        min_island_size: reader.len("integration.min_island_size")?,
-        max_ccd_substeps: reader.len("integration.max_ccd_substeps")?,
-    })
+    let bytes = reader.bytes("integration")?;
+    let params = bincode::deserialize(bytes)
+        .map_err(|_| FxRapierSnapshotError::StateMismatch("integration deserialization failed"))?;
+    Ok(IntegrationSnapshot { params })
 }
 
 fn write_stress(

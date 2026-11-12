@@ -2,12 +2,6 @@
 
 #[cfg(all(feature = "deterministic-replay", feature = "parallel"))]
 compile_error!("fracture_rapier feature `deterministic-replay` is incompatible with `parallel`");
-#[cfg(all(feature = "deterministic-replay", feature = "simd-stable"))]
-compile_error!("fracture_rapier feature `deterministic-replay` is incompatible with `simd-stable`");
-#[cfg(all(feature = "deterministic-replay", feature = "simd-nightly"))]
-compile_error!(
-    "fracture_rapier feature `deterministic-replay` is incompatible with `simd-nightly`"
-);
 
 mod collider_sync;
 mod connect_api;

@@ -1,18 +1,402 @@
-## Unreleased
+## v0.36.1 (4 October 2026)
 
-### Fixed
+### Added
 
-- Continuous Collision Detection now consults the user's `PhysicsHooks::filter_contact_pair`
-  hook, matching narrow-phase semantics. Previously, CCD would clamp a fast-moving body's
-  motion at a predicted impact with a pair the user had filtered out. Closes #754.
+- Python: a multibody's state and motors in reduced coordinates (`Multibody.generalized_position`,
+  `armature` / `set_armature`, `set_link_motor` and friends, `MultibodyLink.assembly_id` / `ndofs`),
+  MJCF body and joint names (`MjcfRobot.body_names`, `joint_name_to_idx`...) and MJCF actuator
+  parameters (`MjcfActuatorHandle.gear`, `ctrl_range`, `kp`, `kv`...).
+
+## v0.36.0 (24 September 2026)
+
+### Added
+
+- Soft bodies: `SoftBodySet`, `SoftBody` and `SoftBodyBuilder` (ropes, cloth, trimeshes, volumes…),
+  simulated together with rigid bodies, contacts and joints; also on `PhysicsWorld`.
+- Soft-body materials with plasticity, tearing and cutting (`SoftBodySet::tear`/`cut`); torn-off
+  pieces become soft bodies and report a `SoftBodyTearEvent`.
+- Soft-body clusters (`SoftBodySet::add_cluster`): rigid proxies that joints and colliders attach to.
+- Deformable colliders: `ColliderSet::insert_deformable` binds a `DEFORMABLE` trimesh (3D) or
+  polyline (2D) to a soft body through a `SoftMeshBinding`.
+- Experimental FEM soft-body solver behind the new `fem` feature (`SoftBodySolver::Fem`).
+- `IntegrationParameters::soft_bodies`, soft-body debug-render modes, and soft bodies in snapshots.
+- `RigidBody(Builder)::additional_pgs_iterations`: extra PGS iterations per substep for a body's island.
+- `DebugRenderMode::PSEUDO_NORMALS` draws the pseudo-normals of trimeshes and polylines.
+- `ColliderBuilder::polyline_with_flags`, `RigidBodyHandle::is_invalid`, and a public
+  `CoefficientCombineRule::combine`.
+- `PhysicsWorld::detect_collisions` (collision detection without stepping) and
+  `PhysicsWorld::remove_body_with_colliders`.
+- `CCDSolver::invalidate_fixed_targets_cache`, for users calling `CCDSolver::solve_continuous` directly.
+- `Multibody::remove_dof_coupling`, `retain_dof_couplings` and `clear_dof_couplings`.
+- `rapier3d-urdf`: `UrdfLink::urdf_link_index` and `UrdfJoint::urdf_joint_index` (and
+  `merged_urdf_joint_indices`) map loaded links and joints to their URDF counterparts.
+- `rapier3d-mjcf`: `MjcfContactHooks::is_excluded` and `pair_override` query a model's contact rules.
+- Testbed: drag bodies with the mouse, a "Debug" tab for the debug-render settings, and a
+  "Smooth mesh colliders" option (3D).
+- New C bindings (`bindings/c`): 2D/3D, f32/f64, a C11 header with C++ helpers, and a CMake package.
 
 ### Modified
 
+- Update to parry 0.31: query results now report the hit sub-shape (e.g. the triangle of a trimesh).
+- `PhysicsPipeline::step`, `RigidBodySet::remove`, `ColliderSet::remove`, `DebugRenderPipeline::render`
+  and `CCDSolver::solve_continuous` take the `SoftBodySet`.
+- `EventHandler` has a new required method `handle_soft_body_tear_event`, and
+  `ChannelEventCollector::new` takes a sender for these events.
+- `ContactPair::manifolds` and `solver_clusters` moved to `ContactPair::contacts`: use
+  `pair.manifolds()` or `pair.rigid()`.
+- The rigid-contact fields of `ContactModificationContext` moved behind `ctx.rigid_mut()`.
+- `SolverFlags::COMPUTE_IMPULSES` is renamed `COMPUTE_RIGID_IMPULSES`.
+- `RigidBodyType::SoftFrame`: the rigid proxies of soft bodies, counted as dynamic by `is_dynamic`.
+- `DebugRenderObject::SoftBody` variant, and new fields in `IntegrationParameters`,
+  `DebugRenderStyle` and `PhysicsWorld` (`soft_bodies`, `collision_pipeline`).
+- `CCDSolver::solve_continuous` no longer takes `scene_changed`, and
+  `RigidBodyCcd::is_moving_fast` also takes the body's mass properties.
+- Snapshots serialized with previous versions can't be loaded anymore.
+- The `std` feature of `rapier2d` and `rapier2d-f64` now enables `parry2d/spade`.
+- The C, Python, and JavaScript/TypeScript bindings moved to the `bindings/` directory.
+- The `bevy_rapier2d` and `bevy_rapier3d` plugins now live in this repository, in `bindings/bevy_rapier`.
+- Testbed: rigid-body axes are shown by default and polylines are drawn as thick lines (2D) or tubes (3D).
+
+### Fixed
+
+- The CCD no longer sweeps against a stale list of fixed colliders after they were added, removed or
+  moved during a step where no body needed CCD.
+- `KinematicCharacterController::solve_character_collision_impulses` now pushes every dynamic body
+  touched by a compound character, not only the last one.
+- A step with `dt == 0` no longer produces NaNs: it only applies user changes and detects collisions.
+- `CollisionPipeline::step` no longer trips a debug assertion when a moving body touches a collider.
+- Enabling or disabling an impulse joint now updates the islands of its bodies.
+- Multibody DoF couplings are no longer lost when multibodies merge or split, and disabled
+  self-contacts are no longer re-enabled when they merge.
+- `PhysicsPipeline::counters` now fills the contact pair, contact and constraint counts.
+- With `max_ccd_substeps > 1`: end-of-step AABBs cover the full next step, the step splitter uses
+  the current velocity, and heavy bodies under gravity are no longer flagged as fast.
+- `SpringCoefficients` no longer divides by zero when `damping_ratio` is zero.
+- `rapier3d-urdf`: `<origin rpy>` angles are now composed as fixed-axis roll-pitch-yaw, as specified.
+- `rapier3d-urdf`: the fixed children of a squeezed empty link stay rigidly attached, and the joint
+  taking over the removed link's joint keeps its pivot.
+- Testbed (3D): `camera_rotation` and `camera_fwd_dir` return the actual camera orientation.
+
+## v0.35.3 (28 August 2026)
+
+### Fixed
+
+- Multibody: properly support the constraint-based MJCF frictionloss statement instead of emulating
+  it with a motor.
+
+## v0.35.2 (15 August 2026)
+
+### Fixed
+
+- Multibody: guard against the instabilities the semi-implicit coriolis term can introduce when
+  the mass matrix is near-singular. The free-velocity update is re-solved with the plain mass
+  matrix whenever it injects more energy than the applied forces’ work.
+- Motors and limits of multibody joints now honor their compliance (the CFM term was left out of
+  the row’s effective mass), so their gains may need to be stiffer to settle as fast as before.
+- Generic (multibody) joint constraints now reserve the exact number of jacobian rows they emit:
+  an axis carrying both a motor and a limit produces two, exceeding the previous allocation.
+- The impulses reported on contacts (and the contact-force events derived from them) are now the
+  total impulse applied during the step, instead of one substep too many: they drop by
+  `1 / (num_solver_iterations + 1)` and no longer vary with `warmstart_coefficient`.
+- MJCF: a geom’s `margin` is no longer loaded as a `contact_skin`, which made geoms rest that far
+  apart. It is ignored below rapier’s speculative-contact distance, and becomes the body’s
+  soft-CCD prediction above it (`PairOverride::margin` is removed).
+- MJCF: actuators now load as `MotorModel::ForceBased`, matching MuJoCo gains, which are absolute
+  generalized forces rather than accelerations.
+
+## v0.35.1 (08 August 2026)
+
+### Added
+
+- Added public access to the testbed’s `Window` and `GraphicsManager` to enable custom
+  rendering on third-party examples.
+
+## v0.35.0 (08 August 2026)
+
+### Added
+
+- `ContactForceEvent::started`: `true` on the step a pair's total contact force first
+  exceeds its `contact_force_event_threshold` (coming from below it, or from separation),
+  `false` while it stays above on consecutive steps — the analogue of PhysX's
+  "threshold force found" vs "persists" report. The status resets when the force drops
+  back below the threshold or the colliders separate.
+
+- `CoefficientCombineRule::GeometricMean`: combines friction/restitution as
+  `sqrt(c1 * c2)`, the convention used by several other engines. It has the highest
+  rule priority, and clamps negative coefficients to zero before the square root.
+- `DebugRenderStyle::sleep_eligible_color_multiplier`: the debug-renderer now draws bodies that
+  are eligible for sleep but still awake in a distinct color, making it easy to spot what is
+  keeping a pile awake.
+
+### Fixed
+
+- `Wheel::rotation` now accumulates from the wheel's own rolling direction on the
+  contact plane (`contact normal × axle`, the same forward direction used by the
+  friction update) instead of the chassis' `index_forward_axis`, so wheels visually
+  spin whenever the vehicle actually rolls (adapted from PR #950 by @tomo0613).
+- `DynamicRayCastVehicleController` no longer has unlimited braking friction when a
+  wheel's side impulse is exactly zero (e.g. braking in a straight line): the skid
+  clamp now applies to the forward impulse as well, so braking strength is bounded by
+  `friction_slip` (PR #947 by @tomo0613).
+- Angular joint limits are no longer restricted to `(-π, π)`: the limit rows now measure the
+  wrapped joint angle from the middle of the allowed range (with the joint axis as the row's
+  jacobian, like the angular motor rows), so a range may sit anywhere on the circle
+  (`[0, 3π/2]` stops the joint at 3π/2 instead of π/2, and ranges crossing the ±π seam like
+  `[3π/4, 5π/4]` work at all). A range wider than a full turn is indistinguishable from "no
+  limit" for an angle read off a relative rotation, so it now leaves the axis free instead of
+  clamping it at some folded-back angle.
+- Joint limit rows (linear and angular) now cap their position-correction bias by
+  `IntegrationParameters::max_corrective_velocity`, like contacts always did: a deep limit
+  violation recovers over a few steps instead of catapulting the bodies.
+- Python: `DynamicRayCastVehicleController.update_vehicle` now excludes the chassis body from
+  the suspension raycasts by default (their origins sit on its own collider).
+- The character controller's snap-to-ground now triggers on any movement that isn't upwards,
+  including movements exactly orthogonal to the up vector, instead of requiring a downward
+  motion larger than an arbitrary epsilon. Purely lateral movement along the ground no longer
+  flickers the `grounded` flag when snap-to-ground is enabled (PR #481 by @ChrisJanssens).
+- Restitution is now applied as an end-of-step pass instead of during the velocity solve, so
+  contacts detected speculatively (within the prediction distance) bounce with the requested
+  coefficient instead of being damped away by the prediction distance (issue #974).
+- SIMD joint constraints now build their local frames relative to the body's center of mass,
+  fixing joints on bodies whose center of mass isn't at their origin (PR #953 by @Kyzzsa).
+- The broad phase now filters candidate pairs by collision groups, so colliders that can never
+  interact don't reach the narrow phase at all (issue #288).
+- `ContactForceEvent` sums the pair's *solver* manifolds, so contact clustering no longer
+  makes the reported force and contact point disagree with what the solver applied.
+- Generic (multibody) contact constraints now rebuild their anchors in the same frames the
+  substep update uses, fixing multibodies welded to rigid-bodies never settling (issue #968).
+- `RigidBodyBuilder::additional_mass` on a body whose colliders are all massless (zero density)
+  now derives the angular inertia from the collider shapes instead of leaving it null, so such
+  bodies rotate (issue #666).
+- Joints specified through a subset of their axes now complete the missing frame axes with a
+  twist-consistent minimal rotation, so a prismatic joint whose axis isn't `x` no longer picks
+  an arbitrarily rolled frame (issue #746).
+- `RigidBody::sleep()` is now honored immediately, even when the body was repositioned during
+  the same frame (issue #448).
+- `ImpulseJointSet::joints_between` now yields every joint between the two bodies instead of
+  only the first (issue #866).
+- `CollisionPipeline::step` now clears the rigid-bodies' modified flags, so a collision-only
+  pipeline no longer accumulates stale change tracking (issue #662).
+- Contact impulses are stored with canonicalized signed zeros, removing a source of
+  cross-platform divergence with `enhanced-determinism`.
+- The debug-renderer now draws the border radius of 2D round triangles (issue #634).
+- Testbed: objects no longer flash visible for one frame when the surface rendering is
+  disabled (issue #843).
+
+### Modified
+
+- The broad phase no longer creates pairs between colliders attached to the same
+  rigid-body (they can never collide). A single awake body carrying thousands of
+  mutually-overlapping colliders previously flooded the pair map and contact graph with
+  pairs the narrow phase re-discarded every step; the issue #970 scene (2,210 convex
+  colliders on one always-awake body) steps ~90x faster while stationary and ~18x
+  faster while moving. Note that `NarrowPhase::contact_pair` now returns `None` for
+  same-parent colliders instead of a manifold-less pair.
+- Sleep eligibility is now judged on the actual per-step pose displacement (measured at the
+  body’s farthest point) instead of the velocities: a body held in place by contacts can sleep
+  even with residual solver velocities, while a body creeping through solver position
+  corrections cannot.
+- With the `block-solver` feature, manifolds whose 2x2 constraint matrix is almost singular
+  (e.g. redundant contact points) are now solved with the sequential solver instead of a
+  degraded one-point solve, removing residual jiggle in piles. The block solver also uses the
+  same lexicographic manifold point ordering as the sequential solver.
+- Improved 3D solver performance by caching the constraints angular jacobians instead of
+  recomputing them at each solver iteration.
+
+## v0.35.0-beta.0 (02 August 2026)
+
+### Breaking changes
+
+- ⚠ Removed the `simd-stable`, `simd-nightly` and `simd-is-enabled` features: SIMD is now
+  always on, backed by `wide` (which falls back to scalar code where unsupported); the
+  nightly `core::simd` backend is gone (we will support it when it get stabilized).
+  Just drop these features from your `Cargo.toml`.
+- ⚠ `PhysicsHooks` and `EventHandler` now require `Sync` instead of `Send + Sync` (through
+  the blanket-implemented `utils::MaybeSync`). Existing implementations keep compiling.
+- ⚠ Sleeping was rewritten around persistent islands: an island sleeps and wakes strictly
+  as a unit, so a body is never frozen while something it touches still moves. The
+  `IslandManager` and `RigidBodyActivation` serialization formats changed.
+- ⚠ Sleep thresholds changed: `normalized_linear_threshold` defaults to `0.05` (was `0.4`,
+  and is now measured at the body’s farthest point) and `time_until_sleep` to `0.5` seconds
+  (was `2.0`).
+- ⚠ Awake bodies are solved as a single active set: `IntegrationParameters::min_island_size`
+  was removed.
+- ⚠ The CCD solver was rewritten around sweep-based time of impact: each fast body is
+  clamped to its earliest impact (pose only; velocities resolve through speculative
+  contacts), and already-touching pairs no longer pin the body in place.
+  `CCDSolver::predict_impacts_at_next_positions`/`clamp_motions`, `PredictedImpacts` and
+  `TOIEntry` were replaced by `CCDSolver::solve_continuous`.
+- ⚠ Fast dynamic bodies now always run CCD against fixed colliders; `ccd_enabled` upgrades
+  a body to a "bullet" that also sweeps kinematic and dynamic bodies. Set
+  `IntegrationParameters::max_ccd_substeps` to `0` to disable CCD entirely.
+- ⚠ Body velocities are now capped each substep: linear speed at
+  `IntegrationParameters::max_linear_velocity()` (default 400 units/s) and rotation at
+  ~45° per step (`RigidBody::set_allow_fast_rotation` bypasses the angular cap).
+  `RigidBodyCcd::ccd_max_dist` became `RigidBody::max_extent()`, which `max_point_velocity`
+  now takes as an argument.
+- ⚠ Contact defaults changed: `normalized_prediction_distance` is `0.02` (was `0.002`),
+  `normalized_max_corrective_velocity` is `3.0` (was `10.0`) and
+  `normalized_allowed_linear_error` is `0.005` (was `0.001`), greatly reducing tunneling
+  through thin walls. Contacts against fixed bodies use a stiffer spring
+  (`IntegrationParameters::static_contact_softness`).
+- ⚠ `SolverContact` stores per-body anchors instead of a single world point, and friction
+  and restitution became per-manifold (new `friction`/`restitution` fields on
+  `ContactModificationContext`, instead of per-contact). Inside
+  `PhysicsHooks::modify_solver_contacts` the anchors still hold fresh world-space points,
+  and `dist` edits are still honored. `ContactModificationContext::solver_contacts` is now
+  a `SolverContacts` (an inline `ArrayVec` in 2D, still a `Vec` in 3D).
+- ⚠ `ContactPair` can now store reduced *solver clusters* alongside its manifolds; use
+  `ContactPair::solver_manifolds()` to read what the solver actually sees.
+- ⚠ `RigidBody::additional_solver_iterations` now adds whole solver substeps for the
+  body’s constraint-connected component, converging much better on high mass ratios.
+
+### Added
+
+- NaN/infinity quarantine: bodies and colliders whose pose, velocity or geometry goes
+  non-finite are rolled back to their last valid pose, disabled, and reported through
+  `PhysicsPipeline::quarantine()`/`PhysicsWorld::quarantine()` (new `Quarantine` type),
+  instead of corrupting the rest of the simulation.
+- Thread-pool API on `PhysicsPipeline`/`PhysicsWorld` (`parallel` feature):
+  `configure_thread_pool`, `set_thread_pool`, `thread_pool`, `clear_thread_pool` and
+  `num_threads`. When set, the whole step runs inside that pool.
+- `enhanced-determinism` can now be combined with `parallel`, with results bitwise
+  identical for any thread-pool size, and costs no measurable performance anymore
+  (cross-platform determinism now rests on glam’s shared scalar core plus `libm`-pinned
+  transcendentals). It remains incompatible with `simd8`, and cross-platform reproducibility
+  still requires matching numeric features (`block-solver`, f32 vs f64).
+- New `simd8` feature: widens the solver’s SIMD from 4 to 8 lanes (f32 only; needs an
+  AVX2-capable target to emit 256-bit instructions).
+- New `block-solver` feature (on by default in 2D): solves adjacent contact points as
+  coupled 2x2 blocks for better resting-stack stability.
+- New `unsync-callbacks` feature: drops the `Sync` requirement from `PhysicsHooks` and
+  `EventHandler` for thread-affine callbacks (a JS closure, a GUI handle). Callbacks then
+  all run on the thread driving `step()`, and the thread-pool API above is compiled out
+  (install a pool by stepping from inside it). Parallelism is kept: only the pairs that can
+  reach a callback are held back for the driving thread.
+- New `solver-bounds-checks` feature: validates the solver’s body indices at constraint
+  generation, turning a stale index into a clean panic instead of an unchecked SIMD gather.
+- `ColliderBuilder::oriented_polyline` (2D): a one-sided polyline that only collides on the
+  side determined by vertex winding.
+- `IntegrationParameters::contact_clustering` and `contact_recycling` (both on by default,
+  plus `normalized_contact_recycle_distance`): reduce narrow-phase and solver work on
+  composite-shape and resting contacts.
+- `IntegrationParameters::friction_in_bias_pass` and `warmstart_joints` solver tuning knobs.
+
+### Modified
+
+- The narrow phase and constraint solver were reworked around a persistent contact graph and
+  a staged multithreaded solver (parallelism within a single island), for lower per-step
+  overhead and steadier timings; multithreaded trajectories may shift within solver
+  tolerance.
+- The broad phase was reworked for large, mostly-static worlds: scenes with very large static
+  collider counts now pay near-zero per-step broad-phase cost.
+- Gyroscopic forces are applied per-substep in the principal inertia frame, improving
+  fast-spinning asymmetric bodies.
+- Removed the x86 flush-to-zero/denormals-are-zero floating-point flag: it mutated a
+  process-wide control register behind the user’s back.
+
+## v0.34.0 (04 July 2026)
+
+### Added
+
+- Multibody joints now support a per-DoF **armature** (reflected rotor inertia, matching MuJoCo's
+  concept), exposed via `Multibody::armature()` / `armature_mut()`. The related
+  `Multibody::dof_inverse_inertia()` returns the articulated DoF inverse inertia including armature.
+- Multibody joints now support passive **per-DoF springs** (MuJoCo-style spring/damper) via
+  `MultibodyJoint::set_spring()` / `spring()`, integrated implicitly.
+- Multibody joints now support **holonomic DoF coupling**: constrain one generalized coordinate to
+  another via `MultibodyDofCoupling` and `Multibody::add_dof_coupling()` / `couplings()`.
+- `MultibodyLink::assembly_id()` exposes the offset of a link's DoFs in the multibody's generalized
+  coordinate/velocity vectors.
+- `rapier3d-mjcf`: support for tendons, equality constraints, materials (including visual-mesh
+  materials), actuator max-force, joint DoF coupling, armature, per-DoF spring/damper, and control.
+- Testbed: the ability to specify a material.
+
+### Fixed
+
+- Corrected the local frame of impulse joints attached to multibodies.
+- Added a missing coupling term for loop-closing impulse-joint constraints (bodies with a non-zero
+  center-of-mass offset).
+- Fixed a crash occurring with the `parallel` feature enabled.
+
+### Modified
+
+- **Breaking (`rapier_testbed` only):** the testbed was reworked to remove the callback-based API.
+  `Harness::add_callback` / `clear_callbacks` and the `HarnessPlugin` trait were removed, and several
+  testbed/harness types (`RunState`, `PhysicsState`, `RapierBroadPhaseType`,
+  `TestbedApp::from_builders` / `set_builders`, etc.) were changed. Simulation setup now drives the
+  physics world directly instead of registering per-step callbacks. The core `rapier2d`/`rapier3d`
+  physics API is unaffected.
+
+## v0.33.0 (05 June 2026)
+
+### Added
+
+- New `mjcf-rs` and `rapier3d-mjcf` crates: a pure-Rust (no `libmujoco`/FFI) loader for the MuJoCo
+  MJCF XML format. `mjcf-rs` parses MJCF into a typed AST — resolving `<include>`, `<default>`
+  class inheritance, angle units, and the several rotation specs (`quat`, `axisangle`, `euler`,
+  `xyaxes`, `zaxis`) — and `rapier3d-mjcf` converts a model into rigid-bodies, colliders, and
+  joints via `MjcfRobot`. Meshes load behind the `stl`/`wavefront`/`msh` features, and visual
+  meshes support per-vertex normals with optional smoothing ([#936](https://github.com/dimforge/rapier/pull/936), [#943](https://github.com/dimforge/rapier/pull/943)).
+- Python bindings for Rapier 2D/3D (`rapier-py-*` crates under `python/`), generated and published
+  as installable wheels ([#938](https://github.com/dimforge/rapier/pull/938)).
+- New `PhysicsWorld` convenience wrapper bundling `RigidBodySet`, `ColliderSet`, the broad/narrow
+  phases, islands, joints, the CCD solver, gravity, and integration parameters in a single struct,
+  for simpler setup of basic simulations. It also exposes helpers for waking bodies (`wake_up`,
+  `wake_up_all`), iterating only active bodies (`active_bodies`), and iterating joints — including
+  those attached to a given body (`impulse_joints`, `impulse_joints_with`, `multibody_joints`,
+  `multibody_joints_with`).
+- `std`/`alloc` feature gating: `no_std` builds are now supported, and a subset of the library
+  compiles without `alloc` as well (e.g. for `spirv` targets) ([#928](https://github.com/dimforge/rapier/pull/928)).
+- `InteractionGroups` and `Group` now derive `bytemuck::NoUninit` under the `bytemuck` feature,
+  and `InteractionTestMode` is `#[repr(u32)]`, making them GPU-uploadable.
+- `MultibodyJoint::joint_rot()` and `MultibodyJoint::coords()` expose the joint’s rotation and
+  generalized coordinates publicly.
+- `ImpulseJointSet::set_bodies` rewires an existing impulse joint to a new pair of bodies while
+  preserving its handle, configuration, and warm-started impulses.
+- `rapier3d-urdf`:
+  - New `UrdfLoaderOptions::mesh_converter` lets the loader replace the original mesh with a
+    cheap proxy shape (e.g. `MeshConverter::Obb`) while keeping the source mesh available for
+    rendering via the new `UrdfCollider::visual` / `UrdfVisual` types.
+  - New `UrdfLoaderOptions::scale` applies a uniform scale to link positions, joint anchors,
+    mesh sizes, primitive shape sizes, inertial offsets, and prismatic joint limits.
+  - New `UrdfLoaderOptions::squeeze_empty_fixed_links` (default `true`) removes empty links
+    connected by fixed joints, splicing the kinematic chain so bodyless “frame-only” links
+    (e.g. `world`, `*_tcp`) no longer create mass-less rigid-bodies.
+  - URDF files with empty `<geometry></geometry>` blocks are now accepted (sanitized before
+    parsing, then skipped when building colliders).
+  - The `urdf_rs` crate is re-exported.
+
+### Fixed
+
+- `QueryPipeline::project_point` now honors its `max_dist` argument (it was previously ignored).
+- Several multibody-related crashes ([#906](https://github.com/dimforge/rapier/issues/906), [#907](https://github.com/dimforge/rapier/issues/907), [#908](https://github.com/dimforge/rapier/issues/908), [#927](https://github.com/dimforge/rapier/issues/927)).
+- Continuous Collision Detection now consults the user's `PhysicsHooks::filter_contact_pair`
+  hook, matching narrow-phase semantics. Previously, CCD would clamp a fast-moving body's
+  motion at a predicted impact with a pair the user had filtered out ([#929](https://github.com/dimforge/rapier/pull/929), closes [#754](https://github.com/dimforge/rapier/issues/754)).
+- Corrected the documentation of `RigidBody::add_force` / `add_torque` / `reset_forces` /
+  `reset_torques`: user-defined forces and torques are **not** cleared automatically between
+  steps and persist until explicitly reset ([#903](https://github.com/dimforge/rapier/issues/903)).
+
+### Modified
+
+- Unify version numbers for `rapier3d-urdf`, `rapier3d-meshloader`, and `rapier3d-mjcf` so they
+  follow the same versioning as the other libraries in the workspace.
 - **Breaking (CCD solver direct callers only):** `CCDSolver::find_first_impact` and
   `CCDSolver::predict_impacts_at_next_positions` now take an extra `hooks: &dyn PhysicsHooks`
   argument. `PhysicsPipeline::step` callers are unaffected.
+- **Breaking:** `QueryPipeline::project_point_and_get_feature` now takes an additional
+  `max_dist: Real` argument.
+- **Breaking (`rapier3d-urdf`):** `UrdfLink::colliders` and `UrdfLinkHandle::colliders` changed
+  from `Vec<Collider>` / `Vec<ColliderHandle>` to `Vec<UrdfCollider>` / `Vec<UrdfColliderHandle>`
+  to carry the optional visual mesh override.
+- **Behavior change (`rapier3d-urdf`):** with `squeeze_empty_fixed_links` defaulting to `true`,
+  empty links bridged by fixed joints are now collapsed by default. Set it to `false` to keep
+  the previous behavior.
+- Update `glamx` to 0.3.
+- Updated `wide` version to `1` ([#902](https://github.com/dimforge/rapier/issues/902)).
 
-## v0.31.0 (09 Jan. 2026)
+## v0.32.0 (09 Jan. 2026)
 
 ### Modified
 

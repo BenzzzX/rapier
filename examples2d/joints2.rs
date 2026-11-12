@@ -1,28 +1,22 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let mut impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Enable/disable softness.
      */
-    let settings = testbed.example_settings_mut();
+    let settings = viewer.example_settings_mut();
     let variable_softness = settings.get_or_set_bool("Variable softness", false);
 
     /*
      * Create the balls
      */
     // Build the rigid body.
-    // NOTE: a smaller radius (e.g. 0.1) breaks Box2D so
-    // in order to be able to compare rapier with Box2D,
-    // we set it to 0.4.
     let rad = 0.4;
     let numi = 10; // Num vertical nodes.
     let numk = 10; // Num horizontal nodes.
@@ -43,9 +37,8 @@ pub fn init_world(testbed: &mut Testbed) {
 
             let rigid_body =
                 RigidBodyBuilder::new(status).translation(Vector::new(fk * shift, -fi * shift));
-            let child_handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::ball(rad);
-            colliders.insert_with_parent(collider, child_handle, &mut bodies);
+            let (child_handle, _) = world.insert(rigid_body, collider);
 
             let softness = if variable_softness {
                 // If variable softness is enabled, joints closer to the fixed body are softer.
@@ -63,7 +56,7 @@ pub fn init_world(testbed: &mut Testbed) {
                 let joint = RevoluteJointBuilder::new()
                     .local_anchor2(Vector::new(0.0, shift))
                     .softness(softness);
-                impulse_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_impulse_joint(parent_handle, child_handle, joint);
             }
 
             // Horizontal joint.
@@ -73,7 +66,7 @@ pub fn init_world(testbed: &mut Testbed) {
                 let joint = RevoluteJointBuilder::new()
                     .local_anchor2(Vector::new(-shift, 0.0))
                     .softness(softness);
-                impulse_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_impulse_joint(parent_handle, child_handle, joint);
             }
 
             body_handles.push(child_handle);
@@ -83,6 +76,13 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::new(numk as f32 * rad, numi as f32 * -rad), 20.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::new(numk as f32 * rad, numi as f32 * -rad), 20.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

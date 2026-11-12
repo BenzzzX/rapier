@@ -6,18 +6,37 @@
 [files]
 extend-exclude = [
     ".git/",
+    # The website's static assets are generated/vendored: prebuilt demo
+    # bundles, generated TypeDoc HTML, and exported SVGs — not authored prose.
+    "website/static/",
+    "website/.yarn/",
 ]
 ignore-hidden = false
 
 [default]
 extend-ignore-re = [
     "\\bPolygon::PN\\b",
+    # Index notation in the strain-constraint docs: `m_ba`, `ε_ba` (the b,a entry).
+    "_ba\\b",
 ]
 
 # Case sensitive, matches entire word.
 [default.extend-identifiers]
 anc_color = "anc_color"
 rady = "rady"
+iit_softfoot = "iit_softfoot"
+FoV = "FoV"
+# Shepperd's method: named after S. W. Shepperd (quaternion extraction).
+Shepperd = "Shepperd"
+# Short local identifiers in the Python bindings/tests: `ba` (body a, paired
+# with `bb`) and `typ` (a "type" value — `type` is reserved in Rust/Python).
+ba = "ba"
+typ = "typ"
+# Voxel grid coordinate index in the JS bindings, paired with `ix`/`iz`.
+iy = "iy"
+# Template mesh data in the testbed instancer: `tpos`/`tnrm`/`tidx`
+# (template positions/normals/indices). Only `tpos` collides with a word.
+tpos = "tpos"
 
 # Case insensitive, matches inside word.
 [default.extend-words]

@@ -1,14 +1,11 @@
-use rapier_testbed2d::Testbed;
+use rapier_testbed2d::TestbedViewer;
 use rapier2d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let mut impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Create the balls
@@ -34,15 +31,14 @@ pub fn init_world(testbed: &mut Testbed) {
 
             let rigid_body =
                 RigidBodyBuilder::new(status).translation(Vec2::new(fk * shift, -fi * shift));
-            let child_handle = bodies.insert(rigid_body);
             let collider = ColliderBuilder::ball(rad);
-            colliders.insert_with_parent(collider, child_handle, &mut bodies);
+            let (child_handle, _) = world.insert(rigid_body, collider);
 
             // Vertical joint.
             if i > 0 {
                 let parent_handle = *body_handles.last().unwrap();
                 let joint = RevoluteJointBuilder::new().local_anchor2(Vec2::new(0.0, shift));
-                impulse_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_impulse_joint(parent_handle, child_handle, joint);
             }
 
             // Horizontal joint.
@@ -50,7 +46,7 @@ pub fn init_world(testbed: &mut Testbed) {
                 let parent_index = body_handles.len() - numi;
                 let parent_handle = body_handles[parent_index];
                 let joint = RevoluteJointBuilder::new().local_anchor2(Vec2::new(-shift, 0.0));
-                impulse_joints.insert(parent_handle, child_handle, joint, true);
+                world.insert_impulse_joint(parent_handle, child_handle, joint);
             }
 
             body_handles.push(child_handle);
@@ -58,8 +54,15 @@ pub fn init_world(testbed: &mut Testbed) {
     }
 
     /*
-     * Set up the testbed.
+     * Set up the viewer.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec2::new(numk as f32 * rad, numi as f32 * -rad), 5.0);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec2::new(numk as f32 * rad, numi as f32 * -rad), 5.0);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

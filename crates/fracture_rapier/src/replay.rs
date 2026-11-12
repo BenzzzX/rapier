@@ -166,6 +166,7 @@ impl FxRapierWorld2D {
                         RigidBodyType::Fixed => 1,
                         RigidBodyType::KinematicPositionBased => 2,
                         RigidBodyType::KinematicVelocityBased => 3,
+                        RigidBodyType::SoftFrame => 4,
                     },
                     sleeping: body.is_sleeping(),
                 });

@@ -1,14 +1,11 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     /*
      * World
      */
-    let mut bodies = RigidBodySet::new();
-    let mut colliders = ColliderSet::new();
-    let impulse_joints = ImpulseJointSet::new();
-    let multibody_joints = MultibodyJointSet::new();
+    let mut world = PhysicsWorld::new();
 
     /*
      * Create the balls
@@ -39,9 +36,8 @@ pub fn init_world(testbed: &mut Testbed) {
                 let rigid_body = RigidBodyBuilder::new(status)
                     .translation(Vec3::new(x, y, z))
                     .sleeping(true); // j < num - 1);
-                let handle = bodies.insert(rigid_body);
                 let collider = ColliderBuilder::ball(rad).density(density);
-                colliders.insert_with_parent(collider, handle, &mut bodies);
+                let _ = world.insert(rigid_body, collider);
             }
         }
     }
@@ -49,6 +45,13 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Set up the testbed.
      */
-    testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
-    testbed.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+    viewer.set_world(&mut world);
+    viewer.look_at(Vec3::new(100.0, 100.0, 100.0), Vec3::ZERO);
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
+    }
+    Ok(())
 }

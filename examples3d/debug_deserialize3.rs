@@ -1,4 +1,4 @@
-use rapier_testbed3d::Testbed;
+use rapier_testbed3d::TestbedViewer;
 use rapier3d::prelude::*;
 
 #[derive(serde::Deserialize)]
@@ -14,9 +14,9 @@ struct PhysicsState {
     pub multibody_joints: MultibodyJointSet,
 }
 
-pub fn init_world(testbed: &mut Testbed) {
+pub async fn run(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
     // Deserialize
-    let setting = testbed.example_settings_mut();
+    let setting = viewer.example_settings_mut();
     let frame_id = setting.get_or_set_u32("frame", 0, 0..=1400);
     let frame_dirs = "/Users/sebcrozet/work/hytopia/sdk/examples/bug-demo";
     let path = format!("{frame_dirs}/snapshot{frame_id}.bincode");
@@ -24,10 +24,10 @@ pub fn init_world(testbed: &mut Testbed) {
         Ok(bytes) => bytes,
         Err(err) => {
             println!("Failed to open the serialized scene file {path:?}: {err}");
-            return;
+            return Ok(());
         }
     };
-    match bincode::deserialize(&bytes) {
+    let mut world = match bincode::deserialize(&bytes) {
         Ok(state) => {
             let state: PhysicsState = state;
             println!("World state deserialized successfully:");
@@ -46,21 +46,32 @@ pub fn init_world(testbed: &mut Testbed) {
                 }
             }
 
-            testbed.set_world(
-                state.bodies,
-                state.colliders,
-                state.impulse_joints,
-                state.multibody_joints,
-            );
-
-            testbed.harness_mut().physics.islands = state.islands;
-            testbed.harness_mut().physics.broad_phase = state.broad_phase;
-            testbed.harness_mut().physics.narrow_phase = state.narrow_phase;
-            testbed.harness_mut().physics.integration_parameters = state.integration_parameters;
-            testbed.harness_mut().physics.gravity = state.gravity;
-
-            testbed.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::new(0.0, 0.0, 0.0));
+            let mut world = PhysicsWorld::new();
+            world.bodies = state.bodies;
+            world.colliders = state.colliders;
+            world.impulse_joints = state.impulse_joints;
+            world.multibody_joints = state.multibody_joints;
+            world.islands = state.islands;
+            world.broad_phase = state.broad_phase;
+            world.narrow_phase = state.narrow_phase;
+            world.integration_parameters = state.integration_parameters;
+            world.gravity = state.gravity;
+            world
         }
-        Err(err) => println!("Failed to deserialize the world state: {err}"),
+        Err(err) => {
+            println!("Failed to deserialize the world state: {err}");
+            return Ok(());
+        }
+    };
+
+    viewer.set_world(&mut world);
+
+    viewer.look_at(Vec3::new(10.0, 10.0, 10.0), Vec3::new(0.0, 0.0, 0.0));
+
+    while viewer.render_frame(&mut world).await {
+        if viewer.simulating() {
+            world.step();
+        }
     }
+    Ok(())
 }

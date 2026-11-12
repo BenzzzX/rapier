@@ -1,15 +1,13 @@
 use rapier::math::Real;
+use rapier::pipeline::PhysicsWorld;
 
 use crate::debug_render::DebugRenderPipelineResource;
-use crate::harness::{Harness, RapierBroadPhaseType};
-use crate::testbed::{
-    PHYSX_BACKEND_PATCH_FRICTION, PHYSX_BACKEND_TWO_FRICTION_DIR, RunMode, TestbedActionFlags,
-    TestbedState, TestbedStateFlags, UiTab,
-};
+use crate::physics::RapierBroadPhaseType;
+use crate::testbed::state::Transition;
+use crate::testbed::{RunMode, TestbedActionFlags, TestbedState, TestbedStateFlags, UiTab};
 
 pub use egui;
 
-use crate::PhysicsState;
 use crate::settings::SettingValue;
 use egui::{ComboBox, RichText, Slider, Ui, Window};
 use web_time::Instant;
@@ -41,42 +39,42 @@ fn setup_custom_theme(ctx: &egui::Context) {
     let rounding = CornerRadius::same(6);
     let small_rounding = CornerRadius::same(4);
 
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         let v = &mut style.visuals;
         v.dark_mode = false;
 
         v.widgets.noninteractive.bg_fill = faint_bg;
         v.widgets.noninteractive.weak_bg_fill = faint_bg;
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, stroke_color);
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, stroke_color);
         v.widgets.noninteractive.corner_radius = rounding;
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_color);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text_color);
 
         v.widgets.inactive.bg_fill = widget_bg;
         v.widgets.inactive.weak_bg_fill = widget_bg;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, stroke_color);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, stroke_color);
         v.widgets.inactive.corner_radius = small_rounding;
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, text_color);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text_color);
 
         v.widgets.hovered.bg_fill = widget_bg_hover;
         v.widgets.hovered.weak_bg_fill = widget_bg_hover;
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, stroke_hover);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, stroke_hover);
         v.widgets.hovered.corner_radius = small_rounding;
-        v.widgets.hovered.fg_stroke = Stroke::new(1.5, text_color);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, text_color);
 
         v.widgets.active.bg_fill = widget_bg_active;
         v.widgets.active.weak_bg_fill = widget_bg_active;
-        v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+        v.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
         v.widgets.active.corner_radius = small_rounding;
-        v.widgets.active.fg_stroke = Stroke::new(2.0, accent_active);
+        v.widgets.active.fg_stroke = Stroke::new(2.0_f32, accent_active);
 
         v.widgets.open.bg_fill = widget_bg;
         v.widgets.open.weak_bg_fill = widget_bg;
-        v.widgets.open.bg_stroke = Stroke::new(1.0, stroke_color);
+        v.widgets.open.bg_stroke = Stroke::new(1.0_f32, stroke_color);
         v.widgets.open.corner_radius = small_rounding;
-        v.widgets.open.fg_stroke = Stroke::new(1.0, text_color);
+        v.widgets.open.fg_stroke = Stroke::new(1.0_f32, text_color);
 
         v.selection.bg_fill = accent.gamma_multiply(0.25);
-        v.selection.stroke = Stroke::new(1.0, accent);
+        v.selection.stroke = Stroke::new(1.0_f32, accent);
 
         v.hyperlink_color = accent;
         v.faint_bg_color = faint_bg;
@@ -87,7 +85,7 @@ fn setup_custom_theme(ctx: &egui::Context) {
 
         v.window_corner_radius = CornerRadius::same(8);
         v.window_fill = window_fill;
-        v.window_stroke = Stroke::new(1.0, stroke_color);
+        v.window_stroke = Stroke::new(1.0_f32, stroke_color);
 
         v.panel_fill = bg_fill;
 
@@ -107,7 +105,7 @@ fn setup_custom_theme(ctx: &egui::Context) {
 pub(crate) fn update_ui(
     ui_context: &egui::Context,
     state: &mut TestbedState,
-    harness: &mut Harness,
+    world: &mut PhysicsWorld,
     debug_render: &mut DebugRenderPipelineResource,
 ) {
     setup_custom_theme(ui_context);
@@ -129,6 +127,7 @@ pub(crate) fn update_ui(
                 ui.selectable_value(&mut state.selected_tab, UiTab::Examples, "Examples");
                 ui.selectable_value(&mut state.selected_tab, UiTab::Settings, "Settings");
                 ui.selectable_value(&mut state.selected_tab, UiTab::Performance, "Performance");
+                ui.selectable_value(&mut state.selected_tab, UiTab::DebugRender, "Debug");
             });
 
             ui.separator();
@@ -143,10 +142,13 @@ pub(crate) fn update_ui(
                         examples_tab(ui, state);
                     }
                     UiTab::Settings => {
-                        settings_tab(ui, state, harness, debug_render);
+                        settings_tab(ui, state, world);
                     }
                     UiTab::Performance => {
-                        performance_tab(ui, harness);
+                        performance_tab(ui, state, world);
+                    }
+                    UiTab::DebugRender => {
+                        debug_render_tab(ui, debug_render);
                     }
                 });
 
@@ -176,13 +178,17 @@ pub(crate) fn update_ui(
                     state.running = RunMode::Step;
                 }
 
+                ui.label(RichText::new(format!("#{}", state.timestep_id)).monospace())
+                    .on_hover_text("Steps run since the example started");
+
                 // Restart
                 if ui
                     .button("Restart")
                     .on_hover_text("Restart example (R)")
                     .clicked()
                 {
-                    state.action_flags.set(TestbedActionFlags::RESTART, true);
+                    state.preserve_settings_on_switch = true;
+                    state.transition = Some(Transition::Switch);
                 }
 
                 ui.separator();
@@ -203,37 +209,24 @@ pub(crate) fn update_ui(
                         .action_flags
                         .set(TestbedActionFlags::RESTORE_SNAPSHOT, true);
                 }
+
+                ui.separator();
+
+                if ui
+                    .button("Frame all")
+                    .on_hover_text("Recenter the camera so the entire scene fills the view")
+                    .clicked()
+                {
+                    state
+                        .action_flags
+                        .set(TestbedActionFlags::FRAME_SCENE, true);
+                }
             });
         });
 }
 
 fn examples_tab(ui: &mut Ui, state: &mut TestbedState) {
-    // Backend selector (if multiple backends available)
-    if state.backend_names.len() > 1 {
-        ui.horizontal(|ui| {
-            ui.label("Backend:");
-            let mut backend_changed = false;
-            ComboBox::from_id_salt("backend_combo")
-                .width(150.0)
-                .selected_text(state.backend_names[state.selected_backend])
-                .show_ui(ui, |ui| {
-                    for (id, name) in state.backend_names.iter().enumerate() {
-                        backend_changed = ui
-                            .selectable_value(&mut state.selected_backend, id, *name)
-                            .changed()
-                            || backend_changed;
-                    }
-                });
-
-            if backend_changed {
-                state
-                    .action_flags
-                    .set(TestbedActionFlags::BACKEND_CHANGED, true);
-            }
-        });
-    }
-
-    // Navigation and backend selector row
+    // Navigation row
     ui.horizontal(|ui| {
         // Previous/Next buttons (navigate in display order)
         if ui
@@ -242,9 +235,7 @@ fn examples_tab(ui: &mut Ui, state: &mut TestbedState) {
             .clicked()
         {
             state.selected_display_index -= 1;
-            state
-                .action_flags
-                .set(TestbedActionFlags::EXAMPLE_CHANGED, true);
+            state.transition = Some(Transition::Switch);
         }
 
         if ui
@@ -256,9 +247,7 @@ fn examples_tab(ui: &mut Ui, state: &mut TestbedState) {
             .clicked()
         {
             state.selected_display_index += 1;
-            state
-                .action_flags
-                .set(TestbedActionFlags::EXAMPLE_CHANGED, true);
+            state.transition = Some(Transition::Switch);
         }
 
         // Current example name
@@ -308,24 +297,15 @@ fn examples_tab(ui: &mut Ui, state: &mut TestbedState) {
                         && !is_selected
                     {
                         state.selected_display_index = display_idx;
-                        state
-                            .action_flags
-                            .set(TestbedActionFlags::EXAMPLE_CHANGED, true);
+                        state.transition = Some(Transition::Switch);
                     }
                 }
             });
     }
 }
 
-fn settings_tab(
-    ui: &mut Ui,
-    state: &mut TestbedState,
-    harness: &mut Harness,
-    debug_render: &mut DebugRenderPipelineResource,
-) {
-    let integration_parameters = &mut harness.physics.integration_parameters;
-    let is_physx = state.selected_backend == PHYSX_BACKEND_PATCH_FRICTION
-        || state.selected_backend == PHYSX_BACKEND_TWO_FRICTION_DIR;
+fn settings_tab(ui: &mut Ui, state: &mut TestbedState, world: &mut PhysicsWorld) {
+    let integration_parameters = &mut world.integration_parameters;
 
     // ─────────────────────────────────────────────────────────────────
     // RENDERING
@@ -344,8 +324,24 @@ fn settings_tab(
             .set(TestbedStateFlags::DRAW_SURFACES, draw_surfaces);
     }
 
-    ui.checkbox(&mut debug_render.enabled, "Debug render")
-        .on_hover_text("Show debug wireframes and contacts.");
+    #[cfg(feature = "dim3")]
+    {
+        let mut smooth = state
+            .flags
+            .contains(TestbedStateFlags::SMOOTH_MESH_COLLIDERS);
+        if ui
+            .checkbox(&mut smooth, "Smooth mesh colliders")
+            .on_hover_text(
+                "Shared vertices and per-vertex normals on mesh colliders, soft bodies included \
+                 (flat shading otherwise).",
+            )
+            .changed()
+        {
+            state
+                .flags
+                .set(TestbedStateFlags::SMOOTH_MESH_COLLIDERS, smooth);
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────
     // SIMULATION
@@ -367,28 +363,45 @@ fn settings_tab(
         integration_parameters.set_inv_dt(frequency as Real);
     }
 
-    // Steps per frame
-    ui.add(Slider::new(&mut state.nsteps, 1..=100).text("Steps/frame"))
-        .on_hover_text("Physics steps per rendered frame.");
-
-    // Gravity
-    let mut gravity_y = harness.physics.gravity.y;
+    // Gravity slider — operates along the current up-axis so the
+    // slider's "down" matches the camera's "down". Scenes that switch
+    // to Z-up (e.g. the MJCF demo) get gravity along -Z instead of the
+    // hard-coded -Y. Any orthogonal components of gravity are
+    // preserved when the slider moves.
+    let up = state.up_axis;
+    let mut gravity_along_up = world.gravity.dot(up);
     if ui
-        .add(Slider::new(&mut gravity_y, 0.0..=-200.0).text("Gravity"))
-        .on_hover_text("Gravity (m/s^2). Default: -9.81")
+        .add(Slider::new(&mut gravity_along_up, 0.0..=-200.0).text("Gravity"))
+        .on_hover_text("Gravity (m/s^2) along the up-axis. Default: -9.81")
         .changed()
     {
-        harness.physics.gravity.y = gravity_y;
+        let current = world.gravity.dot(up);
+        world.gravity += up * (gravity_along_up - current);
     }
 
-    // Sleep
+    // Sleeping toggle (whole-island sleep is the only strategy).
     let mut sleep = state.flags.contains(TestbedStateFlags::SLEEP);
     if ui
-        .checkbox(&mut sleep, "Sleep enabled")
-        .on_hover_text("Allow resting bodies to sleep for better performance.")
+        .checkbox(&mut sleep, "Sleeping")
+        .on_hover_text(
+            "An island (touching-contact/joint connected component) falls \
+             asleep once all of its bodies settled; it sleeps and wakes as a \
+             unit.",
+        )
         .changed()
     {
         state.flags.set(TestbedStateFlags::SLEEP, sleep);
+        if sleep {
+            // Wake everything so the scene re-settles from a clean state.
+            // Field-borrow version of `PhysicsWorld::wake_up_all`
+            // (`integration_parameters` is still borrowed from `world` here).
+            let handles: Vec<_> = world.bodies.iter().map(|(h, _)| h).collect();
+            for handle in handles {
+                world.islands.wake_up(&mut world.bodies, handle, true);
+            }
+        }
+        // Disabling is applied by `handle_sleep_settings` reacting to the
+        // flag change (wakes everything and negates the sleep thresholds).
     }
 
     ui.add_space(8.0);
@@ -402,7 +415,7 @@ fn settings_tab(
     ui.add(Slider::new(&mut integration_parameters.num_solver_iterations, 1..=10).text("Substeps"))
         .on_hover_text("Main solver iterations. Higher = more stable stacking.");
 
-    if !is_physx {
+    {
         ui.add(
             Slider::new(
                 &mut integration_parameters.num_internal_pgs_iterations,
@@ -411,6 +424,24 @@ fn settings_tab(
             .text("PGS iters"),
         )
         .on_hover_text("Internal Projected Gauss-Seidel iterations.");
+
+        // Applied to every soft body of the world when moved, so a demo's own per-body
+        // choices stand until the user touches the slider.
+        if ui
+            .add(Slider::new(&mut state.soft_additional_pgs, 0..=15).text("Soft extra PGS iters"))
+            .on_hover_text(
+                "Extra internal PGS iterations per substep for the island components holding \
+                 a soft body (applied to every soft body when moved). Converges the elastic \
+                 rows and the contacts together: stiff or slender soft bodies get closer to \
+                 their nominal stiffness, resting bodies lose their residual roughness, cloth \
+                 stretches less and plastic flow reads the stress it should.",
+            )
+            .changed()
+        {
+            for (_, sb) in world.soft_bodies.iter_mut() {
+                sb.set_additional_pgs_iterations(state.soft_additional_pgs);
+            }
+        }
 
         ui.add(
             Slider::new(
@@ -433,7 +464,7 @@ fn settings_tab(
     // ─────────────────────────────────────────────────────────────────
     // CONTACTS (Rapier only)
     // ─────────────────────────────────────────────────────────────────
-    if !is_physx {
+    {
         ui.label(RichText::new("Contacts").strong());
         ui.add_space(2.0);
 
@@ -458,7 +489,7 @@ fn settings_tab(
         ui.add(
             Slider::new(
                 &mut integration_parameters.contact_softness.damping_ratio,
-                0.01..=20.0,
+                0.01..=100.0,
             )
             .text("Damping"),
         )
@@ -495,7 +526,7 @@ fn settings_tab(
     // ─────────────────────────────────────────────────────────────────
     // ADVANCED (Rapier only)
     // ─────────────────────────────────────────────────────────────────
-    if !is_physx {
+    {
         ui.label(RichText::new("Advanced").strong());
         ui.add_space(2.0);
 
@@ -522,8 +553,9 @@ fn settings_tab(
                 });
 
             if bp_changed {
-                harness.physics.broad_phase = state.broad_phase_type.init_broad_phase();
-                state.action_flags.set(TestbedActionFlags::RESTART, true);
+                world.broad_phase = state.broad_phase_type.init_broad_phase();
+                state.preserve_settings_on_switch = true;
+                state.transition = Some(Transition::Switch);
             }
         });
 
@@ -532,21 +564,36 @@ fn settings_tab(
         )
         .on_hover_text("Continuous collision detection substeps.");
 
-        ui.add(
-            Slider::new(&mut integration_parameters.min_island_size, 1..=10_000)
-                .text("Min island sz."),
-        )
-        .on_hover_text("Minimum bodies per simulation island.");
+        if world.soft_bodies.iter().next().is_some() {
+            // Edits the testbed-owned copy, stamped onto the world every frame: the
+            // choices survive demo restarts and switches (and app relaunches, through the
+            // saved testbed state).
+            soft_recovery_section(ui, &mut state.soft_recovery);
+        }
 
         #[cfg(feature = "parallel")]
         {
-            let mut num_threads = harness.state.num_threads();
+            let max_threads = num_cpus::get();
+            let mut num_threads = state
+                .physics_thread_pool
+                .as_ref()
+                .map(|pool| pool.current_num_threads())
+                .unwrap_or_else(|| (max_threads.saturating_sub(1)).clamp(1, 8));
+
             if ui
-                .add(Slider::new(&mut num_threads, 1..=num_cpus::get_physical()).text("Threads"))
-                .on_hover_text("Parallel solver threads.")
+                .add(Slider::new(&mut num_threads, 1..=max_threads).text("Solver threads"))
+                .on_hover_text(
+                    "Worker threads running the physics step. On heterogeneous CPUs,                      the performance-core count works best (efficiency cores stall                      the solver's barrier-paced stages).",
+                )
                 .changed()
             {
-                harness.state.set_num_threads(num_threads);
+                if let Err(e) = world.configure_thread_pool(num_threads) {
+                    eprintln!("Failed to build the physics thread pool: {e}");
+                }
+                if let Some(pool) = world.thread_pool()
+                {
+                    state.physics_thread_pool = Some(pool);
+                }
             }
         }
 
@@ -554,28 +601,388 @@ fn settings_tab(
     }
 }
 
-fn performance_tab(ui: &mut Ui, harness: &Harness) {
+/// The soft-body tangle detection and recovery toggles and knobs (see `SoftRecoverySettings`),
+/// edited live on the running world; shown whenever the world contains soft bodies. Re-enabling
+/// a mechanism does not wake bodies that fell asleep while it was off.
+fn soft_recovery_section(ui: &mut Ui, r: &mut rapier::dynamics::SoftRecoverySettings) {
+    use rapier::dynamics::SoftPatchConstraints;
+    egui::CollapsingHeader::new("Soft recovery")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label("Prevention");
+            ui.checkbox(&mut r.authored_velocity_margin, "Authored-velocity margin");
+            ui.checkbox(
+                &mut r.edge_speculation,
+                "Edge speculation (3D closed pairs)",
+            );
+            ui.separator();
+            ui.label("Detection");
+            ui.checkbox(&mut r.inverted_cell_detection, "Inverted cells");
+            ui.checkbox(&mut r.self_crossing_detection, "Self-crossings");
+            ui.checkbox(
+                &mut r.detection_motion_gating,
+                "Self-crossing sweep motion gating",
+            );
+            ui.checkbox(&mut r.cross_body_detection, "Cross-body crossings");
+            ui.separator();
+            ui.label("Passive stand-down");
+            ui.checkbox(&mut r.self_stand_down, "Self stand-down");
+            ui.checkbox(&mut r.cross_body_expel_gate, "Cross expel-only gate");
+            ui.checkbox(&mut r.edge_stand_down, "Edge-pass stand-down");
+            ui.checkbox(
+                &mut r.crossing_repulsion,
+                "Crossing repulsion (repel, not drop)",
+            );
+            ui.checkbox(
+                &mut r.crossing_repulsion_guide,
+                "Repulsion guided by the volume normal",
+            );
+            ui.checkbox(
+                &mut r.crossing_repulsion_self_guide,
+                "Self-repulsion guided by the fold's volume normal",
+            );
+            ui.separator();
+            ui.label("Intersection-volume constraints (closed surfaces)");
+            ui.checkbox(&mut r.overlap_constraints, "Overlap constraints (master)");
+            ui.checkbox(&mut r.overlap_skin_volume, "Skin volume");
+            ui.add(
+                Slider::new(&mut r.overlap_kept_depth, 0.0..=1.0)
+                    .text("Kept skin overlap (fraction of skins)"),
+            );
+            ui.checkbox(
+                &mut r.overlap_normal_push,
+                "Push along the normal instead of the gradients",
+            );
+            ui.checkbox(
+                &mut r.overlap_self_regions,
+                "Self-overlaps between distinct regions",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Per-point constraints on the patch's features");
+                for (policy, name) in [
+                    (SoftPatchConstraints::Keep, "Keep"),
+                    (SoftPatchConstraints::StandDown, "Stand down"),
+                    (SoftPatchConstraints::AlongNormal, "Along the normal"),
+                ] {
+                    ui.selectable_value(&mut r.overlap_patch_constraints, policy, name);
+                }
+            });
+            ui.checkbox(&mut r.overlap_multi_volume, "Multi-volume grid (section 5)");
+            ui.add(Slider::new(&mut r.overlap_split, 1..=8).text("Grid cells per tangent axis"));
+            ui.checkbox(&mut r.overlap_rigid, "Against rigid colliders");
+            ui.checkbox(&mut r.overlap_skip_self_tangled, "Skip self-crossed meshes");
+            ui.checkbox(
+                &mut r.overlap_edge_stand_down,
+                "Edge constraints stand down on owned pairs (3D)",
+            );
+            ui.add(
+                Slider::new(&mut r.recovery_pace, 0.05..=8.0)
+                    .logarithmic(true)
+                    .text("Recovery pace (length units / s)"),
+            );
+            ui.add(
+                Slider::new(&mut r.overlap_constraint_pace, 0.05..=64.0)
+                    .logarithmic(true)
+                    .text("Constraint impulse bound (x recovery pace)"),
+            );
+            ui.add(Slider::new(&mut r.overlap_patience, 10..=2000).text("Stall patience (steps)"));
+            ui.add(
+                Slider::new(&mut r.overlap_progress_margin, 0.0..=0.5)
+                    .text("Progress margin (fraction)"),
+            );
+            if ui.button("Reset to defaults").clicked() {
+                *r = Default::default();
+            }
+        });
+}
+
+/// One of the debug renderer's colors, as a color picker. The style stores HSLA; the picker
+/// works in sRGB, so the value round-trips through [`crate::debug_render::rgb_to_hsla`].
+fn debug_color_picker(ui: &mut Ui, label: &str, color: &mut rapier::pipeline::DebugColor) {
+    let rgba = crate::debug_render::hsla_to_rgb(color[0], color[1], color[2], color[3]);
+    let mut srgba = rgba.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    ui.horizontal(|ui| {
+        if ui
+            .color_edit_button_srgba_unmultiplied(&mut srgba)
+            .changed()
+        {
+            *color = crate::debug_render::rgb_to_hsla(srgba.map(|c| c as f32 / 255.0));
+        }
+        ui.label(label);
+    });
+}
+
+/// One of the debug renderer's color multipliers (a per-HSLA-component scale, not a color).
+fn debug_multiplier_row(ui: &mut Ui, label: &str, color: &mut rapier::pipeline::DebugColor) {
+    ui.horizontal(|ui| {
+        for (component, prefix) in color.iter_mut().zip(["h ", "s ", "l ", "a "]) {
+            ui.add(
+                egui::DragValue::new(component)
+                    .speed(0.01)
+                    .range(0.0..=1.0)
+                    .prefix(prefix),
+            );
+        }
+        ui.label(label);
+    });
+}
+
+/// What the debug renderer draws, and how it draws it.
+fn debug_render_tab(ui: &mut Ui, debug_render: &mut DebugRenderPipelineResource) {
+    use rapier::pipeline::DebugRenderMode;
+
+    ui.checkbox(&mut debug_render.enabled, "Debug render")
+        .on_hover_text("Draw the physics state over the scene (wireframes, joints, contacts).");
+    ui.add_space(8.0);
+
+    // ─────────────────────────────────────────────────────────────────
+    // WHAT TO DRAW
+    // ─────────────────────────────────────────────────────────────────
+    ui.label(RichText::new("What to draw").strong());
+    ui.add_space(2.0);
+
+    {
+        // The composite `JOINTS` flag is left out: its two halves are here.
+        const FLAGS: &[(DebugRenderMode, &str, &str)] = &[
+            (
+                DebugRenderMode::COLLIDER_SHAPES,
+                "Collider shapes",
+                "The colliders' outlines, colored by their body type.",
+            ),
+            (
+                DebugRenderMode::COLLIDER_AABBS,
+                "Collider AABBs",
+                "The bounding boxes the broad phase sees.",
+            ),
+            (
+                DebugRenderMode::RIGID_BODY_AXES,
+                "Rigid-body axes",
+                "The local frame of every rigid body, at its center of mass.",
+            ),
+            (
+                DebugRenderMode::IMPULSE_JOINTS,
+                "Impulse joints",
+                "The anchors of the impulse joints, and their separation.",
+            ),
+            (
+                DebugRenderMode::MULTIBODY_JOINTS,
+                "Multibody joints",
+                "The anchors of the multibody joints, and their separation.",
+            ),
+            (
+                DebugRenderMode::CONTACTS,
+                "Contacts",
+                "The geometric contact points and their normals.",
+            ),
+            (
+                DebugRenderMode::SOLVER_CONTACTS,
+                "Solver contacts",
+                "The contact points the solver actually used this step.",
+            ),
+            (
+                DebugRenderMode::SOFT_BODIES,
+                "Soft bodies",
+                "The soft bodies' elements (structural and cell edges), their cluster frames, \
+                 and their soft-vs-soft contacts.",
+            ),
+            (
+                DebugRenderMode::PSEUDO_NORMALS,
+                "Pseudo-normals",
+                "The pseudo-normals of the oriented triangle-meshes and polylines, at their \
+                 vertices and edge midpoints.",
+            ),
+            (
+                DebugRenderMode::SOFT_VOLUME_CONTACTS,
+                "Soft volume constraints",
+                "The soft bodies' intersection-volume constraints: each one's normal at its \
+                 patch center, and the volume gradient at every particle it acts on.",
+            ),
+            (
+                DebugRenderMode::SOFT_BODY_STRESS,
+                "Soft-body stress",
+                "Colors the soft bodies' elements by their load, blue when slack to red at \
+                 their tear threshold (by their stretch, full at 50%, for a body that never \
+                 tears). Needs the soft bodies drawn.",
+            ),
+        ];
+
+        for (flag, label, hover) in FLAGS {
+            let mut on = debug_render.pipeline.mode.contains(*flag);
+            if ui.checkbox(&mut on, *label).on_hover_text(*hover).changed() {
+                debug_render.pipeline.mode.set(*flag, on);
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("All").clicked() {
+                debug_render.pipeline.mode = DebugRenderMode::all();
+            }
+            if ui.button("None").clicked() {
+                debug_render.pipeline.mode = DebugRenderMode::empty();
+            }
+            if ui.button("Default").clicked() {
+                debug_render.pipeline.mode = DebugRenderMode::default();
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // ─────────────────────────────────────────────────────────────
+        // STYLE
+        // ─────────────────────────────────────────────────────────────
+        ui.label(RichText::new("Style").strong());
+        ui.add_space(2.0);
+
+        let style = &mut debug_render.pipeline.style;
+        ui.add(Slider::new(&mut style.subdivisions, 2..=64).text("Subdivisions"))
+            .on_hover_text("Segments approximating a curved shape (balls, capsules, cones).");
+        ui.add(Slider::new(&mut style.border_subdivisions, 1..=32).text("Border subdivisions"))
+            .on_hover_text("Segments approximating the rounded border of a round shape.");
+        ui.add(Slider::new(&mut style.rigid_body_axes_length, 0.0..=2.0).text("Axes length"))
+            .on_hover_text("Length of the rigid-body axes.");
+        ui.add(Slider::new(&mut style.contact_normal_length, 0.0..=1.0).text("Normal length"))
+            .on_hover_text("Length of the contact normals.");
+        ui.add(
+            Slider::new(&mut style.pseudo_normal_length, 0.0..=1.0).text("Pseudo-normal length"),
+        )
+        .on_hover_text("Length of the meshes' pseudo-normals.");
+
+        ui.collapsing("Colors", |ui| {
+            debug_color_picker(ui, "Dynamic colliders", &mut style.collider_dynamic_color);
+            debug_color_picker(ui, "Fixed colliders", &mut style.collider_fixed_color);
+            debug_color_picker(
+                ui,
+                "Kinematic colliders",
+                &mut style.collider_kinematic_color,
+            );
+            debug_color_picker(
+                ui,
+                "Parentless colliders",
+                &mut style.collider_parentless_color,
+            );
+            debug_color_picker(ui, "Collider AABBs", &mut style.collider_aabb_color);
+            debug_color_picker(
+                ui,
+                "Impulse joint anchors",
+                &mut style.impulse_joint_anchor_color,
+            );
+            debug_color_picker(
+                ui,
+                "Impulse joint separation",
+                &mut style.impulse_joint_separation_color,
+            );
+            debug_color_picker(
+                ui,
+                "Multibody joint anchors",
+                &mut style.multibody_joint_anchor_color,
+            );
+            debug_color_picker(
+                ui,
+                "Multibody joint separation",
+                &mut style.multibody_joint_separation_color,
+            );
+            debug_color_picker(ui, "Contact depth", &mut style.contact_depth_color);
+            debug_color_picker(ui, "Contact normals", &mut style.contact_normal_color);
+            debug_color_picker(ui, "Soft-body elements", &mut style.soft_body_element_color);
+            debug_color_picker(ui, "Soft-body frames", &mut style.soft_body_frame_color);
+            debug_color_picker(
+                ui,
+                "Vertex pseudo-normals",
+                &mut style.vertex_pseudo_normal_color,
+            );
+            debug_color_picker(
+                ui,
+                "Edge pseudo-normals",
+                &mut style.edge_pseudo_normal_color,
+            );
+
+            ui.add_space(4.0);
+            ui.label("Multipliers (per HSLA component)");
+            debug_multiplier_row(ui, "Sleeping", &mut style.sleep_color_multiplier);
+            debug_multiplier_row(
+                ui,
+                "Sleep-ready",
+                &mut style.sleep_eligible_color_multiplier,
+            );
+            debug_multiplier_row(ui, "Disabled", &mut style.disabled_color_multiplier);
+            if ui.button("Reset colors").clicked() {
+                let default = rapier::pipeline::DebugRenderStyle::default();
+                // The scalars above are edited separately: only the colors are reset.
+                *style = rapier::pipeline::DebugRenderStyle {
+                    subdivisions: style.subdivisions,
+                    border_subdivisions: style.border_subdivisions,
+                    rigid_body_axes_length: style.rigid_body_axes_length,
+                    contact_normal_length: style.contact_normal_length,
+                    ..default
+                };
+            }
+        });
+    }
+}
+
+fn performance_tab(ui: &mut Ui, state: &TestbedState, world: &PhysicsWorld) {
     // ─────────────────────────────────────────────────────────────────
     // SCENE INFO
     // ─────────────────────────────────────────────────────────────────
     ui.label(RichText::new("Scene").strong());
     ui.add_space(2.0);
 
+    let num_contacts: usize = world
+        .narrow_phase
+        .contact_pairs()
+        .map(|pair| {
+            pair.manifolds()
+                .iter()
+                .map(|m| m.points.len())
+                .sum::<usize>()
+        })
+        .sum();
+
+    let num_sleeping = world
+        .rigid_bodies()
+        .filter(|(_, rb)| rb.is_sleeping())
+        .count();
+
     egui::Grid::new("scene_grid")
         .num_columns(2)
         .spacing([20.0, 2.0])
         .show(ui, |ui| {
+            ui.label("Step:");
+            ui.label(format!("{}", state.timestep_id));
+            ui.end_row();
+
             ui.label("Bodies:");
-            ui.label(format!("{}", harness.physics.bodies.len()));
+            ui.label(format!("{}", world.bodies.len()));
+            ui.end_row();
+
+            ui.label("Sleeping:");
+            ui.label(format!("{}", num_sleeping));
             ui.end_row();
 
             ui.label("Colliders:");
-            ui.label(format!("{}", harness.physics.colliders.len()));
+            ui.label(format!("{}", world.colliders.len()));
             ui.end_row();
 
             ui.label("Joints:");
-            ui.label(format!("{}", harness.physics.impulse_joints.len()));
+            ui.label(format!("{}", world.impulse_joints.len()));
             ui.end_row();
+
+            ui.label("Contacts:");
+            ui.label(format!("{}", num_contacts));
+            ui.end_row();
+        });
+
+    // ─────────────────────────────────────────────────────────────────
+    // SERIALIZATION INFO
+    // ─────────────────────────────────────────────────────────────────
+    egui::CollapsingHeader::new("Serialization Hashes")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(serialization_string(world))
+                    .small()
+                    .monospace(),
+            );
         });
 
     ui.add_space(8.0);
@@ -585,15 +992,25 @@ fn performance_tab(ui: &mut Ui, harness: &Harness) {
     // ─────────────────────────────────────────────────────────────────
     // TIMING - Full details
     // ─────────────────────────────────────────────────────────────────
-    let counters = &harness.physics.pipeline.counters;
+    let counters = &world.physics_pipeline.counters;
     let total_ms = counters.step_time_ms();
-    let fps = if total_ms > 0.0 {
-        (1000.0 / total_ms).round()
-    } else {
-        0.0
-    };
+    let (mean_frame_ms, mean_step_ms) = state.frame_stats.mean_ms();
+    let (_, max_step_ms) = state.frame_stats.max_ms();
 
-    ui.label(RichText::new(format!("Total: {:.2}ms - {:.0} FPS", total_ms, fps)).strong());
+    // The step counters only hold the last step: the peaks over the recent frames show the
+    // spikes a single value flickers past. The testbed time is the frame minus the step, with
+    // the frame measured by the viewer without the renderer's present (so no vsync wait).
+    ui.label(
+        RichText::new(format!(
+            "Total physics: {:.2}ms (peak {:.2}ms)",
+            total_ms, max_step_ms
+        ))
+        .strong(),
+    );
+    ui.label(format!(
+        "Testbed: {:.2}ms",
+        (mean_frame_ms - mean_step_ms).max(0.0)
+    ));
     ui.add_space(4.0);
 
     // Collision detection
@@ -702,31 +1119,15 @@ fn performance_tab(ui: &mut Ui, harness: &Harness) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
-
-    // ─────────────────────────────────────────────────────────────────
-    // SERIALIZATION INFO
-    // ─────────────────────────────────────────────────────────────────
-    egui::CollapsingHeader::new("Serialization Hashes")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(serialization_string(
-                    harness.state.timestep_id,
-                    &harness.physics,
-                ))
-                .small()
-                .monospace(),
-            );
-        });
 }
 
-fn serialization_string(timestep_id: usize, physics: &PhysicsState) -> String {
+fn serialization_string(world: &PhysicsWorld) -> String {
     let t = Instant::now();
-    let bf = bincode::serialize(&physics.broad_phase).unwrap();
-    let nf = bincode::serialize(&physics.narrow_phase).unwrap();
-    let bs = bincode::serialize(&physics.bodies).unwrap();
-    let cs = bincode::serialize(&physics.colliders).unwrap();
-    let js = bincode::serialize(&physics.impulse_joints).unwrap();
+    let bf = bincode::serialize(&world.broad_phase).unwrap();
+    let nf = bincode::serialize(&world.narrow_phase).unwrap();
+    let bs = bincode::serialize(&world.bodies).unwrap();
+    let cs = bincode::serialize(&world.colliders).unwrap();
+    let js = bincode::serialize(&world.impulse_joints).unwrap();
     let serialization_time = Instant::now() - t;
     let hash_bf = md5::compute(&bf);
     let hash_nf = md5::compute(&nf);
@@ -734,13 +1135,12 @@ fn serialization_string(timestep_id: usize, physics: &PhysicsState) -> String {
     let hash_colliders = md5::compute(&cs);
     let hash_joints = md5::compute(&js);
     format!(
-        "Frame: {} ({:.1}ms)\n\
+        "Serialized ({:.1}ms)\n\
          Broad:     {:.1}KB {}\n\
          Narrow:    {:.1}KB {}\n\
          Bodies:    {:.1}KB {}\n\
          Colliders: {:.1}KB {}\n\
          Joints:    {:.1}KB {}",
-        timestep_id,
         serialization_time.as_secs_f64() * 1000.0,
         bf.len() as f32 / 1000.0,
         format!("{hash_bf:?}").split_at(8).0,
@@ -764,6 +1164,9 @@ fn example_settings_ui(ui_context: &egui::Context, state: &mut TestbedState) {
         .default_width(250.0)
         .show(ui_context, |ui| {
             let mut any_changed = false;
+            // Settings the example reads live (e.g. via a callback): changing
+            // them updates the value but must not restart the simulation.
+            let non_restart = state.example_settings.non_restart_keys().clone();
 
             for (name, value) in state.example_settings.iter_mut() {
                 let prev_value = value.clone();
@@ -795,23 +1198,116 @@ fn example_settings_ui(ui_context: &egui::Context, state: &mut TestbedState) {
                     SettingValue::Bool { value } => {
                         ui.checkbox(value, name);
                     }
-                    SettingValue::String { value, range } => {
-                        ComboBox::from_label(name)
-                            .width(150.0)
-                            .selected_text(&range[*value])
-                            .show_ui(ui, |ui| {
-                                for (id, option) in range.iter().enumerate() {
-                                    ui.selectable_value(value, id, option);
+                    SettingValue::String {
+                        value,
+                        range,
+                        display_mode,
+                    } => match display_mode {
+                        crate::settings::StringDisplayMode::ComboBox => {
+                            let n = range.len();
+                            ui.horizontal(|ui| {
+                                // `<` / `>` step to the previous / next option
+                                // without opening the dropdown (mirrors the `List`
+                                // mode steppers and the `U32` `-` / `+` pair).
+                                let can_prev = *value > 0;
+                                let can_next = *value + 1 < n;
+                                if ui
+                                    .add_enabled(can_prev, egui::Button::new("<"))
+                                    .on_hover_text("Previous")
+                                    .clicked()
+                                {
+                                    *value -= 1;
                                 }
+                                if ui
+                                    .add_enabled(can_next, egui::Button::new(">"))
+                                    .on_hover_text("Next")
+                                    .clicked()
+                                {
+                                    *value += 1;
+                                }
+                                ComboBox::from_label(name)
+                                    .width(150.0)
+                                    .selected_text(&range[*value])
+                                    .show_ui(ui, |ui| {
+                                        // Bound the popup height so a long option
+                                        // list scrolls instead of being clipped by
+                                        // the screen edge (which otherwise hides all
+                                        // but the first couple of entries when the
+                                        // settings window sits low on screen).
+                                        egui::ScrollArea::vertical().max_height(1600.0).show(
+                                            ui,
+                                            |ui| {
+                                                for (id, option) in range.iter().enumerate() {
+                                                    ui.selectable_value(value, id, option);
+                                                }
+                                            },
+                                        );
+                                    });
                             });
-                    }
+                        }
+                        crate::settings::StringDisplayMode::List => {
+                            let current = range.get(*value).cloned().unwrap_or_default();
+                            let n = range.len();
+                            ui.horizontal(|ui| {
+                                // `<` / `>` step through the list one
+                                // entry at a time. Mirrors the `-` / `+`
+                                // pair on `U32` settings.
+                                let can_prev = n > 0 && *value > 0;
+                                let can_next = n > 0 && *value + 1 < n;
+                                if ui
+                                    .add_enabled(can_prev, egui::Button::new("<"))
+                                    .on_hover_text("Previous")
+                                    .clicked()
+                                {
+                                    *value -= 1;
+                                }
+                                if ui
+                                    .add_enabled(can_next, egui::Button::new(">"))
+                                    .on_hover_text("Next")
+                                    .clicked()
+                                {
+                                    *value += 1;
+                                }
+                                ui.label(RichText::new(format!("{name}:")).strong());
+                                ui.label(current);
+                            });
+                            // Bound the height so a long option list
+                            // doesn't crowd out the rest of the panel.
+                            egui::ScrollArea::vertical()
+                                .id_salt(name.as_str())
+                                .max_height(300.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (id, opt) in range.iter().enumerate() {
+                                        let is_selected = *value == id;
+                                        let text = if is_selected {
+                                            RichText::new(opt).strong()
+                                        } else {
+                                            RichText::new(opt)
+                                        };
+                                        if ui.selectable_label(is_selected, text).clicked()
+                                            && !is_selected
+                                        {
+                                            *value = id;
+                                        }
+                                    }
+                                });
+                        }
+                    },
                 }
 
-                any_changed = any_changed || *value != prev_value;
+                // A change to a non-restart setting still updates the value
+                // (the widget mutated it above) but doesn't restart the sim.
+                if *value != prev_value && !non_restart.contains(name.as_str()) {
+                    any_changed = true;
+                }
             }
 
             if any_changed {
-                state.action_flags.set(TestbedActionFlags::RESTART, true);
+                // A restart-triggering setting changed: re-run the example,
+                // preserving the user's setting edits.
+                state.preserve_settings_on_switch = true;
+                state.transition = Some(Transition::Switch);
             }
         });
 }

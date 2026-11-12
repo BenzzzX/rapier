@@ -423,6 +423,40 @@ pub struct AlchemyRapierBodyStateResult {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierStreamingMotionBound {
+    pub group: u32,
+    pub members: u32,
+    pub linear_speed: f32,
+    pub angular_speed: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierStreamingGroupMember {
+    pub body: AlchemyRapierRigidBodyHandle,
+    pub min: AlchemyRapierVec2,
+    pub max: AlchemyRapierVec2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierMorphColliderDesc {
+    pub body: AlchemyRapierRigidBodyHandle,
+    pub collider: AlchemyRapierColliderHandle,
+    pub position: AlchemyRapierVec2,
+    pub vertices: *const AlchemyRapierVec2,
+    pub vertex_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlchemyRapierMorphColliderResult {
+    pub status: AlchemyRapierStatus,
+    pub applied: u8,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlchemyRapierRagdollMotorDesc {
     pub body_a: AlchemyRapierRigidBodyHandle,
@@ -547,6 +581,10 @@ pub struct AlchemyRapierContactSample {
     pub normal_from_2_to_1: AlchemyRapierVec2,
     pub impulse_on_body1: AlchemyRapierVec2,
     pub collision_impulse: f32,
+    // Collision-only upper bound based on the relative pre-solve velocity.
+    // Solver impulse also contains positional correction and support forces.
+    pub impact_impulse: f32,
+    pub impact_speed: f32,
 }
 
 pub type AlchemyRapierContactCallback =
@@ -843,6 +881,58 @@ struct PendingSplitEvent {
     child_material_ids: Vec<u16>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PreSolveContactBody {
+    generation: u32,
+    valid: bool,
+    center: Vector,
+    velocity: Vector,
+    angular_velocity: f32,
+    inverse_mass: Vector,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EnabledContactBodyIndex {
+    generation: u32,
+    slot: usize,
+    valid: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StreamingMotionNode {
+    generation: u32,
+    valid: bool,
+    parent: usize,
+    members: u32,
+    kinetic_twice: f64,
+    kinematic_speed: f64,
+}
+
+fn streaming_motion_root(nodes: &mut [StreamingMotionNode], mut index: usize) -> usize {
+    while nodes[index].parent != index {
+        let parent = nodes[index].parent;
+        nodes[index].parent = nodes[parent].parent;
+        index = nodes[index].parent;
+    }
+    index
+}
+
+fn streaming_motion_union(nodes: &mut [StreamingMotionNode], enabled: &[EnabledContactBodyIndex], a: RigidBodyHandle, b: RigidBodyHandle) {
+    let (a_index, a_generation) = a.into_raw_parts();
+    let (b_index, b_generation) = b.into_raw_parts();
+    let a_index = a_index as usize;
+    let b_index = b_index as usize;
+    if a_index >= nodes.len() || b_index >= nodes.len() || a_index >= enabled.len() || b_index >= enabled.len() ||
+        !enabled[a_index].valid || !enabled[b_index].valid ||
+        !nodes[a_index].valid || !nodes[b_index].valid ||
+        nodes[a_index].generation != a_generation || nodes[b_index].generation != b_generation {
+        return;
+    }
+    let a_root = streaming_motion_root(nodes, a_index);
+    let b_root = streaming_motion_root(nodes, b_index);
+    if a_root != b_root { nodes[b_root].parent = a_root; }
+}
+
 struct AlchemyRapierWorldInner {
     gravity: Vector,
     integration_parameters: IntegrationParameters,
@@ -851,6 +941,11 @@ struct AlchemyRapierWorldInner {
     broad_phase: BroadPhaseBvh,
     narrow_phase: NarrowPhase,
     bodies: RigidBodySet,
+    soft_bodies: SoftBodySet,
+    contact_body_snapshots: Vec<PreSolveContactBody>,
+    enabled_contact_bodies: Vec<RigidBodyHandle>,
+    enabled_contact_body_indices: Vec<EnabledContactBodyIndex>,
+    streaming_motion_nodes: Vec<StreamingMotionNode>,
     colliders: ColliderSet,
     // Colliders changed after the last physics step are not yet in the
     // broad-phase tree. Include only these explicitly in scene queries.
@@ -874,14 +969,29 @@ struct AlchemyRapierWorldInner {
 
 impl AlchemyRapierWorldInner {
     fn new() -> Self {
+        // Alchemy uses pixel-sized world units. Pin the contact scale used by
+        // the pre-0.36 integration rather than silently inheriting upstream's
+        // new meter-oriented defaults when the engine is upgraded.
+        let mut integration_parameters = IntegrationParameters::default();
+        integration_parameters.normalized_allowed_linear_error = 0.001;
+        integration_parameters.normalized_max_corrective_velocity = 10.0;
+        integration_parameters.normalized_prediction_distance = 0.002;
+        integration_parameters.normalized_max_linear_velocity = 100_000.0;
+        integration_parameters.contact_softness.damping_ratio = 5.0;
+        integration_parameters.static_contact_softness = integration_parameters.contact_softness;
         Self {
             gravity: Vector::new(0.0, -9.81),
-            integration_parameters: IntegrationParameters::default(),
+            integration_parameters,
             pipeline: PhysicsPipeline::new(),
             islands: IslandManager::new(),
             broad_phase: BroadPhaseBvh::new(),
             narrow_phase: NarrowPhase::new(),
             bodies: RigidBodySet::new(),
+            soft_bodies: SoftBodySet::new(),
+            contact_body_snapshots: Vec::new(),
+            enabled_contact_bodies: Vec::new(),
+            enabled_contact_body_indices: Vec::new(),
+            streaming_motion_nodes: Vec::new(),
             colliders: ColliderSet::new(),
             query_pending_colliders: HashSet::new(),
             query_candidate_scratch: Vec::new(),
@@ -899,6 +1009,42 @@ impl AlchemyRapierWorldInner {
             voxel_terrain_sources: HashMap::new(),
             pending_split_events: Vec::new(),
             previous_active_contact_pairs: HashSet::new(),
+        }
+    }
+
+    fn track_contact_body_enabled(&mut self, handle: RigidBodyHandle, enabled: bool) {
+        let (index, generation) = handle.into_raw_parts();
+        let index = index as usize;
+        if self.enabled_contact_body_indices.len() <= index {
+            self.enabled_contact_body_indices.resize(index + 1, EnabledContactBodyIndex::default());
+        }
+        let existing = self.enabled_contact_body_indices[index];
+        if existing.valid && existing.generation == generation && enabled {
+            return;
+        }
+        if !enabled {
+            if let Some(snapshot) = self.contact_body_snapshots.get_mut(index) {
+                if snapshot.generation == generation { snapshot.valid = false; }
+            }
+        }
+        if existing.valid && (existing.generation == generation || enabled) {
+            let last = self.enabled_contact_bodies.len() - 1;
+            self.enabled_contact_bodies.swap_remove(existing.slot);
+            if existing.slot != last {
+                let moved = self.enabled_contact_bodies[existing.slot];
+                let (moved_index, _) = moved.into_raw_parts();
+                self.enabled_contact_body_indices[moved_index as usize].slot = existing.slot;
+            }
+            self.enabled_contact_body_indices[index].valid = false;
+        }
+        if enabled {
+            let slot = self.enabled_contact_bodies.len();
+            self.enabled_contact_bodies.push(handle);
+            self.enabled_contact_body_indices[index] = EnabledContactBodyIndex {
+                generation,
+                slot,
+                valid: true,
+            };
         }
     }
 
@@ -922,6 +1068,7 @@ impl AlchemyRapierWorldInner {
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
+            &mut self.soft_bodies,
             &mut self.ccd_solver,
             &hooks,
             &(),
@@ -970,6 +1117,58 @@ fn collect_active_contact_pairs(world: &AlchemyRapierWorldInner) -> HashSet<(u64
     active_pairs
 }
 
+// Reuse a dense handle-indexed buffer. This is sampled once before each solve,
+// not allocated or looked up through a hash table for every contact.
+fn snapshot_contact_bodies(world: &mut AlchemyRapierWorldInner) {
+    for &handle in &world.enabled_contact_bodies {
+        let Some(body) = world.bodies.get(handle) else { continue; };
+        let (index, generation) = handle.into_raw_parts();
+        let index = index as usize;
+        if world.contact_body_snapshots.len() <= index {
+            world.contact_body_snapshots.resize(index + 1, PreSolveContactBody::default());
+        }
+        world.contact_body_snapshots[index] = PreSolveContactBody {
+            generation,
+            valid: body.is_enabled(),
+            center: body.center_of_mass(),
+            velocity: body.linvel(),
+            angular_velocity: body.angvel(),
+            inverse_mass: if body.is_dynamic() {
+                body.mass_properties().effective_inv_mass
+            } else {
+                Vector::ZERO
+            },
+        };
+    }
+}
+
+fn pre_solve_contact_body(world: &AlchemyRapierWorldInner, handle: Option<RigidBodyHandle>) -> Option<PreSolveContactBody> {
+    let Some(handle) = handle else { return Some(PreSolveContactBody::default()); };
+    let (index, generation) = handle.into_raw_parts();
+    world.contact_body_snapshots.get(index as usize).copied()
+        .filter(|sample| sample.valid && sample.generation == generation)
+}
+
+fn contact_impact_estimate(
+    first: PreSolveContactBody,
+    second: PreSolveContactBody,
+    point: Vector,
+    normal_from_second_to_first: Vector,
+    restitution: f32,
+) -> (f32, f32) {
+    let at_point = |body: PreSolveContactBody| {
+        let arm = point - body.center;
+        body.velocity + Vector::new(-arm.y, arm.x) * body.angular_velocity
+    };
+    let closing_speed = (-(at_point(first) - at_point(second)).dot(normal_from_second_to_first)).max(0.0);
+    let inverse_mass = first.inverse_mass + second.inverse_mass;
+    let normal_inverse_mass = inverse_mass.x * normal_from_second_to_first.x * normal_from_second_to_first.x +
+        inverse_mass.y * normal_from_second_to_first.y * normal_from_second_to_first.y;
+    if normal_inverse_mass <= 0.0000001 { return (closing_speed, 0.0); }
+    let bound = closing_speed * (1.0 + restitution.max(0.0)) / normal_inverse_mass;
+    (closing_speed, if bound.is_finite() { bound.max(0.0) } else { 0.0 })
+}
+
 fn emit_contact_samples(
     world: &AlchemyRapierWorldInner,
     callback: AlchemyRapierContactCallback,
@@ -984,7 +1183,7 @@ fn emit_contact_samples(
         if !pair.has_any_active_contact() {
             continue;
         }
-        for manifold in &pair.manifolds {
+        for manifold in pair.manifolds() {
             if manifold.data.solver_contacts.is_empty() {
                 continue;
             }
@@ -1004,9 +1203,11 @@ fn emit_contact_samples(
                     continue;
                 }
 
-                if let Some(solver_contact) = manifold.data.solver_contacts.get(contact_index) {
-                    if !solver_contact.point.x.is_finite()
-                        || !solver_contact.point.y.is_finite()
+                if let Some(solver_contact) = manifold.data.solver_contacts.iter().find(|item| item.contact_indices()[0] as usize == contact_index) {
+                    let (anchor1, anchor2) = manifold.data.solver_contact_world_points(solver_contact, &world.bodies);
+                    let point = (anchor1 + anchor2) * 0.5;
+                    if !point.x.is_finite()
+                        || !point.y.is_finite()
                         || !impulse.x.is_finite()
                         || !impulse.y.is_finite()
                     {
@@ -1017,6 +1218,15 @@ fn emit_contact_samples(
                         voxel_metadata(&world.voxel_colliders, pair.collider1, manifold.subshape1);
                     let voxel2 =
                         voxel_metadata(&world.voxel_colliders, pair.collider2, manifold.subshape2);
+                    let impact = match (
+                        pre_solve_contact_body(world, manifold.data.rigid_body1),
+                        pre_solve_contact_body(world, manifold.data.rigid_body2),
+                    ) {
+                        (Some(first), Some(second)) => Some(contact_impact_estimate(
+                            first, second, point, force_dir1, manifold.data.restitution,
+                        )),
+                        _ => None,
+                    };
                     let sample = AlchemyRapierContactSample {
                         collider1_packed_id: pack_collider_handle(pair.collider1),
                         collider2_packed_id: pack_collider_handle(pair.collider2),
@@ -1044,10 +1254,12 @@ fn emit_contact_samples(
                             .unwrap_or(INVALID_SOURCE_CELL_ID),
                         material_id1: voxel1.map(|metadata| metadata.material_id).unwrap_or(0),
                         material_id2: voxel2.map(|metadata| metadata.material_id).unwrap_or(0),
-                        point: ffi_vec(solver_contact.point),
+                        point: ffi_vec(point),
                         normal_from_2_to_1: ffi_vec(force_dir1),
                         impulse_on_body1: ffi_vec(impulse),
                         collision_impulse,
+                        impact_impulse: impact.map(|(_, bound)| collision_impulse.min(bound)).unwrap_or(-1.0),
+                        impact_speed: impact.map(|(speed, _)| speed).unwrap_or(-1.0),
                     };
                     unsafe { callback(user_data, &sample) };
                     sample_count = sample_count.saturating_add(1);
@@ -1368,6 +1580,7 @@ fn combine_coefficient(
         CoefficientCombineRule::Multiply => left * right,
         CoefficientCombineRule::Max => left.max(right),
         CoefficientCombineRule::ClampedSum => (left + right).clamp(0.0, 1.0),
+        CoefficientCombineRule::GeometricMean => (left.max(0.0) * right.max(0.0)).sqrt(),
     }
 }
 
@@ -1471,13 +1684,14 @@ impl PhysicsHooks for AlchemyContactHooks<'_> {
         if group1.is_some() && group1 == group2 {
             None
         } else {
-            Some(SolverFlags::COMPUTE_IMPULSES)
+            Some(SolverFlags::COMPUTE_RIGID_IMPULSES)
         }
     }
 
     fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
-        let material1 = self.material_for(context, context.collider1, context.manifold.subshape1);
-        let material2 = self.material_for(context, context.collider2, context.manifold.subshape2);
+        let Some(rigid) = context.rigid() else { return; };
+        let material1 = self.material_for(context, context.collider1, rigid.manifold.subshape1);
+        let material2 = self.material_for(context, context.collider2, rigid.manifold.subshape2);
         let restitution = combine_coefficient(
             material1.restitution,
             material2.restitution,
@@ -1485,20 +1699,21 @@ impl PhysicsHooks for AlchemyContactHooks<'_> {
             material2.restitution_combine_rule,
         );
         let sample = self.friction_callback;
-        let normal = *context.normal;
-        for contact in context.solver_contacts.iter_mut() {
+        let bodies = context.bodies;
+        let sides = [(context.collider1, context.rigid_body1), (context.collider2, context.rigid_body2)];
+        let rigid = context.rigid_mut().unwrap();
+        let normal = *rigid.normal;
+        *rigid.restitution = restitution;
+        for (contact_index, contact) in rigid.solver_contacts.iter_mut().enumerate() {
             let mut values = [material1.friction, material2.friction];
             if let Some(sample) = sample {
-                for (side, (collider, body)) in [
-                    (context.collider1, context.rigid_body1),
-                    (context.collider2, context.rigid_body2),
-                ].into_iter().enumerate() {
+                for (side, (collider, body)) in sides.into_iter().enumerate() {
                     let sign = if side == 0 { -1.0 } else { 1.0 };
-                    let p = contact.point + normal * (sign * 0.51);
+                    let p = (contact.anchor1 + contact.anchor2) * 0.5 + normal * (sign * 0.51);
                     let mut body_id = 0;
                     let mut cell = -1;
                     if let Some(handle) = body {
-                        if let (Some(pixel), Some(rigid_body)) = (self.pixel_rigidbodies.get(&handle), context.bodies.get(handle)) {
+                        if let (Some(pixel), Some(rigid_body)) = (self.pixel_rigidbodies.get(&handle), bodies.get(handle)) {
                             if pixel.collider == collider {
                                 let local = rigid_body.position().inverse_transform_point(p);
                                 let asset = local + pixel_shape_half_extents(pixel.width, pixel.height, pixel.pixel_size) - pixel.local_origin;
@@ -1516,8 +1731,7 @@ impl PhysicsHooks for AlchemyContactHooks<'_> {
                     if override_friction.is_finite() && override_friction >= 0.0 { values[side] = override_friction; }
                 }
             }
-            contact.friction = combine_coefficient(values[0], values[1], material1.friction_combine_rule, material2.friction_combine_rule);
-            contact.restitution = restitution;
+            rigid.contact_friction_overrides[contact_index] = Some(combine_coefficient(values[0], values[1], material1.friction_combine_rule, material2.friction_combine_rule));
         }
     }
 }
@@ -1576,6 +1790,7 @@ fn body_type_from_rapier(value: RigidBodyType) -> AlchemyRapierBodyType {
         RigidBodyType::KinematicPositionBased => AlchemyRapierBodyType::KinematicPosition,
         RigidBodyType::KinematicVelocityBased => AlchemyRapierBodyType::Kinematic,
         RigidBodyType::Dynamic => AlchemyRapierBodyType::Dynamic,
+        RigidBodyType::SoftFrame => unreachable!("soft frame is not exposed as an Alchemy rigid body"),
     }
 }
 
@@ -1765,6 +1980,7 @@ fn remove_pixel_rigidbody_state(world: &mut AlchemyRapierWorldInner, body_handle
             existing.collider,
             &mut world.islands,
             &mut world.bodies,
+            &mut world.soft_bodies,
             true,
         );
     }
@@ -1796,7 +2012,7 @@ fn clear_body_colliders(world: &mut AlchemyRapierWorldInner, body_handle: RigidB
     for collider in colliders {
         let _ = world
             .colliders
-            .remove(collider, &mut world.islands, &mut world.bodies, true);
+            .remove(collider, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true);
     }
 }
 
@@ -2332,7 +2548,7 @@ fn try_apply_dirty_pixel_split(
 
     let _ = world
         .colliders
-        .remove(state.collider, &mut world.islands, &mut world.bodies, true);
+        .remove(state.collider, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true);
     if let Some(body) = world.bodies.get_mut(body_handle) {
         body.set_position(
             Pose::from_parts(source_position, source_pose.rotation),
@@ -2475,6 +2691,7 @@ fn create_pending_split_events(
                 .gravity_scale(source_gravity_scale)
                 .can_sleep(source_can_sleep),
         );
+        world.track_contact_body_enabled(child_body, true);
         let child_collider_handle =
             world
                 .colliders
@@ -3712,6 +3929,7 @@ fn step_with_contact_callback(
         let mut active_pairs = HashSet::new();
         let mut contact_hit_count = 0usize;
         for _ in 0..sub_steps {
+            if callback.is_some() { snapshot_contact_bodies(world); }
             world.step_once(dt, friction_callback, user_data as usize);
             if callback.is_some() {
                 contact_hit_count = contact_hit_count
@@ -3801,6 +4019,7 @@ pub extern "C" fn alchemy_rapier_create_body(
             };
         };
         let handle = world.bodies.insert(body_builder(desc));
+        world.track_contact_body_enabled(handle, true);
         AlchemyRapierCreateBodyResult {
             status: AlchemyRapierStatus::Ok,
             handle: handle_to_ffi(handle),
@@ -3884,6 +4103,7 @@ pub extern "C" fn alchemy_rapier_set_body_simulation_enabled(
             }
             world.query_pending_colliders.insert(collider);
         }
+        world.track_contact_body_enabled(handle, enabled != 0);
         AlchemyRapierStatus::Ok
     })) {
         Ok(status) => status,
@@ -4022,10 +4242,12 @@ pub extern "C" fn alchemy_rapier_destroy_body(
                 &mut world.colliders,
                 &mut world.impulse_joints,
                 &mut world.multibody_joints,
+                &mut world.soft_bodies,
                 true,
             )
             .is_some()
         {
+            world.track_contact_body_enabled(handle, false);
             AlchemyRapierStatus::Ok
         } else {
             AlchemyRapierStatus::InvalidHandle
@@ -4055,7 +4277,7 @@ pub extern "C" fn alchemy_rapier_clear_body_colliders(
             remove_voxel_collider_metadata(world, collider);
             let _ = world
                 .colliders
-                .remove(collider, &mut world.islands, &mut world.bodies, true);
+                .remove(collider, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true);
         }
         recompute_body_mass(world, body_handle);
         AlchemyRapierStatus::Ok
@@ -4178,6 +4400,156 @@ pub extern "C" fn alchemy_rapier_create_convex_collider(
             handle: AlchemyRapierColliderHandle::default(),
             packed_id: 0,
         },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_update_convex_collider(
+    world: *mut AlchemyRapierWorld,
+    handle: AlchemyRapierColliderHandle,
+    points: *const AlchemyRapierVec2,
+    point_count: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        if points.is_null() || !(3..=128).contains(&point_count) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let points = unsafe { slice::from_raw_parts(points, point_count) };
+        if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        let handle = collider_handle_from_ffi(handle);
+        let Some(collider) = world.colliders.get(handle) else { return AlchemyRapierStatus::InvalidHandle; };
+        if collider.shape().as_capsule().is_none() && collider.shape().as_convex_polygon().is_none() {
+            return AlchemyRapierStatus::Unsupported;
+        }
+        let mut vertices = [Vector::ZERO; 128];
+        for (destination, point) in vertices.iter_mut().zip(points) { *destination = vector(*point); }
+        let Some(shape) = SharedShape::convex_hull(&vertices[..point_count]) else { return AlchemyRapierStatus::InvalidArgument; };
+        let collider = &mut world.colliders[handle];
+        let parent = collider.parent();
+        collider.set_shape(shape);
+        world.query_pending_colliders.insert(handle);
+        if let Some(parent) = parent {
+            recompute_body_mass(world, parent);
+            if let Some(body) = world.bodies.get_mut(parent) { body.wake_up(true); }
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+fn morph_shape_blocked(
+    world: &AlchemyRapierWorldInner,
+    own_body: RigidBodyHandle,
+    own_collider: &Collider,
+    proposed_shape: &dyn Shape,
+    proposed_pose: &Pose,
+) -> bool {
+    let dispatcher = world.narrow_phase.query_dispatcher();
+    let query_aabb = proposed_shape.compute_aabb(proposed_pose);
+    let blocked_by = |handle: ColliderHandle, other: &Collider| {
+        if !other.is_enabled() || other.is_sensor() || other.parent() == Some(own_body) ||
+            world.terrain_by_collider.contains_key(&handle) ||
+            world.terrain_fracture_actor_by_collider.contains_key(&handle) ||
+            world.voxel_terrain_sources.contains_key(&handle) ||
+            !own_collider.collision_groups().test(other.collision_groups()) {
+            return false;
+        }
+        if !aabbs_intersect(&query_aabb, &other.compute_aabb()) { return false; }
+        let relative = proposed_pose.inv_mul(other.position());
+        let proposed = match dispatcher.contact(&relative, proposed_shape, other.shape(), 0.0) {
+            Ok(Some(contact)) => contact.dist,
+            Ok(None) => return false,
+            Err(_) => return true,
+        };
+        if proposed >= -0.01 { return false; }
+        let old_relative = own_collider.position().inv_mul(other.position());
+        let previous = match dispatcher.contact(&old_relative, own_collider.shape(), other.shape(), 0.0) {
+            Ok(Some(contact)) => contact.dist,
+            Ok(None) => 0.0,
+            Err(_) => return true,
+        };
+        proposed < previous - 0.01
+    };
+    let pipeline = world.broad_phase.as_query_pipeline(
+        dispatcher, &world.bodies, &world.colliders, QueryFilter::default(),
+    );
+    for (handle, collider) in pipeline.intersect_aabb_conservative(query_aabb) {
+        if !world.query_pending_colliders.contains(&handle) && blocked_by(handle, collider) { return true; }
+    }
+    for handle in &world.query_pending_colliders {
+        if let Some(collider) = world.colliders.get(*handle) {
+            if blocked_by(*handle, collider) { return true; }
+        }
+    }
+    false
+}
+
+// The caller checks pixel terrain separately. These proposals are applied in
+// order, with a dynamic-body overlap check before any pose or shape changes.
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_try_morph_colliders_batch(
+    world: *mut AlchemyRapierWorld,
+    proposals: *const AlchemyRapierMorphColliderDesc,
+    results: *mut AlchemyRapierMorphColliderResult,
+    count: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        if count > 128 || (count != 0 && (proposals.is_null() || results.is_null())) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        if count == 0 { return AlchemyRapierStatus::Ok; }
+        let proposals = unsafe { slice::from_raw_parts(proposals, count) };
+        let results = unsafe { slice::from_raw_parts_mut(results, count) };
+        world.bodies.propagate_modified_body_positions_to_colliders(&mut world.colliders);
+        for (proposal, result) in proposals.iter().zip(results.iter_mut()) {
+            *result = AlchemyRapierMorphColliderResult::default();
+            if proposal.vertices.is_null() || !(3..=128).contains(&proposal.vertex_count) ||
+                !proposal.position.x.is_finite() || !proposal.position.y.is_finite() {
+                result.status = AlchemyRapierStatus::InvalidArgument;
+                continue;
+            }
+            let points = unsafe { slice::from_raw_parts(proposal.vertices, proposal.vertex_count) };
+            if points.iter().any(|point| !point.x.is_finite() || !point.y.is_finite()) {
+                result.status = AlchemyRapierStatus::InvalidArgument;
+                continue;
+            }
+            let body_handle = handle_from_ffi(proposal.body);
+            let collider_handle = collider_handle_from_ffi(proposal.collider);
+            let Some(body) = world.bodies.get(body_handle) else { result.status = AlchemyRapierStatus::InvalidHandle; continue; };
+            let Some(collider) = world.colliders.get(collider_handle) else { result.status = AlchemyRapierStatus::InvalidHandle; continue; };
+            if !body.is_enabled() || body.colliders().len() != 1 || collider.parent() != Some(body_handle) ||
+                (collider.shape().as_capsule().is_none() && collider.shape().as_convex_polygon().is_none()) {
+                result.status = AlchemyRapierStatus::Unsupported;
+                continue;
+            }
+            let mut vertices = [Vector::ZERO; 128];
+            for (vertex, point) in vertices.iter_mut().zip(points) { *vertex = vector(*point); }
+            let Some(shape) = SharedShape::convex_hull(&vertices[..points.len()]) else {
+                result.status = AlchemyRapierStatus::InvalidArgument;
+                continue;
+            };
+            let mut body_pose = *body.position();
+            body_pose.translation = vector(proposal.position);
+            let collider_pose = collider.position_wrt_parent().map_or(body_pose, |local| body_pose * *local);
+            if morph_shape_blocked(world, body_handle, collider, shape.as_ref(), &collider_pose) { continue; }
+            world.bodies[body_handle].set_position(body_pose, true);
+            let collider = &mut world.colliders[collider_handle];
+            collider.set_position(collider_pose);
+            collider.set_shape(shape);
+            world.query_pending_colliders.insert(collider_handle);
+            recompute_body_mass(world, body_handle);
+            result.applied = 1;
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
     }
 }
 
@@ -4362,7 +4734,7 @@ pub extern "C" fn alchemy_rapier_rebuild_pixel_rigidbody_from_owned_asset(
 
         let _ = world
             .colliders
-            .remove(state.collider, &mut world.islands, &mut world.bodies, true);
+            .remove(state.collider, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true);
         let collider_handle =
             world
                 .colliders
@@ -4665,7 +5037,7 @@ pub extern "C" fn alchemy_rapier_destroy_collider(
         remove_voxel_collider_metadata(world, handle);
         if world
             .colliders
-            .remove(handle, &mut world.islands, &mut world.bodies, true)
+            .remove(handle, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true)
             .is_some()
         {
             AlchemyRapierStatus::Ok
@@ -4693,7 +5065,7 @@ pub extern "C" fn alchemy_rapier_destroy_collider_by_id(
         remove_voxel_collider_metadata(world, handle);
         if world
             .colliders
-            .remove(handle, &mut world.islands, &mut world.bodies, true)
+            .remove(handle, &mut world.islands, &mut world.bodies, &mut world.soft_bodies, true)
             .is_some()
         {
             AlchemyRapierStatus::Ok
@@ -4759,6 +5131,202 @@ pub extern "C" fn alchemy_rapier_body_state(
             can_sleep: 0,
             is_awake: 0,
         },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_body_states_batch(
+    world: *mut AlchemyRapierWorld,
+    handles: *const AlchemyRapierRigidBodyHandle,
+    states: *mut AlchemyRapierBodyStateResult,
+    enabled: *mut u8,
+    count: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        if count > 128 || (count != 0 && (handles.is_null() || states.is_null() || enabled.is_null())) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        if count == 0 { return AlchemyRapierStatus::Ok; }
+        let handles = unsafe { slice::from_raw_parts(handles, count) };
+        let states = unsafe { slice::from_raw_parts_mut(states, count) };
+        let enabled = unsafe { slice::from_raw_parts_mut(enabled, count) };
+        for ((output, is_enabled), ffi_handle) in states.iter_mut().zip(enabled).zip(handles) {
+            let handle = handle_from_ffi(*ffi_handle);
+            *output = if let Some(body) = world.bodies.get(handle) {
+                *is_enabled = u8::from(body.is_enabled());
+                make_body_state(handle, body)
+            } else {
+                *is_enabled = 0;
+                AlchemyRapierBodyStateResult {
+                    status: AlchemyRapierStatus::InvalidHandle,
+                    packed_id: 0,
+                    body_type: AlchemyRapierBodyType::Dynamic,
+                    position: AlchemyRapierVec2::default(),
+                    rotation: 0.0,
+                    linear_velocity: AlchemyRapierVec2::default(),
+                    angular_velocity: 0.0,
+                    linear_damping: 0.0,
+                    angular_damping: 0.0,
+                    can_sleep: 0,
+                    is_awake: 0,
+                }
+            };
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_prepare_streaming_motion_groups(world: *mut AlchemyRapierWorld) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        for &handle in &world.enabled_contact_bodies {
+            let (index, generation) = handle.into_raw_parts();
+            let index = index as usize;
+            if world.streaming_motion_nodes.len() <= index {
+                world.streaming_motion_nodes.resize(index + 1, StreamingMotionNode::default());
+            }
+            let valid = world.bodies.get(handle).is_some_and(|body| !body.is_fixed());
+            world.streaming_motion_nodes[index] = StreamingMotionNode { generation, valid, parent: index, ..Default::default() };
+        }
+        for pair in world.narrow_phase.contact_pairs() {
+            // Broad-phase neighbors can become contacts during the next step;
+            // grouping them conservatively also covers newly formed contacts.
+            let a = world.colliders.get(pair.collider1).and_then(|collider| collider.parent());
+            let b = world.colliders.get(pair.collider2).and_then(|collider| collider.parent());
+            if let (Some(a), Some(b)) = (a, b) {
+                streaming_motion_union(&mut world.streaming_motion_nodes, &world.enabled_contact_body_indices, a, b);
+            }
+        }
+        for (_, joint) in world.impulse_joints.iter() {
+            streaming_motion_union(&mut world.streaming_motion_nodes, &world.enabled_contact_body_indices, joint.body1(), joint.body2());
+        }
+        for (_, _, multibody, link) in world.multibody_joints.iter() {
+            if let Some(parent) = link.parent_id().and_then(|id| multibody.link(id)) {
+                streaming_motion_union(&mut world.streaming_motion_nodes, &world.enabled_contact_body_indices,
+                    link.rigid_body_handle(), parent.rigid_body_handle());
+            }
+        }
+        for &handle in &world.enabled_contact_bodies {
+            let (index, _) = handle.into_raw_parts();
+            let index = index as usize;
+            if !world.streaming_motion_nodes[index].valid { continue; }
+            let Some(body) = world.bodies.get(handle) else { continue; };
+            let root = streaming_motion_root(&mut world.streaming_motion_nodes, index);
+            let group = &mut world.streaming_motion_nodes[root];
+            group.members += 1;
+            let speed = body.linvel().length() as f64;
+            if body.is_dynamic() {
+                let mass = body.mass() as f64;
+                let inertia = body.mass_properties().local_mprops.principal_inertia() as f64;
+                let angular = body.angvel() as f64;
+                if mass.is_finite() && mass > 0.0 { group.kinetic_twice += mass * speed * speed; }
+                if inertia.is_finite() && inertia > 0.0 { group.kinetic_twice += inertia * angular * angular; }
+            } else {
+                group.kinematic_speed += speed;
+            }
+        }
+        // Compress after all unions, so batch lookups need no allocation or graph traversal.
+        for &handle in &world.enabled_contact_bodies {
+            let (index, _) = handle.into_raw_parts();
+            let index = index as usize;
+            if world.streaming_motion_nodes[index].valid {
+                let root = streaming_motion_root(&mut world.streaming_motion_nodes, index);
+                world.streaming_motion_nodes[index].parent = root;
+            }
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_streaming_motion_bounds_batch(
+    world: *mut AlchemyRapierWorld,
+    handles: *const AlchemyRapierRigidBodyHandle,
+    bounds: *mut AlchemyRapierStreamingMotionBound,
+    count: usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        if count > 128 || (count != 0 && (handles.is_null() || bounds.is_null())) {
+            return AlchemyRapierStatus::InvalidArgument;
+        }
+        if count == 0 { return AlchemyRapierStatus::Ok; }
+        let handles = unsafe { slice::from_raw_parts(handles, count) };
+        let bounds = unsafe { slice::from_raw_parts_mut(bounds, count) };
+        for (output, ffi_handle) in bounds.iter_mut().zip(handles) {
+            *output = AlchemyRapierStreamingMotionBound::default();
+            let handle = handle_from_ffi(*ffi_handle);
+            let (index, generation) = handle.into_raw_parts();
+            let Some(node) = world.streaming_motion_nodes.get(index as usize) else { continue; };
+            if !node.valid || node.generation != generation { continue; }
+            let Some(body) = world.bodies.get(handle) else { continue; };
+            let group = world.streaming_motion_nodes[node.parent];
+            let mass = body.mass() as f64;
+            let inertia = body.mass_properties().local_mprops.principal_inertia() as f64;
+            let linear = if mass.is_finite() && mass > 0.0 { (group.kinetic_twice / mass).sqrt() } else { body.linvel().length() as f64 };
+            let angular = if inertia.is_finite() && inertia > 0.0 { (group.kinetic_twice / inertia).sqrt() } else { body.angvel().abs() as f64 };
+            output.group = node.parent as u32;
+            output.members = group.members;
+            output.linear_speed = (linear + 2.0 * group.kinematic_speed).min(f32::MAX as f64) as f32;
+            output.angular_speed = angular.min(f32::MAX as f64) as f32;
+        }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
+    }
+}
+
+// Called only for groups which must pause at a streaming boundary. Enumerate
+// every Rapier member, including bodies owned by character/ragdoll systems.
+#[unsafe(no_mangle)]
+pub extern "C" fn alchemy_rapier_streaming_group_members(
+    world: *mut AlchemyRapierWorld,
+    group: u32,
+    output: *mut AlchemyRapierStreamingGroupMember,
+    capacity: usize,
+    written: *mut usize,
+) -> AlchemyRapierStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Ok(world) = to_inner(world) else { return AlchemyRapierStatus::NullPointer; };
+        if written.is_null() || (capacity != 0 && output.is_null()) { return AlchemyRapierStatus::InvalidArgument; }
+        let mut count = 0usize;
+        for &handle in &world.enabled_contact_bodies {
+            let (index, generation) = handle.into_raw_parts();
+            let Some(node) = world.streaming_motion_nodes.get(index as usize) else { continue; };
+            if !node.valid || node.generation != generation || node.parent != group as usize { continue; }
+            let Some(body) = world.bodies.get(handle) else { continue; };
+            if count < capacity {
+                let center = body.position().translation;
+                let mut min = center;
+                let mut max = center;
+                for collider_handle in body.colliders() {
+                    let Some(collider) = world.colliders.get(*collider_handle) else { continue; };
+                    if !collider.is_enabled() { continue; }
+                    let pose = collider.position_wrt_parent().map_or(*collider.position(), |local| *body.position() * *local);
+                    let aabb = collider.shape().compute_aabb(&pose);
+                    min = min.min(aabb.mins);
+                    max = max.max(aabb.maxs);
+                }
+                unsafe { output.add(count).write(AlchemyRapierStreamingGroupMember {
+                    body: handle_to_ffi(handle), min: ffi_vec(min), max: ffi_vec(max),
+                }); }
+            }
+            count += 1;
+        }
+        unsafe { written.write(count); }
+        AlchemyRapierStatus::Ok
+    })) {
+        Ok(status) => status,
+        Err(_) => AlchemyRapierStatus::Panic,
     }
 }
 
@@ -6117,7 +6685,7 @@ pub extern "C" fn alchemy_rapier_query_overlap_capsule(
             else {
                 continue;
             };
-            if !intersects {
+            if !intersects.intersecting {
                 continue;
             }
 
@@ -7310,6 +7878,181 @@ mod tests {
     use rapier2d::parry::query::DefaultQueryDispatcher;
 
     #[test]
+    fn upgraded_terrain_friction_callback_updates_each_pixel_contact() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        extern "C" fn sample(data: *mut c_void, _body: u64, _cell: i32, point: AlchemyRapierVec2) -> f32 {
+            let all_slippery = unsafe { &*(data as *const AtomicBool) }.load(Ordering::Relaxed);
+            if all_slippery || point.x < 0.0 { 0.0 } else { 1.0 }
+        }
+        let mut world = AlchemyRapierWorldInner::new();
+        let floor = world.colliders.insert(ColliderBuilder::cuboid(5.0, 0.5)
+            .translation(Vector::new(0.0, -0.5)).friction(1.0)
+            .friction_combine_rule(CoefficientCombineRule::Min)
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS).build());
+        world.voxel_terrain_sources.insert(floor, VoxelTerrainSourceMetadata { chunk_x: 0, chunk_y: 0, revision: 1 });
+        let body = world.bodies.insert(RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.0, 0.49)).linvel(Vector::new(1.0, 0.0))
+            .lock_rotations().build());
+        let shape = world.colliders.insert_with_parent(ColliderBuilder::cuboid(1.0, 0.5)
+            .friction(1.0).build(), body, &mut world.bodies);
+        let slippery = AtomicBool::new(false);
+        let data = &slippery as *const AtomicBool as usize;
+        for all_slippery in [false, true] {
+            slippery.store(all_slippery, Ordering::Relaxed);
+            world.step_once(1.0 / 60.0, Some(sample), data);
+            let pair = world.narrow_phase.contact_pair(floor, shape).expect("contact pair");
+            let manifold = pair.manifolds().iter().find(|m| m.data.solver_contacts.len() == 2).expect("two contact points");
+            let mut values = [None, None];
+            for contact in &manifold.data.solver_contacts {
+                let (a, b) = manifold.data.solver_contact_world_points(contact, &world.bodies);
+                let side = ((a.x + b.x) > 0.0) as usize;
+                let id = contact.contact_indices()[0] as usize;
+                values[side] = manifold.points[id].data.friction_override;
+            }
+            assert_eq!(values[0], Some(0.0));
+            assert_eq!(values[1], Some(if all_slippery { 0.0 } else { 1.0 }));
+        }
+    }
+
+    #[test]
+    fn upgraded_solver_respects_separate_contact_friction() {
+        struct SplitFriction;
+        impl PhysicsHooks for SplitFriction {
+            fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+                let Some(rigid) = context.rigid_mut() else { return; };
+                for (index, contact) in rigid.solver_contacts.iter().enumerate() {
+                    let x = (contact.anchor1.x + contact.anchor2.x) * 0.5;
+                    rigid.contact_friction_overrides[index] = Some(if x < 0.0 { 0.0 } else { 1.0 });
+                }
+            }
+        }
+        let mut world = AlchemyRapierWorldInner::new();
+        let floor = world.colliders.insert(ColliderBuilder::cuboid(5.0, 0.5)
+            .translation(Vector::new(0.0, -0.5))
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS).build());
+        let body = world.bodies.insert(RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.0, 0.49)).linvel(Vector::new(1.0, 0.0))
+            .lock_rotations().build());
+        let shape = world.colliders.insert_with_parent(ColliderBuilder::cuboid(1.0, 0.5)
+            .friction(1.0).build(), body, &mut world.bodies);
+        world.pipeline.step(world.gravity, &world.integration_parameters, &mut world.islands,
+            &mut world.broad_phase, &mut world.narrow_phase, &mut world.bodies,
+            &mut world.colliders, &mut world.impulse_joints, &mut world.multibody_joints,
+            &mut world.soft_bodies, &mut world.ccd_solver, &SplitFriction, &());
+        let pair = world.narrow_phase.contact_pair(floor, shape).expect("contact pair");
+        let manifold = pair.manifolds().iter().find(|m| m.data.solver_contacts.len() == 2).expect("two contact points");
+        let mut impulses = [None, None];
+        for contact in &manifold.data.solver_contacts {
+            let (a, b) = manifold.data.solver_contact_world_points(contact, &world.bodies);
+            let side = ((a.x + b.x) > 0.0) as usize;
+            let id = contact.contact_indices()[0] as usize;
+            impulses[side] = Some(manifold.points[id].data.tangent_impulse.x.abs());
+        }
+        let left = impulses[0].expect("left contact");
+        let right = impulses[1].expect("right contact");
+        assert!(left < 1e-6, "zero-friction point carried impulse {left}");
+        assert!(right > 1e-5, "high-friction point carried no impulse: {right}");
+    }
+
+    #[test]
+    fn upgraded_one_way_drive_moves_child_without_pushing_parent() {
+        let world = alchemy_rapier_create_world();
+        assert_eq!(alchemy_rapier_set_gravity(world.world, AlchemyRapierVec2 { x: 0.0, y: 0.0 }), AlchemyRapierStatus::Ok);
+        let parent = create_motor_test_body(world.world, 0.0, 0.0);
+        let child = create_motor_test_body(world.world, 0.0, 0.0);
+        let inner = to_inner(world.world).unwrap();
+        let mut joint = GenericJoint::new(JointAxesMask::empty());
+        joint.set_contacts_enabled(false);
+        let handle = inner.impulse_joints.insert(handle_from_ffi(parent), handle_from_ffi(child), joint, true);
+        let drive = AlchemyRapierControlDriveDesc {
+            only_control_child: 1, target_position: AlchemyRapierVec2 { x: 1.0, y: 0.0 },
+            target_velocity: AlchemyRapierVec2::default(), target_angle: 0.0, target_angular_velocity: 0.0,
+            linear_stiffness: 100.0, linear_damping: 10.0, angular_stiffness: 0.0,
+            angular_damping: 0.0, max_force: 100.0, max_torque: 0.0,
+        };
+        assert_eq!(alchemy_rapier_set_control_drive(world.world, joint_handle_to_ffi(handle), drive), AlchemyRapierStatus::Ok);
+        for _ in 0..10 { assert_eq!(alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status, AlchemyRapierStatus::Ok); }
+        let a = alchemy_rapier_body_state(world.world, parent);
+        let b = alchemy_rapier_body_state(world.world, child);
+        assert!(a.position.x.abs() < 0.0001, "parent moved: {}", a.position.x);
+        assert!(b.position.x > 0.01, "child did not move: {}", b.position.x);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn impact_estimate_uses_pre_solve_closing_speed_and_effective_mass() {
+        let mut moving = PreSolveContactBody {
+            valid: true,
+            velocity: Vector::new(-4.0, 0.0),
+            inverse_mass: Vector::new(0.1, 0.1),
+            ..PreSolveContactBody::default()
+        };
+        let fixed = PreSolveContactBody::default();
+        let normal = Vector::new(1.0, 0.0);
+        let (speed, impulse) = contact_impact_estimate(moving, fixed, Vector::ZERO, normal, 0.0);
+        assert!((speed - 4.0).abs() < 0.0001);
+        assert!((impulse - 40.0).abs() < 0.0001);
+        moving.velocity = Vector::new(0.0, 4.0);
+        assert_eq!(contact_impact_estimate(moving, fixed, Vector::ZERO, normal, 0.0), (0.0, 0.0));
+        moving.velocity = Vector::new(4.0, 0.0);
+        assert_eq!(contact_impact_estimate(moving, fixed, Vector::ZERO, normal, 0.0), (0.0, 0.0));
+        moving.velocity = Vector::ZERO;
+        moving.angular_velocity = 4.0;
+        let (speed, impulse) = contact_impact_estimate(moving, fixed, Vector::new(0.0, 1.0), normal, 0.5);
+        assert!((speed - 4.0).abs() < 0.0001);
+        assert!((impulse - 60.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn contact_snapshots_exclude_disabled_bodies_and_track_reactivation() {
+        let mut world = AlchemyRapierWorldInner::new();
+        let first = world.bodies.insert(RigidBodyBuilder::dynamic().linvel(Vector::new(1.0, 0.0)));
+        let second = world.bodies.insert(RigidBodyBuilder::dynamic().linvel(Vector::new(2.0, 0.0)));
+        world.track_contact_body_enabled(first, true);
+        world.track_contact_body_enabled(second, true);
+        snapshot_contact_bodies(&mut world);
+        assert_eq!(pre_solve_contact_body(&world, Some(first)).unwrap().velocity.x, 1.0);
+        world.track_contact_body_enabled(first, false);
+        assert_eq!(world.enabled_contact_bodies.len(), 1);
+        assert!(pre_solve_contact_body(&world, Some(first)).is_none());
+        assert_eq!(world.enabled_contact_bodies[0], second);
+        world.track_contact_body_enabled(first, true);
+        snapshot_contact_bodies(&mut world);
+        assert_eq!(world.enabled_contact_bodies.len(), 2);
+        assert_eq!(pre_solve_contact_body(&world, Some(first)).unwrap().velocity.x, 1.0);
+    }
+
+    #[test]
+    fn contact_callback_reports_pre_solve_impact_for_real_collision() {
+        unsafe extern "C" fn collect(user_data: *mut c_void, sample: *const AlchemyRapierContactSample) {
+            unsafe { (&mut *(user_data as *mut Vec<AlchemyRapierContactSample>)).push(*sample); }
+        }
+        let world = alchemy_rapier_create_world();
+        assert_eq!(alchemy_rapier_set_gravity(world.world, AlchemyRapierVec2 { x: 0.0, y: 0.0 }), AlchemyRapierStatus::Ok);
+        for (position, velocity) in [(-0.8, 2.0), (0.8, -2.0)] {
+            let mut desc = test_body_desc(0.0);
+            desc.position = AlchemyRapierVec2 { x: position, y: 0.0 };
+            desc.linear_velocity = AlchemyRapierVec2 { x: velocity, y: 0.0 };
+            let body = alchemy_rapier_create_body(world.world, desc);
+            assert_eq!(body.status, AlchemyRapierStatus::Ok);
+            assert_eq!(alchemy_rapier_create_capsule_collider(world.world, body.handle, 0.5, 0.0).status, AlchemyRapierStatus::Ok);
+        }
+        let mut contacts: Vec<AlchemyRapierContactSample> = Vec::new();
+        for _ in 0..30 {
+            let result = alchemy_rapier_step_with_contact_callback(
+                world.world, 1.0 / 60.0, 1, Some(collect),
+                &mut contacts as *mut Vec<AlchemyRapierContactSample> as *mut c_void,
+            );
+            assert_eq!(result.status, AlchemyRapierStatus::Ok);
+        }
+        let hit = contacts.iter().find(|sample| sample.impact_speed > 3.5).expect("missing measured impact");
+        assert!(hit.impact_speed <= 4.01);
+        assert!(hit.impact_impulse > 0.0);
+        assert!(hit.impact_impulse <= hit.collision_impulse);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
     fn full_terrain_shape_cache_preserves_per_collider_metadata_and_falls_back_for_damage() {
         let mut world = AlchemyRapierWorldInner::new();
         let mut cells: Vec<_> = (0..64)
@@ -7638,6 +8381,179 @@ mod tests {
             AlchemyRapierStatus::Ok
         );
         body.handle
+    }
+
+    #[test]
+    fn batched_body_states_report_disabled_and_invalid_handles() {
+        let world = alchemy_rapier_create_world();
+        let first = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let second = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        assert_eq!(first.status, AlchemyRapierStatus::Ok);
+        assert_eq!(second.status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_set_body_simulation_enabled(world.world, second.handle, 0,
+            AlchemyRapierVec2::default(), 0.0, AlchemyRapierVec2::default(), 0.0), AlchemyRapierStatus::Ok);
+        let invalid = AlchemyRapierRigidBodyHandle { index: u32::MAX, generation: u32::MAX };
+        let handles = [first.handle, second.handle, invalid];
+        let mut states = [alchemy_rapier_body_state(world.world, first.handle); 3];
+        let mut enabled = [0; 3];
+        assert_eq!(alchemy_rapier_body_states_batch(world.world, handles.as_ptr(), states.as_mut_ptr(), enabled.as_mut_ptr(), 3), AlchemyRapierStatus::Ok);
+        assert_eq!(states[0].status, AlchemyRapierStatus::Ok);
+        assert_eq!(states[1].status, AlchemyRapierStatus::Ok);
+        assert_eq!(states[2].status, AlchemyRapierStatus::InvalidHandle);
+        assert_eq!(enabled, [1, 0, 0]);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn streaming_motion_bound_includes_contact_partner_energy() {
+        let world = alchemy_rapier_create_world();
+        let mut desc = test_body_desc(0.0);
+        desc.gravity_scale = 0.0;
+        desc.position.x = 0.0;
+        let left = alchemy_rapier_create_body(world.world, desc);
+        desc.position.x = 0.9;
+        let right = alchemy_rapier_create_body(world.world, desc);
+        for handle in [left.handle, right.handle] {
+            assert_eq!(alchemy_rapier_create_capsule_collider(world.world, handle, 0.5, 0.0).status, AlchemyRapierStatus::Ok);
+        }
+        assert_eq!(alchemy_rapier_step(world.world, 1.0 / 60.0, 1).status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_apply_body_linear_impulse(world.world, left.handle, AlchemyRapierVec2 { x: 10.0, y: 0.0 }, 1), AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_prepare_streaming_motion_groups(world.world), AlchemyRapierStatus::Ok);
+        let handles = [left.handle, right.handle];
+        let mut bounds = [AlchemyRapierStreamingMotionBound::default(); 2];
+        assert_eq!(alchemy_rapier_streaming_motion_bounds_batch(world.world, handles.as_ptr(), bounds.as_mut_ptr(), 2), AlchemyRapierStatus::Ok);
+        assert_eq!(bounds[0].group, bounds[1].group);
+        assert_eq!(bounds[0].members, 2);
+        assert!(bounds[1].linear_speed > 0.1);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn streaming_motion_groups_include_connected_joint_bodies() {
+        let world = alchemy_rapier_create_world();
+        let mut desc = test_body_desc(0.0);
+        desc.position.x = -10.0;
+        let first = alchemy_rapier_create_body(world.world, desc);
+        desc.position.x = 10.0;
+        let second = alchemy_rapier_create_body(world.world, desc);
+        desc.position.x = 100.0;
+        let separate = alchemy_rapier_create_body(world.world, desc);
+        let joint = AlchemyRapierRevoluteJointDesc {
+            body1: first.handle, body2: second.handle,
+            local_anchor1: AlchemyRapierVec2::default(), local_anchor2: AlchemyRapierVec2::default(),
+            natural_frequency: 0.0, damping_ratio: 0.0, contacts_enabled: 0, wake_up: 1,
+        };
+        assert_eq!(alchemy_rapier_create_revolute_joint(world.world, joint).status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_prepare_streaming_motion_groups(world.world), AlchemyRapierStatus::Ok);
+        let handles = [first.handle, second.handle, separate.handle];
+        let mut bounds = [AlchemyRapierStreamingMotionBound::default(); 3];
+        assert_eq!(alchemy_rapier_streaming_motion_bounds_batch(world.world, handles.as_ptr(), bounds.as_mut_ptr(), 3), AlchemyRapierStatus::Ok);
+        assert_eq!(bounds[0].group, bounds[1].group);
+        assert_eq!(bounds[0].members, 2);
+        assert_ne!(bounds[0].group, bounds[2].group);
+        assert_eq!(bounds[2].members, 1);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn changing_convex_shape_preserves_handle_material_and_query_visibility() {
+        let world = alchemy_rapier_create_world();
+        let body = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        assert_eq!(body.status, AlchemyRapierStatus::Ok);
+        let collider = alchemy_rapier_create_capsule_collider(world.world, body.handle, 0.5, 0.0);
+        assert_eq!(collider.status, AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_set_collider_material(world.world, collider.handle, 0.7, 0.2), AlchemyRapierStatus::Ok);
+        let before_mass = alchemy_rapier_body_mass(world.world, body.handle).mass;
+        let vertices = [
+            AlchemyRapierVec2 { x: -2.0, y: -1.0 }, AlchemyRapierVec2 { x: 2.0, y: -1.0 },
+            AlchemyRapierVec2 { x: 2.0, y: 1.0 }, AlchemyRapierVec2 { x: -2.0, y: 1.0 },
+        ];
+        assert_eq!(alchemy_rapier_update_convex_collider(world.world, collider.handle, vertices.as_ptr(), vertices.len()), AlchemyRapierStatus::Ok);
+        let inner = to_inner(world.world).unwrap();
+        let current = &inner.colliders[collider_handle_from_ffi(collider.handle)];
+        assert!(current.shape().as_convex_polygon().is_some());
+        assert!((current.friction() - 0.7).abs() < 0.0001);
+        assert!((current.restitution() - 0.2).abs() < 0.0001);
+        assert!((alchemy_rapier_body_mass(world.world, body.handle).mass - before_mass).abs() < 0.0001);
+        let mut hits = [AlchemyRapierQueryHit::default(); 4];
+        let result = alchemy_rapier_query_cast_capsule(
+            world.world, AlchemyRapierVec2 { x: -5.0, y: 0.0 }, AlchemyRapierVec2 { x: 5.0, y: 0.0 },
+            0.1, 0.0, AlchemyRapierRigidBodyHandle::default(), 0, QUERY_SOURCE_DYNAMIC_RIGIDBODY,
+            hits.as_mut_ptr(), hits.len(),
+        );
+        assert_eq!(result.status, AlchemyRapierStatus::Ok);
+        assert_eq!(result.hit_count, 1);
+        assert!((hits[0].fraction - 0.29).abs() < 0.02);
+        assert_eq!(alchemy_rapier_update_convex_collider(world.world, collider.handle, vertices.as_ptr(), 2), AlchemyRapierStatus::InvalidArgument);
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn morph_proposal_is_rejected_without_mutating_pose_or_shape_when_blocked() {
+        let world = alchemy_rapier_create_world();
+        let body = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let collider = alchemy_rapier_create_capsule_collider(world.world, body.handle, 0.5, 0.0);
+        let mut blocker_desc = test_body_desc(0.0);
+        blocker_desc.position.x = 2.3;
+        let blocker = alchemy_rapier_create_body(world.world, blocker_desc);
+        assert_eq!(alchemy_rapier_create_capsule_collider(world.world, blocker.handle, 0.5, 0.0).status, AlchemyRapierStatus::Ok);
+        let points = [
+            AlchemyRapierVec2 { x: -2.0, y: -1.0 }, AlchemyRapierVec2 { x: 2.0, y: -1.0 },
+            AlchemyRapierVec2 { x: 2.0, y: 1.0 }, AlchemyRapierVec2 { x: -2.0, y: 1.0 },
+        ];
+        let mut proposal = AlchemyRapierMorphColliderDesc {
+            body: body.handle, collider: collider.handle, position: AlchemyRapierVec2::default(),
+            vertices: points.as_ptr(), vertex_count: points.len(),
+        };
+        let mut result = AlchemyRapierMorphColliderResult::default();
+        assert_eq!(alchemy_rapier_try_morph_colliders_batch(world.world, &proposal, &mut result, 1), AlchemyRapierStatus::Ok);
+        assert_eq!(result.status, AlchemyRapierStatus::Ok);
+        assert_eq!(result.applied, 0);
+        assert_eq!(alchemy_rapier_body_state(world.world, body.handle).position.x, 0.0);
+        assert!(to_inner(world.world).unwrap().colliders[collider_handle_from_ffi(collider.handle)].shape().as_capsule().is_some());
+        assert_eq!(alchemy_rapier_destroy_body(world.world, blocker.handle), AlchemyRapierStatus::Ok);
+        assert_eq!(alchemy_rapier_apply_body_linear_impulse(world.world, body.handle, AlchemyRapierVec2 { x: 1.0, y: 0.0 }, 1), AlchemyRapierStatus::Ok);
+        let before = alchemy_rapier_body_state(world.world, body.handle);
+        proposal.position.x = 1.0;
+        assert_eq!(alchemy_rapier_try_morph_colliders_batch(world.world, &proposal, &mut result, 1), AlchemyRapierStatus::Ok);
+        assert_eq!(result.status, AlchemyRapierStatus::Ok);
+        assert_eq!(result.applied, 1);
+        let after = alchemy_rapier_body_state(world.world, body.handle);
+        assert_eq!(after.position.x, 1.0);
+        assert_eq!(after.linear_velocity.x, before.linear_velocity.x);
+        assert!(to_inner(world.world).unwrap().colliders[collider_handle_from_ffi(collider.handle)].shape().as_convex_polygon().is_some());
+        alchemy_rapier_destroy_world(world.world);
+    }
+
+    #[test]
+    fn morph_proposal_uses_actual_compound_geometry_not_its_bounding_box() {
+        let world = alchemy_rapier_create_world();
+        let body = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let collider = alchemy_rapier_create_capsule_collider(world.world, body.handle, 0.5, 0.0);
+        let blocker = alchemy_rapier_create_body(world.world, test_body_desc(0.0));
+        let blocker_collider = alchemy_rapier_create_capsule_collider(world.world, blocker.handle, 0.5, 0.0);
+        {
+            let inner = to_inner(world.world).unwrap();
+            let handle = collider_handle_from_ffi(blocker_collider.handle);
+            inner.colliders[handle].set_shape(SharedShape::compound(vec![
+                (Pose::from_translation(Vector::new(0.0, -2.0)), SharedShape::ball(0.3)),
+                (Pose::from_translation(Vector::new(0.0, 2.0)), SharedShape::ball(0.3)),
+            ]));
+            inner.query_pending_colliders.insert(handle);
+        }
+        let points = [
+            AlchemyRapierVec2 { x: -2.0, y: -1.0 }, AlchemyRapierVec2 { x: 2.0, y: -1.0 },
+            AlchemyRapierVec2 { x: 2.0, y: 1.0 }, AlchemyRapierVec2 { x: -2.0, y: 1.0 },
+        ];
+        let proposal = AlchemyRapierMorphColliderDesc {
+            body: body.handle, collider: collider.handle, position: AlchemyRapierVec2::default(),
+            vertices: points.as_ptr(), vertex_count: points.len(),
+        };
+        let mut result = AlchemyRapierMorphColliderResult::default();
+        assert_eq!(alchemy_rapier_try_morph_colliders_batch(world.world, &proposal, &mut result, 1), AlchemyRapierStatus::Ok);
+        assert_eq!(result.status, AlchemyRapierStatus::Ok);
+        assert_eq!(result.applied, 1);
+        alchemy_rapier_destroy_world(world.world);
     }
 
     #[test]

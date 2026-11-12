@@ -1,6 +1,6 @@
 use fracture_core::{
     CommandId, DamageSource, DeterministicOrderKey, ExternalBondId, ExternalTarget2D,
-    ExternalTargetKind, ExternalTargetToken, FractureTarget, FxActorId, FxFamilyId, GridCoord,
+    ExternalTargetKind, ExternalTargetToken, FxActorId, FxFamilyId, GridCoord,
     StaticAnchorDesc, StressInput, StressSettings, StressSolver2D, SupportNodeId,
 };
 use fracture_rapier::{
@@ -13,7 +13,7 @@ use fracture_voxel::{
     VoxelHierarchyPolicy, author_voxel_asset_with_options,
 };
 use kiss3d::color::Color;
-use rapier_testbed2d::{PhysicsState, SnapshotHook, Testbed, TestbedGraphics};
+use rapier_testbed2d::{SnapshotHook, TestbedViewer};
 use rapier2d::prelude::*;
 use std::{cell::RefCell, rc::Rc};
 
@@ -94,7 +94,7 @@ impl SnapshotHook for FractureDemoSnapshotHook {
     fn restore_snapshot(
         &mut self,
         snapshot: &[u8],
-        physics: &mut PhysicsState,
+        physics: &mut PhysicsWorld,
     ) -> Result<(), String> {
         let (world, driver) = decode_demo_snapshot(snapshot)?;
         let mut runtime = self.runtime.borrow_mut();
@@ -105,142 +105,72 @@ impl SnapshotHook for FractureDemoSnapshotHook {
     }
 }
 
-pub fn init_world(testbed: &mut Testbed) {
-    init_high_speed_wall(testbed);
+pub async fn run_high_speed_wall(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    run_fracture_world(viewer, build_high_speed_wall_world(), &[IMPACT_FAMILY], WALL_SCENE_CENTER, DemoDriver::PhysicsOnly).await
 }
 
-pub fn init_high_speed_wall(testbed: &mut Testbed) {
-    install_fracture_world(
-        testbed,
-        build_high_speed_wall_world(),
-        &[IMPACT_FAMILY],
-        WALL_SCENE_CENTER,
-        DemoDriver::PhysicsOnly,
-    );
+pub async fn run_bridge_collapse(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    run_fracture_world(viewer, build_bridge_collapse_world(), &[BRIDGE_FAMILY], BRIDGE_SCENE_CENTER,
+        DemoDriver::BridgeGravity { apply_after_tick: 45, load_scale: 0.25, load_step: 0.20, fractured: false }).await
 }
 
-pub fn init_bridge_collapse(testbed: &mut Testbed) {
-    install_fracture_world(
-        testbed,
-        build_bridge_collapse_world(),
-        &[BRIDGE_FAMILY],
-        BRIDGE_SCENE_CENTER,
-        DemoDriver::BridgeGravity {
-            apply_after_tick: 45,
-            load_scale: 0.25,
-            load_step: 0.20,
-            fractured: false,
-        },
-    );
+pub async fn run_joint_pull(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    run_fracture_world(viewer, build_joint_pull_world(), &[JOINT_FAMILY], JOINT_SCENE_CENTER, DemoDriver::PhysicsOnly).await
 }
 
-pub fn init_joint_pull(testbed: &mut Testbed) {
-    install_fracture_world(
-        testbed,
-        build_joint_pull_world(),
-        &[JOINT_FAMILY],
-        JOINT_SCENE_CENTER,
-        DemoDriver::PhysicsOnly,
-    );
+pub async fn run_voxel_collision(viewer: &mut TestbedViewer) -> anyhow::Result<()> {
+    run_fracture_world(viewer, build_voxel_collision_world(), &[COLLISION_LEFT_FAMILY, COLLISION_RIGHT_FAMILY], COLLISION_SCENE_CENTER,
+        DemoDriver::VoxelCollisionFractureField { apply_after_tick: 20, applied: false }).await
 }
 
-pub fn init_voxel_collision(testbed: &mut Testbed) {
-    install_fracture_world(
-        testbed,
-        build_voxel_collision_world(),
-        &[COLLISION_LEFT_FAMILY, COLLISION_RIGHT_FAMILY],
-        COLLISION_SCENE_CENTER,
-        DemoDriver::VoxelCollisionFractureField {
-            apply_after_tick: 20,
-            applied: false,
-        },
-    );
-}
+async fn run_fracture_world(viewer: &mut TestbedViewer, fracture_world: FxRapierWorld2D,
+    destructible_families: &'static [FxFamilyId], camera_center: Vector, driver: DemoDriver) -> anyhow::Result<()> {
+    let mut physics = PhysicsWorld::new();
+    mirror_fracture_world(&fracture_world, &mut physics);
+    viewer.set_world(&mut physics);
+    mirror_fracture_world(&fracture_world, &mut physics);
+    color_initial_bodies(viewer, &fracture_world, destructible_families);
+    let runtime = Rc::new(RefCell::new(FractureDemoRuntime { world: fracture_world, driver }));
+    viewer.add_snapshot_hook(FractureDemoSnapshotHook { runtime: Rc::clone(&runtime) });
+    viewer.look_at(camera_center, CAMERA_PIXELS_PER_WORLD_UNIT);
 
-fn install_fracture_world(
-    testbed: &mut Testbed,
-    fracture_world: FxRapierWorld2D,
-    destructible_families: &'static [FxFamilyId],
-    camera_center: Vector,
-    driver: DemoDriver,
-) {
-    let bodies = fracture_world.rigid_bodies().clone();
-    let colliders = fracture_world.colliders().clone();
-    testbed.set_world_with_params(
-        bodies,
-        colliders,
-        fracture_world.impulse_joints().clone(),
-        MultibodyJointSet::new(),
-        fracture_world.gravity(),
-        (),
-    );
-    color_initial_bodies(testbed, &fracture_world, destructible_families);
-
-    let runtime = Rc::new(RefCell::new(FractureDemoRuntime {
-        world: fracture_world,
-        driver,
-    }));
-    testbed.add_snapshot_hook(FractureDemoSnapshotHook {
-        runtime: Rc::clone(&runtime),
-    });
-
-    testbed.add_callback(move |graphics, physics, _, _| {
+    while viewer.render_frame(&mut physics).await {
+        if !viewer.simulating() { continue; }
         let mut runtime = runtime.borrow_mut();
-        let FractureDemoRuntime {
-            world: fracture_world,
-            driver,
-        } = &mut *runtime;
-        let mut rebuild_graphics = false;
-        let step = match fracture_world.step() {
-            Ok(step) => step,
-            Err(err) => {
-                eprintln!("fracture demo step failed: {err}");
-                return;
-            }
-        };
-        rebuild_graphics |= !step.split_events.is_empty();
-
+        let FractureDemoRuntime { world, driver } = &mut *runtime;
+        let step = world.step().map_err(|err| anyhow::anyhow!("fracture demo step failed: {err}"))?;
+        let mut rebuild = !step.split_events.is_empty();
         match driver {
             DemoDriver::PhysicsOnly => {}
-            DemoDriver::BridgeGravity {
-                apply_after_tick,
-                load_scale,
-                load_step,
-                fractured,
-            } => {
-                if !*fractured && fracture_world.tick() >= *apply_after_tick {
-                    match apply_bridge_gravity_load(fracture_world, *load_scale) {
-                        Ok(step) => {
-                            rebuild_graphics |= !step.report.split_events.is_empty();
-                            *fractured |= !step.report.split_events.is_empty();
-                            *load_scale += *load_step;
-                        }
-                        Err(err) => eprintln!("bridge fracture load failed: {err}"),
-                    }
+            DemoDriver::BridgeGravity { apply_after_tick, load_scale, load_step, fractured } => {
+                if !*fractured && world.tick() >= *apply_after_tick {
+                    let step = apply_bridge_gravity_load(world, *load_scale)
+                        .map_err(|err| anyhow::anyhow!("bridge fracture load failed: {err}"))?;
+                    rebuild |= !step.report.split_events.is_empty();
+                    *fractured |= !step.report.split_events.is_empty();
+                    *load_scale += *load_step;
                 }
             }
-            DemoDriver::VoxelCollisionFractureField {
-                apply_after_tick,
-                applied,
-            } => {
-                if !*applied && fracture_world.tick() >= *apply_after_tick {
-                    queue_voxel_collision_fracture_field(fracture_world);
+            DemoDriver::VoxelCollisionFractureField { apply_after_tick, applied } => {
+                if !*applied && world.tick() >= *apply_after_tick {
+                    queue_voxel_collision_fracture_field(world);
                     *applied = true;
                 }
             }
         }
-
-        mirror_fracture_world(&fracture_world, physics);
-
-        if rebuild_graphics {
-            if let Some(graphics) = graphics {
-                rebuild_render_nodes(graphics, physics, &fracture_world, destructible_families);
+        if rebuild {
+            for (handle, _) in physics.bodies.iter() { viewer.remove_body(handle); }
+        }
+        mirror_fracture_world(world, &mut physics);
+        if rebuild {
+            let destructible = destructible_body_handles(world, destructible_families);
+            for (handle, body) in physics.bodies.iter() {
+                viewer.add_body(handle, &physics);
+                viewer.set_body_color(handle, body_color(body, destructible.contains(&handle)), false);
             }
         }
-    });
-
-    testbed.set_number_of_steps_per_frame(1);
-    testbed.look_at(camera_center, CAMERA_PIXELS_PER_WORLD_UNIT);
+    }
+    Ok(())
 }
 
 fn encode_demo_snapshot(
@@ -881,7 +811,7 @@ fn bridge_stress_settings() -> StressSettings {
     }
 }
 
-fn mirror_fracture_world(world: &FxRapierWorld2D, physics: &mut PhysicsState) {
+fn mirror_fracture_world(world: &FxRapierWorld2D, physics: &mut PhysicsWorld) {
     physics.bodies = world.rigid_bodies().clone();
     physics.colliders = world.colliders().clone();
     physics.impulse_joints = world.impulse_joints().clone();
@@ -890,12 +820,12 @@ fn mirror_fracture_world(world: &FxRapierWorld2D, physics: &mut PhysicsState) {
     physics.broad_phase = world.broad_phase().clone();
     physics.narrow_phase = world.narrow_phase().clone();
     physics.ccd_solver = world.ccd_solver().clone();
-    physics.pipeline = PhysicsPipeline::new();
+    physics.physics_pipeline = PhysicsPipeline::new();
     physics.gravity = world.gravity();
 }
 
 fn color_initial_bodies(
-    testbed: &mut Testbed,
+    testbed: &mut TestbedViewer,
     world: &FxRapierWorld2D,
     destructible_families: &[FxFamilyId],
 ) {
@@ -903,25 +833,6 @@ fn color_initial_bodies(
     for (handle, body) in world.rigid_bodies().iter() {
         let color = body_color(body, destructible.contains(&handle));
         testbed.set_initial_body_color(handle, color);
-    }
-}
-
-fn rebuild_render_nodes(
-    graphics: &mut TestbedGraphics,
-    physics: &PhysicsState,
-    world: &FxRapierWorld2D,
-    destructible_families: &[FxFamilyId],
-) {
-    let destructible = destructible_body_handles(world, destructible_families);
-    graphics.graphics.clear();
-    for (handle, body) in physics.bodies.iter() {
-        graphics.graphics.add_body_colliders_with_color(
-            graphics.window,
-            handle,
-            &physics.bodies,
-            &physics.colliders,
-            body_color(body, destructible.contains(&handle)),
-        );
     }
 }
 
@@ -956,6 +867,7 @@ fn body_color(body: &RigidBody, is_destructible: bool) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fracture_core::FractureTarget;
     use std::collections::BTreeSet;
 
     #[test]
@@ -1098,25 +1010,12 @@ mod tests {
     #[test]
     fn joint_pull_survives_testbed_mirror_step_order() {
         let mut fracture_world = build_joint_pull_world();
-        let mut physics = PhysicsState::new();
+        let mut physics = PhysicsWorld::new();
         mirror_fracture_world(&fracture_world, &mut physics);
 
         let mut saw_split = false;
         for _ in 0..180 {
-            physics.pipeline.step(
-                physics.gravity,
-                &physics.integration_parameters,
-                &mut physics.islands,
-                &mut physics.broad_phase,
-                &mut physics.narrow_phase,
-                &mut physics.bodies,
-                &mut physics.colliders,
-                &mut physics.impulse_joints,
-                &mut physics.multibody_joints,
-                &mut physics.ccd_solver,
-                &*physics.hooks,
-                &(),
-            );
+            physics.step();
 
             let step = fracture_world
                 .step()
@@ -1274,7 +1173,7 @@ mod tests {
         let joint_migrated = world
             .impulse_joints()
             .iter()
-            .any(|(_, joint)| joint.body1 == handles.body || joint.body2 == handles.body);
+            .any(|(_, joint)| joint.body1() == handles.body || joint.body2() == handles.body);
 
         assert!(
             joint_migrated,

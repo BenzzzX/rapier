@@ -1,6 +1,18 @@
 use indexmap::IndexMap;
 use std::ops::RangeInclusive;
 
+/// How a [`SettingValue::String`] is presented in the Example Settings
+/// panel.
+#[derive(Copy, Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum StringDisplayMode {
+    /// Single-line dropdown (default). Right for short option lists.
+    #[default]
+    ComboBox,
+    /// Vertically-scrollable column of selectable labels. Use this when
+    /// the option list is long enough that a ComboBox feels heavy.
+    List,
+}
+
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SettingValue {
     Label(String),
@@ -18,17 +30,59 @@ pub enum SettingValue {
     String {
         value: usize,
         range: Vec<String>,
+        /// Controls how this setting is rendered in the UI. Defaults to
+        /// [`StringDisplayMode::ComboBox`].
+        #[serde(default)]
+        display_mode: StringDisplayMode,
     },
 }
 
 #[derive(Default, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExampleSettings {
     values: IndexMap<String, SettingValue>,
+    /// Keys whose change should NOT trigger a simulation restart. The example
+    /// is expected to read such settings live (e.g. from a per-step callback)
+    /// instead of relying on `init_world` re-running. Re-marked by the example
+    /// on each `init_world`; not persisted.
+    #[serde(skip)]
+    non_restart_keys: std::collections::HashSet<String>,
 }
 
 impl ExampleSettings {
     pub fn clear(&mut self) {
         self.values.clear();
+        self.non_restart_keys.clear();
+    }
+
+    /// Mark (`restart = false`) or unmark (`restart = true`) a setting key so
+    /// that changing it in the UI does (not) trigger a simulation restart. A
+    /// non-restart setting still updates its value in place — the example is
+    /// responsible for reacting to it live.
+    pub fn set_restart_on_change(&mut self, key: &str, restart: bool) {
+        if restart {
+            self.non_restart_keys.remove(key);
+        } else {
+            self.non_restart_keys.insert(key.to_string());
+        }
+    }
+
+    /// Whether changing `key` should trigger a simulation restart (the default
+    /// for every setting unless [`Self::set_restart_on_change`] said otherwise).
+    pub fn changes_require_restart(&self, key: &str) -> bool {
+        !self.non_restart_keys.contains(key)
+    }
+
+    /// The set of keys marked as non-restart via [`Self::set_restart_on_change`].
+    pub fn non_restart_keys(&self) -> &std::collections::HashSet<String> {
+        &self.non_restart_keys
+    }
+
+    /// Removes a setting, so an example can drop the entries that stopped being relevant
+    /// (a parameter of a mode that is no longer selected). The remaining entries keep
+    /// their order.
+    pub fn remove(&mut self, key: &str) {
+        let _ = self.values.shift_remove(key);
+        self.non_restart_keys.remove(key);
     }
 
     pub fn len(&self) -> usize {
@@ -125,32 +179,70 @@ impl ExampleSettings {
             SettingValue::String {
                 value: selected,
                 range,
+                display_mode: StringDisplayMode::ComboBox,
             },
         );
     }
 
-    pub fn get_or_set_string(
+    /// Insert a [`SettingValue::String`] if absent, otherwise return the
+    /// existing index. The setting is rendered with `display_mode` —
+    /// pass [`StringDisplayMode::List`] for option lists long enough
+    /// that a ComboBox feels heavy.
+    ///
+    /// If the entry already exists with a *different* `display_mode`,
+    /// the display mode is updated in place but the user's selected
+    /// value is preserved.
+    pub fn get_or_set_string_with(
         &mut self,
         key: &'static str,
         default: usize,
         range: Vec<String>,
+        display_mode: StringDisplayMode,
     ) -> usize {
+        let clamped_default = if range.is_empty() {
+            0
+        } else {
+            default.min(range.len() - 1)
+        };
         let to_insert = SettingValue::String {
-            value: default,
+            value: clamped_default,
             range,
+            display_mode,
         };
         let entry = self
             .values
             .entry(key.to_string())
             .or_insert(to_insert.clone());
         match entry {
-            SettingValue::String { value, .. } => *value,
+            SettingValue::String {
+                value,
+                display_mode: existing_mode,
+                ..
+            } => {
+                // Keep the user's prior selection but pick up display-mode
+                // changes from the caller.
+                if *existing_mode != display_mode {
+                    *existing_mode = display_mode;
+                }
+                *value
+            }
             _ => {
-                // The entry doesn’t have the right type. Overwrite with the new value.
+                // The entry doesn't have the right type. Overwrite.
                 *entry = to_insert;
-                default
+                clamped_default
             }
         }
+    }
+
+    /// Convenience wrapper around [`Self::get_or_set_string_with`] that
+    /// uses [`StringDisplayMode::ComboBox`].
+    pub fn get_or_set_string(
+        &mut self,
+        key: &'static str,
+        default: usize,
+        range: Vec<String>,
+    ) -> usize {
+        self.get_or_set_string_with(key, default, range, StringDisplayMode::ComboBox)
     }
 
     pub fn get_bool(&self, key: &'static str) -> Option<bool> {
@@ -183,7 +275,7 @@ impl ExampleSettings {
 
     pub fn get_string(&self, key: &'static str) -> Option<&str> {
         match self.values.get(key)? {
-            SettingValue::String { value, range } => Some(&range[*value]),
+            SettingValue::String { value, range, .. } => Some(&range[*value]),
             _ => None,
         }
     }

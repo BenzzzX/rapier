@@ -45,6 +45,7 @@ pub fn unit_joint_limit_constraint(
         min_enabled as u32 as Real * -Real::MAX,
         max_enabled as u32 as Real * Real::MAX,
     ];
+    let cfm_gain = lhs * cfm_coeff;
 
     let constraint = GenericJointConstraint {
         is_rigid_body1: false,
@@ -59,12 +60,71 @@ pub fn unit_joint_limit_constraint(
         joint_id: usize::MAX, // TODO: we don’t support impulse writeback for internal constraints yet.
         impulse: 0.0,
         impulse_bounds,
-        inv_lhs: crate::utils::inv(lhs),
+        inv_lhs: crate::utils::inv(lhs + cfm_gain),
         rhs: rhs_wo_bias + rhs_bias,
         rhs_wo_bias,
         cfm_coeff,
-        cfm_gain: 0.0,
+        cfm_gain,
         writeback_id: WritebackId::Limit(dof_id),
+    };
+
+    constraints[*insert_at] = constraint;
+    *insert_at += 1;
+
+    *j_id += 2 * ndofs;
+}
+
+/// Generates the dry-friction (MuJoCo `frictionloss`) velocity constraint for
+/// one generalized DoF.
+///
+/// `softness` supplies the CFM compliance (MuJoCo's `solreffriction`); only CFM
+/// applies, never ERP, since there is no position error for a bias to chase.
+#[allow(clippy::too_many_arguments)]
+pub fn unit_joint_friction_constraint(
+    params: &IntegrationParameters,
+    multibody: &Multibody,
+    link: &MultibodyLink,
+    friction: Real,
+    dof_id: usize,
+    j_id: &mut usize,
+    jacobians: &mut DVector,
+    constraints: &mut [GenericJointConstraint],
+    insert_at: &mut usize,
+    softness: SpringCoefficients<Real>,
+) {
+    let ndofs = multibody.ndofs();
+    let cfm_coeff = softness.cfm_coeff(params.dt);
+
+    let dof_j_id = *j_id + dof_id + link.assembly_id;
+    jacobians.rows_mut(*j_id, ndofs * 2).fill(0.0);
+    jacobians[dof_j_id] = 1.0;
+    jacobians[dof_j_id + ndofs] = 1.0;
+    multibody
+        .inv_augmented_mass()
+        .solve_mut(&mut jacobians.rows_mut(*j_id + ndofs, ndofs));
+
+    let lhs = jacobians[dof_j_id + ndofs]; // = J^t * M^-1 J
+    let max_impulse = friction * params.dt;
+    let cfm_gain = lhs * cfm_coeff;
+
+    let constraint = GenericJointConstraint {
+        is_rigid_body1: false,
+        solver_vel1: u32::MAX,
+        ndofs1: 0,
+        j_id1: 0,
+        is_rigid_body2: false,
+        solver_vel2: multibody.solver_id,
+        ndofs2: ndofs,
+        j_id2: *j_id,
+        joint_id: usize::MAX, // TODO: we don’t support impulse writeback for internal constraints yet.
+        impulse: 0.0,
+        impulse_bounds: [-max_impulse, max_impulse],
+        inv_lhs: crate::utils::inv(lhs + cfm_gain),
+        rhs: 0.0,
+        rhs_wo_bias: 0.0,
+        cfm_coeff,
+        cfm_gain,
+        writeback_id: WritebackId::Friction(dof_id),
     };
 
     constraints[*insert_at] = constraint;
@@ -102,6 +162,7 @@ pub fn unit_joint_motor_constraint(
 
     let lhs = jacobians[dof_j_id + ndofs]; // = J^t * M^-1 J
     let impulse_bounds = [-motor_params.max_impulse, motor_params.max_impulse];
+    let cfm_gain = lhs * motor_params.cfm_coeff + motor_params.cfm_gain;
 
     let mut rhs_wo_bias = 0.0;
     if motor_params.erp_inv_dt != 0.0 {
@@ -132,8 +193,8 @@ pub fn unit_joint_motor_constraint(
         impulse: 0.0,
         impulse_bounds,
         cfm_coeff: motor_params.cfm_coeff,
-        cfm_gain: motor_params.cfm_gain,
-        inv_lhs: crate::utils::inv(lhs),
+        cfm_gain,
+        inv_lhs: crate::utils::inv(lhs + cfm_gain),
         rhs: rhs_wo_bias,
         rhs_wo_bias,
         writeback_id: WritebackId::Limit(dof_id),
