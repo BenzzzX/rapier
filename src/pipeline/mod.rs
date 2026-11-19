@@ -15,7 +15,7 @@ pub use physics_hooks::{
     PhysicsHooks,
 };
 #[cfg(feature = "alloc")]
-pub use physics_pipeline::{PhysicsPipeline, Quarantine};
+pub use physics_pipeline::{JointLinearMotorObservation, PhysicsPipeline, Quarantine, SoftContactSolvePass, SoftRigidContactObservation};
 #[cfg(feature = "alloc")]
 pub use physics_world::PhysicsWorld;
 #[cfg(feature = "alloc")]

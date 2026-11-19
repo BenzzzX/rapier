@@ -173,6 +173,7 @@ impl PhysicsPipeline {
         soft_bodies: &mut SoftBodySet,
         events: &dyn EventHandler,
     ) {
+        self.last_soft_contact_solve = false;
         // Persistent islands, two tiers: a bounded local dual search settles each removal (proves
         // connectivity — common case, island never marked dirty — or peels the detached side at its cost);
         // the rest falls to the deferred union-find split (one island/step), run before the fused traversal so split bids see the post-split state.
@@ -408,6 +409,7 @@ impl PhysicsPipeline {
             self.staged_solver
                 .soft_constraints
                 .writeback_contacts(narrow_phase);
+            self.last_soft_contact_solve = true;
         }
 
         // Generate contact force events if needed, and update each pair's

@@ -4,6 +4,8 @@ use super::SoftFemSystem;
 use crate::alloc_prelude::*;
 use crate::dynamics::SoftFemParameters;
 use crate::dynamics::{SoftBodyBuilder, SoftBodyCellModel, SoftBodyMaterial};
+#[cfg(feature = "dim2")]
+use crate::math::Real;
 use crate::math::Vector;
 
 /// A response solves `A_step u = Jᵀ` (checked against the matrix), is zero at the pinned
@@ -107,4 +109,89 @@ fn response_solves_the_step_matrix() {
     for (a, b) in dense.1.iter().zip(&cg.1) {
         assert!((*a - *b).length() < 1.0e-3 * (1.0 + a.length()));
     }
+}
+
+/// A rotating 2D contact basis can reuse response columns while the FEM step
+/// matrix and material weights remain fixed. The gain needs the mixed terms:
+/// merely interpolating the two original diagonal gains is not equivalent.
+#[cfg(feature = "dim2")]
+#[test]
+fn rotated_contact_response_reuses_columns_with_mixed_gain() {
+    let builder = SoftBodyBuilder::grid(Vector::ZERO, Vector::new(0.7, 0.35), 4, 4)
+        .cell_model(SoftBodyCellModel::Corotational)
+        .material(SoftBodyMaterial {
+            young_modulus: 1.0e5,
+            poisson_ratio: 0.3,
+            elastic_damping_ratio: 0.5,
+            ..Default::default()
+        })
+        .particle_mass(0.1)
+        .pinned_particles(vec![0]);
+    let mut set = crate::dynamics::SoftBodySet::new();
+    let mut bodies = crate::dynamics::RigidBodySet::new();
+    let mut colliders = crate::geometry::ColliderSet::new();
+    let handle = set.insert(builder, &mut bodies, &mut colliders);
+    let body = &set[handle];
+    let n = body.particles().len();
+    let slots: Vec<u32> = (0..n as u32).collect();
+    let anchors = [(1u32, 0.35), (5u32, 0.65)];
+    let mut largest_mixed_effect: Real = 0.0;
+
+    for max_dense_dofs in [usize::MAX, 0] {
+        let params = SoftFemParameters {
+            max_dense_dofs,
+            linear_tolerance: 1.0e-8,
+            max_linear_iterations: 10_000,
+            ..Default::default()
+        };
+        let mut system = SoftFemSystem::default();
+        system.prepare(body, &slots);
+        system.factorize_step_matrix(1.0 / 240.0, &params);
+        let mut basis = [vec![Vector::ZERO; n], vec![Vector::ZERO; n]];
+        let gain_x = system.response_into(
+            anchors.iter().map(|&(p, w)| (p, Vector::X * w)),
+            &mut basis[0],
+            &params,
+        );
+        let gain_y = system.response_into(
+            anchors.iter().map(|&(p, w)| (p, Vector::Y * w)),
+            &mut basis[1],
+            &params,
+        );
+        let contact_velocity = |column: &[Vector]| -> Vector {
+            anchors.iter().map(|&(p, w)| column[p as usize] * w).sum()
+        };
+        let mixed_xy = contact_velocity(&basis[1]).x;
+        let mixed_yx = contact_velocity(&basis[0]).y;
+        assert!((mixed_xy - mixed_yx).abs() < 1.0e-5 * (1.0 + gain_x.abs() + gain_y.abs()));
+
+        for angle in [0.0 as Real, 0.37, 0.79, 1.31, 2.2] {
+            let direction = Vector::new(angle.cos(), angle.sin());
+            let mut direct = vec![Vector::ZERO; n];
+            let gain = system.response_into(
+                anchors.iter().map(|&(p, w)| (p, direction * w)),
+                &mut direct,
+                &params,
+            );
+            for i in 0..n {
+                let reconstructed = basis[0][i] * direction.x + basis[1][i] * direction.y;
+                assert!(
+                    (direct[i] - reconstructed).length() < 1.0e-4 * (1.0 + direct[i].length()),
+                    "angle={angle}, particle={i}: direct={:?}, combined={reconstructed:?}",
+                    direct[i]
+                );
+            }
+            let diagonal = direction.x * direction.x * gain_x + direction.y * direction.y * gain_y;
+            let complete = diagonal + direction.x * direction.y * (mixed_xy + mixed_yx);
+            assert!(
+                (gain - complete).abs() < 1.0e-4 * (1.0 + gain.abs()),
+                "angle={angle}: direct={gain}, mixed={complete}, diagonal={diagonal}"
+            );
+            largest_mixed_effect = largest_mixed_effect.max((gain - diagonal).abs());
+        }
+    }
+    assert!(
+        largest_mixed_effect > 1.0e-5,
+        "the fixture must exercise a nonzero mixed term"
+    );
 }

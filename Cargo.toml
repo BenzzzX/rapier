@@ -155,6 +155,8 @@ oorandom = { version = "11", default-features = false }
 tempfile = "3"
 
 [patch.crates-io]
+# Parry 0.31.1 with the voxel/composite speculative-contact AABB fix.
+parry2d = { path = "crates/alchemy_parry2d" }
 #xurdf = { path = "../xurdf/xurdf" }
 
 #simba = { path = "../simba" }

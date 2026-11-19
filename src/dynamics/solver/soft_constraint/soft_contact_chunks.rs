@@ -9,7 +9,7 @@ use super::soft_constraints_set::SoftConstraintsSet;
 use super::soft_contact::SoftContact;
 use crate::dynamics::IntegrationParameters;
 use crate::dynamics::solver::solver_body::SolverBodies;
-use crate::math::Vector;
+use crate::math::{Real, Vector};
 
 /// Colors tried before a chunk goes to the serial tail.
 const MAX_CONTACT_COLORS: usize = 16;
@@ -358,6 +358,7 @@ impl SoftConstraintsSet {
         bodies: &mut SolverBodies,
         params: &IntegrationParameters,
         wo_bias: bool,
+        solved_dt: Real,
         update: bool,
         warmstart: bool,
     ) {
@@ -377,7 +378,7 @@ impl SoftConstraintsSet {
                 continue;
             }
             if update {
-                c.update(bodies, params, wo_bias);
+                c.update(bodies, params, wo_bias, solved_dt);
             }
             if warmstart {
                 c.warmstart(bodies, pool);

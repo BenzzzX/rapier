@@ -241,6 +241,27 @@ impl SoftConstraintsSet {
                         tangents,
                         dist0: dist,
                         friction,
+                        tangent_velocity: Vector::ZERO,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor: None,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_fraction: 0.0,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_force: 0.0,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_impulse_limit: 0.0,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_passive_impulse: 0.0,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_passive_rhs: 0.0,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        source_material_weights: [0.0; 2],
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        source_separation: Real::NAN,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        conveyor_adhesion: Default::default(),
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+                        corotating_frame: None,
                         soft_other: true,
                         fem: [None, None],
                         erp_inv_dt,

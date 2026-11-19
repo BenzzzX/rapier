@@ -211,6 +211,10 @@ pub struct JointMotor {
     pub damping: Real,
     /// Maximum force the motor can apply (Newtons for prismatic, Nm for revolute).
     pub max_force: Real,
+    /// Optional lower bound in the solver's signed motor-force convention.
+    /// `None` keeps the usual symmetric interval `[-max_force, max_force]`.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub min_force: Option<Real>,
     /// Internal: current impulse being applied.
     pub impulse: Real,
     /// Force-based or acceleration-based motor model.
@@ -225,6 +229,7 @@ impl Default for JointMotor {
             stiffness: 0.0,
             damping: 0.0,
             max_force: Real::MAX,
+            min_force: None,
             impulse: 0.0,
             model: MotorModel::AccelerationBased,
         }
@@ -244,6 +249,9 @@ impl JointMotor {
             // keep_lhs,
             target_pos: self.target_pos,
             target_vel: self.target_vel,
+            min_impulse: if dt == 0.0 { 0.0 } else {
+                self.min_force.unwrap_or(-self.max_force).max(-self.max_force).min(self.max_force) * dt
+            },
             max_impulse: Self::max_impulse(self.max_force, dt),
         }
     }

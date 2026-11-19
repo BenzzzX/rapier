@@ -167,6 +167,27 @@ pub(crate) struct SoftElasticConstraint {
     /// Volumetric impulse (corotational only).
     pub vol_impulse: Real,
     pub model: SoftElasticModel,
+    /// Cell-local actuators share this block's color and particle ownership.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    pub muscles: [Option<SoftCellMuscleConstraint>; crate::dynamics::SOFT_CELL_MUSCLE_DIRECTIONS],
+}
+
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SoftCellMuscleConstraint {
+    pub command: crate::dynamics::SoftCellMuscle,
+    pub area: Real,
+    pub dt: Real,
+    pub grad: [Vector; MAX_CONSTRAINT_PARTICLES],
+    pub inverse_mass: Real,
+    pub gain: Real,
+    pub bias: Real,
+    pub limit: Real,
+    pub impulse: Real,
+    pub valid: bool,
+    pub target_path: Option<crate::dynamics::soft_body::SoftCellMusclePath>,
+    /// Shared batch time at this substep, carried in double precision.
+    pub elapsed: f64,
 }
 
 /// The constitutive model of a [`SoftElasticConstraint`] and its model-specific state.
@@ -295,6 +316,36 @@ impl SoftElasticConstraint {
             }
         }
         let f = self.deformation_gradient();
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        for muscle in self.muscles.iter_mut().flatten() {
+            let q = f * muscle.command.direction;
+            let stretch = q.length();
+            muscle.valid = false;
+            muscle.impulse = 0.0;
+            let dt = muscle.dt as f64;
+            let old_target = muscle.command.target_at_elapsed(muscle.target_path, muscle.elapsed);
+            muscle.elapsed += dt;
+            let next_target = muscle.command.target_at_elapsed(muscle.target_path, muscle.elapsed);
+            let target_speed = ((next_target - old_target) / dt) as Real;
+            // The stretch gradient is undefined at zero. Do not invent a
+            // direction or apply an unbounded correction to a collapsed cell.
+            if stretch.is_finite() && stretch > 1.0e-6 {
+                let n = q / stretch;
+                let mut w = 0.0;
+                for p in 0..MAX_CONSTRAINT_PARTICLES {
+                    muscle.grad[p] = n * self.coeffs[p].dot(muscle.command.direction);
+                    w += self.im[p] * muscle.grad[p].length_squared();
+                }
+                let k = muscle.area * muscle.command.stiffness_density;
+                let d = muscle.area * muscle.command.damping_density;
+                muscle.inverse_mass = w;
+                muscle.gain = muscle.dt * (d + muscle.dt * k);
+                muscle.bias = muscle.dt * k * (stretch - old_target as Real) - muscle.gain * target_speed;
+                muscle.limit = muscle.dt * muscle.area * muscle.command.force_density;
+                muscle.valid = w.is_finite() && muscle.gain.is_finite() && muscle.bias.is_finite()
+                    && muscle.limit.is_finite() && (1.0 + muscle.gain * w).is_finite();
+            }
+        }
         self.rotation = extract_rotation(f, self.rotation);
         self.rot_mat = self.rotation.to_mat();
         let inv_rot = self.rot_mat.transpose();
@@ -410,6 +461,29 @@ impl SoftElasticConstraint {
         match &self.model {
             SoftElasticModel::Corotational(_) => self.solve_corotational(bodies),
             SoftElasticModel::NeoHookean(_) => self.solve_neo_hookean(bodies),
+        }
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        for muscle in self.muscles.iter_mut().flatten().filter(|muscle| muscle.valid) {
+            let mut velocity = 0.0;
+            for p in 0..MAX_CONSTRAINT_PARTICLES {
+                let id = self.solver_ids[p];
+                if id != u32::MAX {
+                    velocity += muscle.grad[p].dot(bodies.get_vel(id).linear);
+                }
+            }
+            let next = ((muscle.bias + muscle.gain *
+                (velocity + muscle.inverse_mass * muscle.impulse)) /
+                (1.0 + muscle.gain * muscle.inverse_mass)).clamp(-muscle.limit, muscle.limit);
+            if next.is_finite() {
+                let delta = next - muscle.impulse;
+                muscle.impulse = next;
+                for p in 0..MAX_CONSTRAINT_PARTICLES {
+                    let id = self.solver_ids[p];
+                    if id != u32::MAX && (id as usize) < bodies.len() {
+                        bodies.vels[id as usize].linear -= muscle.grad[p] * (self.im[p] * delta);
+                    }
+                }
+            }
         }
     }
 

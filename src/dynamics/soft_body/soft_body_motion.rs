@@ -19,13 +19,22 @@ pub struct SoftParticleAttachment {
     pub local_anchor: Vector,
     /// Accumulated impulse of the last step (warm-start state), one per world axis.
     pub(crate) impulse: Vector,
+    /// Solver substep duration corresponding to `impulse`; not persistent state.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) impulse_dt: Real,
 }
 
 impl SoftParticleAttachment {
-    /// The impulse this attachment applied during the last substep (world axes, positive when
-    /// pulling the particle back toward the anchor).
+    /// Impulse applied to the rigid body during the last solver substep. The
+    /// soft particle receives its opposite.
     pub fn impulse(&self) -> Vector {
         self.impulse
+    }
+
+    /// Duration of the solver substep represented by [`Self::impulse`], or
+    /// zero before the attachment has been solved.
+    pub fn impulse_dt(&self) -> Real {
+        self.impulse_dt
     }
 }
 
@@ -61,9 +70,82 @@ impl SoftBody {
             body,
             local_anchor,
             impulse: Vector::ZERO,
+            impulse_dt: 0.0,
         });
         self.attachments_modified = true;
         self.modified = true;
+    }
+
+    /// Adds one uniquely identified particle/body attachment at an explicit
+    /// body-local anchor. Returns false for an invalid particle, body, anchor,
+    /// or an existing attachment for the same pair.
+    pub fn attach_particle_at(
+        &mut self,
+        i: usize,
+        body: RigidBodyHandle,
+        local_anchor: Vector,
+        bodies: &RigidBodySet,
+    ) -> bool {
+        if i >= self.particles.len()
+            || bodies.get(body).is_none()
+            || !local_anchor.is_finite()
+            || self
+                .attachments
+                .iter()
+                .any(|a| a.particle as usize == i && a.body == body)
+        {
+            return false;
+        }
+        self.attachments.push(SoftParticleAttachment {
+            particle: i as u32,
+            body,
+            local_anchor,
+            impulse: Vector::ZERO,
+            impulse_dt: 0.0,
+        });
+        self.attachments_modified = true;
+        self.wake_up();
+        true
+    }
+
+    /// Moves a specific particle/body attachment's local anchor without
+    /// touching any other attachment on that particle.
+    pub fn set_particle_attachment_anchor(
+        &mut self,
+        i: usize,
+        body: RigidBodyHandle,
+        local_anchor: Vector,
+    ) -> bool {
+        if !local_anchor.is_finite() {
+            return false;
+        }
+        let Some(attachment) = self
+            .attachments
+            .iter_mut()
+            .find(|a| a.particle as usize == i && a.body == body)
+        else {
+            return false;
+        };
+        if attachment.local_anchor != local_anchor {
+            attachment.local_anchor = local_anchor;
+            attachment.impulse = Vector::ZERO;
+            attachment.impulse_dt = 0.0;
+            self.wake_up();
+        }
+        true
+    }
+
+    /// Removes only the attachment for this particle/body pair.
+    pub fn detach_particle_from_body(&mut self, i: usize, body: RigidBodyHandle) -> bool {
+        let before = self.attachments.len();
+        self.attachments
+            .retain(|a| a.particle as usize != i || a.body != body);
+        let detached = self.attachments.len() != before;
+        if detached {
+            self.attachments_modified = true;
+            self.wake_up();
+        }
+        detached
     }
 
     /// Detaches the `i`-th particle from every rigid body it was attached to with

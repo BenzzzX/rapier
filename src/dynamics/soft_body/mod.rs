@@ -17,6 +17,10 @@ pub use self::soft_body_elements::SoftBodySolver;
 pub use self::soft_body_elements::{
     SoftBodyCell, SoftBodyCellModel, SoftBodyEdge, SoftBodyEdgeKind, SoftBodyParticle,
 };
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+pub use self::soft_body_elements::{SoftCellMuscle, SoftEdgeMuscle, SOFT_CELL_MUSCLE_DIRECTIONS};
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+pub(crate) use self::soft_body_elements::SoftCellMusclePath;
 pub use self::soft_body_handle::SoftBodyHandle;
 pub use self::soft_body_material::SoftBodyMaterial;
 pub use self::soft_body_motion::SoftParticleAttachment;

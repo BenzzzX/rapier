@@ -72,6 +72,13 @@ pub struct ModifiableManifold<'a> {
     pub solver_contacts: &'a mut SolverContacts,
     /// Per-contact friction overrides indexed by the original solver-contact order.
     pub contact_friction_overrides: &'a mut [Option<Real>; crate::math::MAX_MANIFOLD_POINTS],
+    /// Bit `k` requests sliding for an exact point contact at vertex `k` of
+    /// this 2D soft-mesh element. Interior contacts keep their own friction.
+    #[cfg(feature = "dim2")]
+    pub soft_sliding_vertices: &'a mut u8,
+    /// Optional per-soft-body shared conveyor force request for this update.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub soft_conveyor: &'a mut Option<crate::geometry::SoftConveyor>,
     /// The contact normal that can be modified.
     pub normal: &'a mut Vector,
     /// The friction coefficient applied to every solver contact of this manifold,

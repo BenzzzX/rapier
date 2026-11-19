@@ -58,6 +58,10 @@ pub(super) fn material_pace(params: &IntegrationParameters) -> Real {
 #[derive(Default)]
 pub(super) struct BodyContacts {
     pub(super) contacts: Vec<SoftContact>,
+    // Reused to distribute each body's conveyor budget across its actual
+    // manifold and predictive contact constraints.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub(super) conveyor_groups: Vec<(u64, f64, Real, Real, Real, Real)>,
     /// The contact state of every mesh assembled this step, in the order the body's meshes were
     /// visited (a constraint's `point` indexes its own mesh's lists).
     pub(super) meshes: Vec<MeshContacts>,

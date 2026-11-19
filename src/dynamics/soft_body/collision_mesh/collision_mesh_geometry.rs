@@ -68,7 +68,7 @@ impl SoftCollisionMesh {
     }
 
     /// Whether a self contact between `vertex` and `element` is ignored: the element holds the
-    /// vertex or a surface neighbor, or (FEM bodies) sits within the skins' clearance of it at
+    /// vertex, a surface neighbor in 3D, or (FEM bodies) sits within the skins' clearance at
     /// rest, except across a crack (see `across_crack`) where the material between is gone.
     pub(crate) fn self_contact_excluded(
         &self,
@@ -80,6 +80,11 @@ impl SoftCollisionMesh {
         if element.contains(&vertex) {
             return true;
         }
+        // In 2D, excluding the whole one-ring also excludes a vertex from
+        // the first non-incident segment. A short fold can then pass through
+        // that segment before any self-contact can stop it. Only incident
+        // segments are topologically adjacent; 3D retains its one-ring rule.
+        #[cfg(feature = "dim3")]
         if let Some(&start) = self.ring_offsets.get(vertex as usize) {
             let end = self.ring_offsets[vertex as usize + 1];
             let ring = &self.ring[start as usize..end as usize];
@@ -91,8 +96,8 @@ impl SoftCollisionMesh {
     }
 
     /// The neighborhood clause of [`Self::self_contact_excluded`] as a stamp table: writes `vertex`
-    /// into `stamps[e]` (one entry per element) for every element holding the vertex or one of its
-    /// surface neighbors.
+    /// into `stamps[e]` (one entry per element) for every element holding the vertex, and in 3D
+    /// also its surface neighbors.
     pub(crate) fn mark_self_contact_exclusions(&self, vertex: u32, stamps: &mut [u32]) {
         let ring = match self.ring_offsets.get(vertex as usize) {
             Some(&start) => {
@@ -101,7 +106,13 @@ impl SoftCollisionMesh {
             }
             None => &[],
         };
-        for &u in core::iter::once(&vertex).chain(ring) {
+        #[cfg(feature = "dim2")]
+        let _ = ring;
+        #[cfg(feature = "dim2")]
+        let excluded = core::iter::once(&vertex);
+        #[cfg(feature = "dim3")]
+        let excluded = core::iter::once(&vertex).chain(ring);
+        for &u in excluded {
             for &e in self.vertex_element_ids(u) {
                 stamps[e as usize] = vertex;
             }

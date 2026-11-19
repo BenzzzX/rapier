@@ -13,7 +13,8 @@ use simba::scalar::{ComplexField as _, RealField as _};
 
 /// Where a soft contact writes its impulses back: a narrow-phase manifold point, or (`manifold`
 /// set to an assembly sentinel) an entry of the owner body's edge-vs-edge or vertex-vs-surface
-/// list, plus the pair's contact `slot` reporting the impulse (`u32::MAX` for a self contact).
+/// list. For soft/soft contacts `slot` reports the impulse (`u32::MAX` for a self contact);
+/// for soft/rigid contacts it stores the other collider's assembly-time subshape.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SoftContactSource {
     pub collider1: ColliderHandle,
@@ -33,9 +34,62 @@ pub(crate) struct SoftContactElement {
     pub frozen_pos: [Vector; CONTACT_ANCHORS],
 }
 
+#[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ConveyorAdhesion {
+    pub stiffness: Real,
+    pub pull_force: Real,
+    pub shear_force: Real,
+    pub stiffness_dt_squared: Real,
+    pub pull_impulse_limit: Real,
+    pub shear_impulse_limit: Real,
+}
+
 /// Number of particles the soft side of a contact is spread over: a surface element's, or a
 /// cell's when the body collides through a skin the cells hold.
 pub(crate) const CONTACT_ANCHORS: usize = DIM + 1;
+
+/// Candidate for a planar rigid feature, with axes fixed in the support's
+/// center-of-mass frame. The accumulator is kept in the assembly basis by
+/// `SoftContact`, so diagnostic impulses do not add rotating components as
+/// though they were parallel.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CorotatingSoftContactFrame {
+    pub local_normal: Vector,
+    pub local_tangent: Vector,
+    pub initial_normal: Vector,
+    pub initial_tangent: Vector,
+    /// Backward-Euler integral of the world-space conveyor velocity projected
+    /// on the support-local tangent, measured since contact assembly.
+    pub target_displacement: Real,
+    pub target_elapsed: Real,
+    pub active: bool,
+}
+
+#[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+impl CorotatingSoftContactFrame {
+    pub fn new(pose: crate::math::Pose, normal: Vector, tangent: Vector) -> Self {
+        Self {
+            local_normal: pose.rotation.inverse() * normal,
+            local_tangent: pose.rotation.inverse() * tangent,
+            initial_normal: normal,
+            initial_tangent: tangent,
+            target_displacement: 0.0,
+            target_elapsed: 0.0,
+            active: false,
+        }
+    }
+
+    #[inline]
+    fn advance_target(&mut self, elapsed: Real, tangent: Vector, target_velocity: Vector) -> Real {
+        if elapsed > self.target_elapsed {
+            self.target_displacement += target_velocity.gdot(tangent) * (elapsed - self.target_elapsed);
+            self.target_elapsed = elapsed;
+        }
+        self.target_displacement
+    }
+}
 
 /// A contact side on a FEM soft body: the constraint acts through the body's augmented mass, not
 /// the anchors' lumped masses (see `soft_fem`). The responses `A⁻¹Jᵀ` (normal, then tangents)
@@ -101,6 +155,35 @@ pub(crate) struct SoftContact {
     /// Separation at build time (skins baked in), and its live value.
     pub dist0: Real,
     pub friction: Real,
+    /// Conveyor bias in the surface-versus-other convention. It is zero for
+    /// constraints that have no associated manifold solver contact.
+    pub tangent_velocity: Vector,
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor: Option<crate::geometry::SoftConveyor>,
+    /// Fraction of the material interpolation belonging to the driven band.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_fraction: Real,
+    // Set after all rows of this soft body are assembled; each row receives
+    // a share of its group's force budget, independent of iteration order.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_force: Real,
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_impulse_limit: Real,
+    /// Passive share of `impulse_tangent[0]`; the remainder is motor impulse.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_passive_impulse: Real,
+    /// Passive friction tracks a stationary surface, independently of the motor target.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_passive_rhs: Real,
+    /// Narrow-phase element contact before optional endpoint expansion.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub source_material_weights: [Real; 2],
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub source_separation: Real,
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_adhesion: ConveyorAdhesion,
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+    pub corotating_frame: Option<CorotatingSoftContactFrame>,
     /// The other side is a soft-body particle: the constraint is solved in the biased pass only, like
     /// the springs driving both sides.
     pub soft_other: bool,
@@ -130,6 +213,44 @@ pub(crate) struct SoftContact {
 }
 
 impl SoftContact {
+    /// The contact frame at assembly, used by manifold reports and snapshots.
+    #[inline]
+    pub(crate) fn assembly_normal(&self) -> Vector {
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        if let Some(frame) = self.corotating_frame.filter(|frame| frame.active) {
+            return frame.initial_normal;
+        }
+        self.dir
+    }
+
+    /// Last-substep impulse in the assembly frame. Accumulated values already
+    /// use that frame, even if the contact basis moved during relaxation.
+    #[inline]
+    pub(crate) fn last_impulse_components(&self) -> (Real, [Real; DIM - 1]) {
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        if let Some(frame) = self.corotating_frame.filter(|frame| frame.active) {
+            let impulse = self.dir * self.impulse_normal + self.tangents[0] * self.impulse_tangent[0];
+            return (impulse.gdot(frame.initial_normal), [impulse.gdot(frame.initial_tangent)]);
+        }
+        (self.impulse_normal, self.impulse_tangent)
+    }
+
+    /// Whole-step impulse on the surface, in world coordinates.
+    #[inline]
+    pub(crate) fn reported_impulse(&self) -> Vector {
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        if let Some(frame) = self.corotating_frame.filter(|frame| frame.active) {
+            return frame.initial_normal * self.impulse_normal_acc
+                + frame.initial_tangent * self.impulse_tangent_acc[0]
+                + self.dir * self.impulse_normal + self.tangents[0] * self.impulse_tangent[0];
+        }
+        let mut impulse = self.dir * (self.impulse_normal_acc + self.impulse_normal);
+        for j in 0..DIM - 1 {
+            impulse += self.tangents[j] * (self.impulse_tangent_acc[j] + self.impulse_tangent[j]);
+        }
+        impulse
+    }
+
     /// Current world position of the surface point (barycentric blend of the particles).
     #[inline]
     fn surface_point(&self, bodies: &SolverBodies) -> Vector {
@@ -170,12 +291,73 @@ impl SoftContact {
 
     /// Updates the separation, rhs and effective masses from the current solver state.
     /// `wo_bias`: relax pass (speculative term only, no softness, no tangent drift bias).
-    pub fn update(&mut self, bodies: &SolverBodies, params: &IntegrationParameters, wo_bias: bool) {
+    pub fn update(&mut self, bodies: &SolverBodies, params: &IntegrationParameters, wo_bias: bool, solved_dt: Real) {
         let inv_dt = params.inv_dt();
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+        if let Some(conveyor) = self.conveyor {
+            // The solver RHS adds this bias to surface-minus-support
+            // velocity, so the desired physical velocity has opposite sign.
+            self.tangent_velocity = -conveyor.target_velocity * self.conveyor_fraction;
+            self.conveyor_impulse_limit = self.conveyor_force * params.dt;
+            self.conveyor_adhesion.pull_impulse_limit = self.conveyor_adhesion.pull_force * params.dt;
+            self.conveyor_adhesion.shear_impulse_limit = self.conveyor_adhesion.shear_force * params.dt;
+            let stiffness_dt_squared = self.conveyor_adhesion.stiffness * params.dt * params.dt;
+            self.conveyor_adhesion.stiffness_dt_squared = if stiffness_dt_squared.is_finite() { stiffness_dt_squared } else { 0.0 };
+        }
         let ps = self.surface_point(bodies);
         let po = self.body_point(bodies);
         let delta = (ps - self.surface_point0) - (po - self.body_point0);
-        let dist = self.dist0 + delta.gdot(self.dir);
+        #[allow(unused_mut)]
+        let mut dist = self.dist0 + delta.gdot(self.dir);
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        let mut corotating_tangent_error = None;
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        let mut corotating_target_displacement = None;
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+        if let Some(mut frame) = self.corotating_frame.filter(|_| {
+            self.body != u32::MAX && self.element.is_none() && !self.soft_other &&
+                self.fem.iter().all(Option::is_none)
+        }) {
+            let pose = bodies.get_pose(self.body);
+            let previous_impulse = self.dir * self.impulse_normal + self.tangents[0] * self.impulse_tangent[0];
+            #[cfg(feature = "experimental-soft-conveyor")]
+            let previous_motor = self.tangents[0] * (self.impulse_tangent[0] - self.conveyor_passive_impulse);
+            // Before the biased pass starts a new substep, account for the
+            // preceding substep in the fixed assembly frame. The initial
+            // accumulator cancels the not-yet-applied initial warm start.
+            if !wo_bias {
+                self.impulse_normal_acc += previous_impulse.gdot(frame.initial_normal);
+                self.impulse_tangent_acc[0] += previous_impulse.gdot(frame.initial_tangent);
+            }
+            self.dir = pose.rotation * frame.local_normal;
+            self.tangents[0] = pose.rotation * frame.local_tangent;
+            #[cfg(feature = "experimental-soft-conveyor")]
+            if let Some(conveyor) = self.conveyor {
+                // The command follows the rotating support's tangent.
+                self.tangent_velocity = -self.tangents[0] * conveyor.target_velocity.gdot(frame.initial_tangent) * self.conveyor_fraction;
+            }
+            // `solved_dt` is monotone across biased and relaxation passes.
+            // Use the endpoint tangent for each elapsed interval; duplicate
+            // updates at the same time must not integrate it twice.
+            corotating_target_displacement = Some(frame.advance_target(
+                solved_dt, self.tangents[0], self.tangent_velocity));
+            // In the relaxation pass the previous impulse has already been
+            // applied. Represent that same world vector in the new basis so
+            // the next projected solve applies only the true difference.
+            self.impulse_normal = previous_impulse.gdot(self.dir);
+            self.impulse_tangent[0] = previous_impulse.gdot(self.tangents[0]);
+            #[cfg(feature = "experimental-soft-conveyor")]
+            if self.conveyor.is_some() {
+                self.conveyor_passive_impulse = self.impulse_tangent[0] - previous_motor.gdot(self.tangents[0]);
+            }
+            self.body_arm = ps - pose.translation;
+            let offset = ps - po;
+            let initial_offset = self.surface_point0 - self.body_point0;
+            dist = self.dist0 + offset.gdot(self.dir) - initial_offset.gdot(frame.initial_normal);
+            corotating_tangent_error = Some(offset.gdot(self.tangents[0]) - initial_offset.gdot(frame.initial_tangent));
+            frame.active = true;
+            self.corotating_frame = Some(frame);
+        }
 
         // Effective masses (the other side's mass properties are step-constant, read once the
         // solver bodies are filled: this runs after the body-init stage).
@@ -250,8 +432,10 @@ impl SoftContact {
         if wo_bias {
             self.rhs_normal = rhs_wo_bias;
             self.cfm_normal = 1.0;
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+            { self.conveyor_passive_rhs = 0.0; }
             for j in 0..DIM - 1 {
-                self.rhs_tangent[j] = 0.0;
+                self.rhs_tangent[j] = self.tangent_velocity.gdot(self.tangents[j]);
             }
         } else {
             let max_corrective_velocity = params.max_corrective_velocity().min(self.max_bias);
@@ -259,15 +443,45 @@ impl SoftContact {
             self.rhs_normal = rhs_wo_bias + bias;
             self.cfm_normal = if dist <= 0.0 { self.cfm_factor } else { 1.0 };
             for j in 0..DIM - 1 {
-                self.rhs_tangent[j] = delta.gdot(self.tangents[j]) * inv_dt;
+                let target = self.tangent_velocity.gdot(self.tangents[j]);
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+                let tangent_error = corotating_tangent_error.unwrap_or_else(|| delta.gdot(self.tangents[j]));
+                #[cfg(not(all(feature = "dim2", feature = "experimental-soft-contact-frame")))]
+                let tangent_error = delta.gdot(self.tangents[j]);
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                { self.conveyor_passive_rhs = tangent_error * inv_dt; }
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+                let target_displacement = corotating_target_displacement.unwrap_or(target * solved_dt);
+                #[cfg(not(all(feature = "dim2", feature = "experimental-soft-contact-frame")))]
+                let target_displacement = target * solved_dt;
+                self.rhs_tangent[j] = target + (tangent_error + target_displacement) * inv_dt;
             }
             // Bank the previous substep's impulses (they were applied in full) before the
             // warm-start scaling of the new substep.
-            self.impulse_normal_acc += self.impulse_normal;
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+            let already_banked = self.corotating_frame.is_some_and(|frame| frame.active);
+            #[cfg(not(all(feature = "dim2", feature = "experimental-soft-contact-frame")))]
+            let already_banked = false;
+            if !already_banked { self.impulse_normal_acc += self.impulse_normal; }
             self.impulse_normal *= params.warmstart_coefficient;
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+            if self.conveyor.is_some() {
+                self.impulse_normal = self.impulse_normal.max(-self.conveyor_adhesion.pull_impulse_limit);
+            }
             for j in 0..DIM - 1 {
-                self.impulse_tangent_acc[j] += self.impulse_tangent[j];
+                if !already_banked { self.impulse_tangent_acc[j] += self.impulse_tangent[j]; }
                 self.impulse_tangent[j] *= params.warmstart_coefficient;
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                if self.conveyor.is_some() {
+                    self.conveyor_passive_impulse *= params.warmstart_coefficient;
+                    let friction = self.friction * self.impulse_normal.max(0.0);
+                    let passive_limit = friction * (1.0 - self.conveyor_fraction);
+                    let motor_limit = (friction * self.conveyor_fraction + self.conveyor_adhesion.shear_impulse_limit)
+                        .min(self.conveyor_impulse_limit);
+                    let motor = (self.impulse_tangent[j] - self.conveyor_passive_impulse).clamp(-motor_limit, motor_limit);
+                    self.conveyor_passive_impulse = self.conveyor_passive_impulse.clamp(-passive_limit, passive_limit);
+                    self.impulse_tangent[j] = self.conveyor_passive_impulse + motor;
+                }
             }
         }
     }
@@ -380,13 +594,49 @@ impl SoftContact {
     pub fn solve(&mut self, bodies: &mut SolverBodies, pool: &[Vector]) {
         // Normal.
         let dvel = self.relative_velocity(bodies, self.dir, self.torque_dir) + self.rhs_normal;
-        let new_impulse = (self.cfm_normal * (self.impulse_normal - self.r_normal * dvel)).max(0.0);
+        let unconstrained = self.impulse_normal - self.r_normal * dvel;
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+        let lower_bound = if self.conveyor.is_some() && self.r_normal > 0.0 &&
+            self.conveyor_adhesion.stiffness_dt_squared > 0.0 {
+            // Implicit linear adhesive traction: project against the spring's
+            // coupled lower bound, then cap tensile impulse by force * dt.
+            // See Gascón et al., Constraint-Based Simulation of Adhesive Contact, Eq. 16.
+            let k = self.conveyor_adhesion.stiffness_dt_squared;
+            let fraction = if k > self.r_normal { 1.0 / (1.0 + self.r_normal / k) }
+                else { (k / self.r_normal) / (1.0 + k / self.r_normal) };
+            (unconstrained * fraction).min(0.0).max(-self.conveyor_adhesion.pull_impulse_limit)
+        } else { 0.0 };
+        #[cfg(not(all(feature = "dim2", feature = "experimental-soft-conveyor")))]
+        let lower_bound = 0.0;
+        let new_impulse = (self.cfm_normal * unconstrained).max(lower_bound);
         let delta = new_impulse - self.impulse_normal;
         self.impulse_normal = new_impulse;
         self.apply(bodies, pool, 0, self.dir, self.ii_torque_dir, delta);
 
         // Friction: per-tangent update, then a clamp to the disc of radius μλ.
-        let limit = self.friction * self.impulse_normal;
+        let limit = self.friction * self.impulse_normal.max(0.0);
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+        if self.conveyor.is_some() {
+            let passive_limit = limit * (1.0 - self.conveyor_fraction);
+            let motor_limit = (limit * self.conveyor_fraction + self.conveyor_adhesion.shear_impulse_limit)
+                .min(self.conveyor_impulse_limit);
+            let mut motor = self.impulse_tangent[0] - self.conveyor_passive_impulse;
+            let velocity = self.relative_velocity(bodies, self.tangents[0], self.torque_tangent[0]);
+            let passive = (self.conveyor_passive_impulse - self.r_tangent[0] * (velocity + self.conveyor_passive_rhs))
+                .clamp(-passive_limit, passive_limit);
+            let delta = passive - self.conveyor_passive_impulse;
+            self.conveyor_passive_impulse = passive;
+            self.impulse_tangent[0] += delta;
+            self.apply(bodies, pool, 1, self.tangents[0], self.ii_torque_tangent[0], delta);
+            let velocity = self.relative_velocity(bodies, self.tangents[0], self.torque_tangent[0]);
+            let next_motor = (motor - self.r_tangent[0] * (velocity + self.rhs_tangent[0]))
+                .clamp(-motor_limit, motor_limit);
+            let delta = next_motor - motor;
+            motor = next_motor;
+            self.impulse_tangent[0] = self.conveyor_passive_impulse + motor;
+            self.apply(bodies, pool, 1, self.tangents[0], self.ii_torque_tangent[0], delta);
+            return;
+        }
         let mut new_tangent = self.impulse_tangent;
         for j in 0..DIM - 1 {
             let dvel = self.relative_velocity(bodies, self.tangents[j], self.torque_tangent[j])
@@ -423,5 +673,36 @@ impl SoftContact {
     /// The tangent basis of a force direction.
     pub fn tangent_basis(dir: Vector) -> [Vector; DIM - 1] {
         dir.orthonormal_basis()
+    }
+}
+
+#[cfg(all(test, feature = "dim2", feature = "experimental-soft-contact-frame"))]
+mod corotating_target_tests {
+    use super::CorotatingSoftContactFrame;
+    use crate::math::{Pose, Real, Vector};
+
+    #[test]
+    fn projected_world_target_uses_each_elapsed_interval_once() {
+        let target = Vector::new(2.0, -0.5);
+        let omega: Real = 1.2;
+        let duration: Real = 0.7;
+        let exact = (target.x * (omega * duration).sin()
+            + target.y * (1.0 - (omega * duration).cos())) / omega;
+        let mut previous_error = Real::MAX;
+        for steps in [8, 32, 128, 512] {
+            let mut frame = CorotatingSoftContactFrame::new(Pose::identity(), Vector::Y, Vector::X);
+            for step in 1..=steps {
+                let elapsed = duration * step as Real / steps as Real;
+                let angle = omega * elapsed;
+                let tangent = Vector::new(angle.cos(), angle.sin());
+                let value = frame.advance_target(elapsed, tangent, target);
+                // A second solver pass at the same time cannot add distance.
+                assert_eq!(frame.advance_target(elapsed, Vector::Y, Vector::splat(100.0)), value);
+            }
+            let error = (frame.target_displacement - exact).abs();
+            assert!(error < previous_error, "steps={steps}, error={error}, previous={previous_error}");
+            previous_error = error;
+        }
+        assert!(previous_error < 0.002, "fine-step integration error={previous_error}");
     }
 }

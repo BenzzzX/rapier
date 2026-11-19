@@ -148,6 +148,23 @@ impl SoftConstraintsSet {
         !self.groups[group].clusters.is_empty()
     }
 
+    /// After a completed CCD pass, the proxy velocity written back to the
+    /// rigid-body set has already been scattered into these particles. Mark
+    /// it as accounted for before a subsequent pass reassembles clusters;
+    /// otherwise that same velocity delta is mistaken for a fresh impulse.
+    pub fn acknowledge_scattered_clusters(&mut self, group: usize, bodies: &crate::dynamics::RigidBodySet) {
+        let Some(group) = self.groups.get(group) else { return; };
+        for record in &self.clusters[group.clusters.clone()] {
+            let awake = &self.awake[record.awake as usize];
+            // SAFETY: invoked after all solver workers finish, before the next pass.
+            let sb = unsafe { &mut *awake.ptr };
+            let cluster = &mut sb.clusters[record.cluster as usize];
+            if let Some(proxy) = bodies.get(cluster.proxy) {
+                cluster.last_gather = (proxy.vels.linvel, proxy.vels.angvel);
+            }
+        }
+    }
+
     pub fn assemble_attachments(
         &mut self,
         island_id: usize,
@@ -205,6 +222,7 @@ impl SoftConstraintsSet {
                             anchor0,
                             erp_inv_dt,
                             cfm_coeff,
+                            dt,
                             body_im: Vector::ZERO,
                             body_ii: Default::default(),
                             arm: Vector::ZERO,

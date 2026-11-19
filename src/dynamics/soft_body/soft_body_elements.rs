@@ -143,6 +143,102 @@ pub enum SoftBodyEdgeKind {
     Bend,
 }
 
+/// A finite internal actuator on one distance edge. Its target is held fixed
+/// until the caller changes or clears it. Stiffness and damping are in force
+/// per length and force per speed. The sum of each edge's force cap multiplied
+/// by its positive effort weight must fit the body's shared effort budget.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+#[derive(Copy, Clone, Debug)]
+pub struct SoftEdgeMuscle {
+    /// Target distance between the two material particles.
+    pub target_length: Real,
+    /// Force per unit distance from the target.
+    pub stiffness: Real,
+    /// Force per unit relative edge speed.
+    pub damping: Real,
+    /// Maximum force magnitude allocated to this edge.
+    pub maximum_force: Real,
+    /// Dimensionless conversion from edge force to shared body effort.
+    pub effort_weight: Real,
+}
+
+/// Experimental muscle along a reference-space direction inside a 2D cell.
+/// Stiffness, damping and the generalized force cap are densities per unit
+/// reference area; the cell's area converts them into solver coefficients.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+#[derive(Copy, Clone, Debug)]
+pub struct SoftCellMuscle {
+    /// Unit direction in the cell's reference material coordinates.
+    pub direction: Vector,
+    /// Initial dimensionless target stretch at the start of the muscle batch.
+    pub target_stretch: Real,
+    /// Target stretch change per second, toward `target_limit`. Zero holds.
+    pub target_rate: Real,
+    /// Positive final target stretch. The target holds here once reached.
+    pub target_limit: Real,
+    /// Generalized stiffness per unit reference area.
+    pub stiffness_density: Real,
+    /// Generalized damping per unit reference area.
+    pub damping_density: Real,
+    /// Generalized force cap per unit reference area.
+    pub force_density: Real,
+}
+
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+impl SoftCellMuscle {
+    /// Evaluate against the body's shared clock, including on cells that have
+    /// no free particle and therefore do not produce a solver constraint.
+    pub(crate) fn target_at_elapsed(&self, path: Option<SoftCellMusclePath>, elapsed: f64) -> f64 {
+        if let Some(path) = path {
+            let t = (elapsed / path.duration).clamp(0.0, 1.0);
+            let at = |axis: usize| {
+                let p = path.controls.map(|v| v[axis]);
+                let a = p[0] + t * (p[1] - p[0]);
+                let b = p[1] + t * (p[2] - p[1]);
+                let c = p[2] + t * (p[3] - p[2]);
+                let d = a + t * (b - a);
+                let e = b + t * (c - b);
+                d + t * (e - d)
+            };
+            let x = at(0);
+            let y = at(1);
+            return (x * x + y * y).sqrt();
+        }
+        let start = self.target_stretch as f64;
+        let rate = self.target_rate as f64;
+        let limit = self.target_limit as f64;
+        if rate > 0.0 {
+            (start + rate * elapsed).min(limit)
+        } else if rate < 0.0 {
+            (start + rate * elapsed).max(limit)
+        } else {
+            start
+        }
+    }
+
+    pub(crate) fn target_is_moving(&self, path: Option<SoftCellMusclePath>, elapsed: f64) -> bool {
+        if let Some(path) = path {
+            return elapsed < path.duration && path.controls.iter().any(|p| *p != path.controls[0]);
+        }
+        let target = self.target_at_elapsed(None, elapsed);
+        (self.target_rate > 0.0 && target < self.target_limit as f64) ||
+            (self.target_rate < 0.0 && target > self.target_limit as f64)
+    }
+}
+
+/// Images of one reference direction under the start and end deformation.
+/// Constructed from shared vertices, not accepted as independent user input.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SoftCellMusclePath {
+    pub controls: [[f64; 2]; 4],
+    pub duration: f64,
+}
+
+/// Maximum independent directions attached to one experimental 2D cell.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+pub const SOFT_CELL_MUSCLE_DIRECTIONS: usize = 3;
+
 /// A distance constraint between two particles of a soft body.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
@@ -158,6 +254,14 @@ pub struct SoftBodyEdge {
     /// Softness of this edge, overriding the material's (`edge_softness` / `bend_softness`)
     /// when set: anisotropic cloth (warp, weft and shear stiffness), stiffer seams...
     pub softness: Option<SpringCoefficients<Real>>,
+    /// Experimental, per-edge actuator and the topology generation it targets.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) muscle: Option<(SoftEdgeMuscle, u32)>,
+    /// Last solved substep's active impulse and its duration, for diagnostics.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) muscle_last_solve: [Real; 2],
     /// Multiplier of the material's tear thresholds for this edge (default `1.0`): a seam that
     /// holds, a perforation that gives. Usually set through [`crate::dynamics::SoftBody::set_edge_tear_resistance`]
     /// or [`crate::dynamics::SoftBody::set_cluster_tear_resistance`].
@@ -182,6 +286,13 @@ pub struct SoftBodyEdge {
 }
 
 impl SoftBodyEdge {
+    /// Active impulse and duration of the last substep in which this edge was
+    /// solved. This is not a whole-step sum and can be stale if the body sleeps.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    pub fn muscle_last_solve(&self) -> (Real, Real) {
+        (self.muscle_last_solve[0], self.muscle_last_solve[1])
+    }
+
     /// The impulse this edge applied during the last substep, along the edge direction
     /// (positive when the edge was resisting stretching).
     pub fn impulse(&self) -> Real {
@@ -283,6 +394,10 @@ pub struct SoftBodyCell {
     pub rest_volume: Real,
     /// Inverse of the rest edge matrix `[x1 - x0, x2 - x0, (x3 - x0)]`.
     pub(crate) inv_rest_matrix: Matrix,
+    /// Experimental actuator and the topology generation it targets.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) muscles: [Option<(SoftCellMuscle, u32, Option<SoftCellMusclePath>)>; SOFT_CELL_MUSCLE_DIRECTIONS],
     /// Accumulated plastic stretch of the rest shape (material frame, unit determinant): the rest
     /// edge matrix is `plastic_stretch * Dm₀`, `Dm₀` the initial rest edge matrix. Bounded by the
     /// material's `plastic_max`, which keeps flowing cells from degenerating into slivers.

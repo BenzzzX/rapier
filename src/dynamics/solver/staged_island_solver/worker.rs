@@ -726,6 +726,39 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     )
                 };
             }
+            // Optional observation happens after every worker finished this
+            // substep's final solve, before the next update rebuilds the rows.
+            // Linear motors are scalar rows; generic multibody rows are excluded.
+            if !ctx.joint_motor_history.is_null() {
+                if worker_id == 0 {
+                    if group.num_pgs_iterations == 0 {
+                        // A seeded row may not have been warmstarted at all.
+                        unsafe { &*ctx.joint_motor_history_valid }
+                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        let joints = unsafe { &*ctx.joint_constraints };
+                        let history = unsafe { &mut *ctx.joint_motor_history };
+                        for builder in group.joint_builders.clone() {
+                            for index in ctx.joint_rows[builder].clone() {
+                                let row = &joints.velocity_constraints[index];
+                                if let crate::dynamics::solver::joint_constraint::WritebackId::Motor(axis) = row.writeback_id {
+                                    if axis < crate::math::DIM {
+                                        let joint = unsafe { &*ctx.joints.add(row.joint_id[0]) };
+                                        history.push(crate::pipeline::JointLinearMotorObservation {
+                                            joint: joint.weight.handle,
+                                            axis,
+                                            dt: params.dt,
+                                            impulse_on_body2: -row.lin_jac * row.impulse,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    sync.complete(stage, 1, 1);
+                }
+                stage = sync.sync(stage, 1);
+            }
         }
 
         /*

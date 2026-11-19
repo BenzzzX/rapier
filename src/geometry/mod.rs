@@ -26,6 +26,8 @@ pub use self::contact_pair::{
     PairContacts, RigidPairContacts, SimdSolverContact, SolverContact, SolverContactGeneric,
     SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
 };
+#[cfg(all(feature = "alloc", feature = "dim2", feature = "experimental-soft-conveyor"))]
+pub use self::contact_pair::SoftConveyor;
 #[cfg(feature = "alloc")]
 pub use self::interaction_graph::{
     ColliderGraphIndex, InteractionGraph, RigidBodyGraphIndex, TemporaryInteractionIndex,

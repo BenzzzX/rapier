@@ -59,6 +59,11 @@ pub struct SoftBody {
     #[cfg(feature = "dim3")]
     pub(crate) dihedrals: Vec<SoftBodyDihedral>,
     pub(crate) cells: Vec<SoftBodyCell>,
+    /// Whether inverted interior cells alone should stop self contacts. Fluid-like
+    /// bodies may allow their computational cells to invert while their surface
+    /// remains valid; actual surface crossings are still detected separately.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub(crate) ignore_inverted_cells_for_self_contacts: bool,
     /// The computational mesh's boundary: segments (2D) or triangles (3D), oriented outward.
     /// Used by the volume constraints, and as the geometry of the default collision mesh.
     pub(crate) boundary: Vec<[u32; DIM]>,
@@ -123,6 +128,15 @@ pub struct SoftBody {
     /// renderers keying their meshes on the particles and elements rebuild them on change.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) topology_version: u32,
+    /// One clock for the entire experimental muscle batch, scoped to its
+    /// topology. It advances for an active body even if some cells are pinned.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) cell_muscle_clock: Option<(u32, f64)>,
+    /// Monotonic within this body, including batches that disable muscles.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) cell_muscle_revision: u64,
     /// Largest normal approach speed of the rigid bodies met by the surface, for the last step
     /// and the one before (`None`: no contact constraint that step); with the particle speeds, it drives
     /// the impact-adaptive substeps (`IntegrationParameters::soft_bodies.max_extra_substeps`).

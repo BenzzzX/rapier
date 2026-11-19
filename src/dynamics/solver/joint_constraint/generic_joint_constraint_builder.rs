@@ -619,7 +619,7 @@ impl JointConstraintHelper<Real> {
 
         rhs_wo_bias += -motor_params.target_vel;
 
-        constraint.impulse_bounds = [-motor_params.max_impulse, motor_params.max_impulse];
+        constraint.impulse_bounds = [motor_params.min_impulse, motor_params.max_impulse];
         constraint.rhs = rhs_wo_bias;
         constraint.rhs_wo_bias = rhs_wo_bias;
         constraint.cfm_coeff = motor_params.cfm_coeff;
@@ -777,7 +777,7 @@ impl JointConstraintHelper<Real> {
         constraint.rhs = rhs_wo_bias;
         constraint.cfm_coeff = motor_params.cfm_coeff;
         constraint.cfm_gain = motor_params.cfm_gain;
-        constraint.impulse_bounds = [-motor_params.max_impulse, motor_params.max_impulse];
+        constraint.impulse_bounds = [motor_params.min_impulse, motor_params.max_impulse];
         constraint
     }
 

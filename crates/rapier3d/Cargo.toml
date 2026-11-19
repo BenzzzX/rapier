@@ -56,6 +56,11 @@ std = [
 # per substep, solving `(M + h D + h^2 K) dv = b` over the whole body. Off by
 # default: it adds per-body solver state and is still experimental.
 fem = []
+# Declared for shared-source cfg checking; the experiment is 2D only.
+experimental-soft-contact-frame = []
+experimental-soft-conveyor = []
+experimental-soft-finite-support = []
+experimental-soft-muscles = []
 parallel = ["dep:rayon", "std", "parry3d/parallel"]
 # Drops the `Sync` requirement from callbacks (`PhysicsHooks`, `EventHandler`).
 # As a side effect, this also removes the dedicated threadpool API from the physics world

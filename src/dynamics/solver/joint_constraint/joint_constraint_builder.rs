@@ -185,6 +185,8 @@ pub struct JointConstraintBuilderSimd {
     #[cfg(feature = "dim2")]
     motor_target_vel: SimdReal,
     #[cfg(feature = "dim2")]
+    motor_min_force: SimdReal,
+    #[cfg(feature = "dim2")]
     motor_max_force: SimdReal,
     /// Like `prev_dof_impulses`, for the 2D angular motor row.
     #[cfg(feature = "dim2")]
@@ -281,6 +283,11 @@ impl JointConstraintBuilderSimd {
             motor_target_pos: array![|ii| ang_motor(ii).target_pos].into(),
             #[cfg(feature = "dim2")]
             motor_target_vel: array![|ii| ang_motor(ii).target_vel].into(),
+            #[cfg(feature = "dim2")]
+            motor_min_force: array![|ii| {
+                let motor = ang_motor(ii);
+                motor.min_force.unwrap_or(-motor.max_force).max(-motor.max_force).min(motor.max_force)
+            }].into(),
             #[cfg(feature = "dim2")]
             motor_max_force: array![|ii| ang_motor(ii).max_force].into(),
             #[cfg(feature = "dim2")]
@@ -440,6 +447,7 @@ impl JointConstraintBuilderSimd {
                 cfm_gain,
                 target_pos: self.motor_target_pos,
                 target_vel: self.motor_target_vel,
+                min_impulse: if params.dt == 0.0 { zero } else { self.motor_min_force * dt },
                 // See `JointMotor::max_impulse`: an infinite max force times a zero dt is NaN.
                 max_impulse: if params.dt == 0.0 {
                     zero

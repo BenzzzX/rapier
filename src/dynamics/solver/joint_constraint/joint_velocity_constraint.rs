@@ -18,6 +18,7 @@ pub struct MotorParameters<N: SimdRealCopy> {
     pub cfm_gain: N,
     pub target_pos: N,
     pub target_vel: N,
+    pub min_impulse: N,
     pub max_impulse: N,
 }
 
@@ -29,6 +30,7 @@ impl<N: SimdRealCopy> Default for MotorParameters<N> {
             cfm_gain: N::zero(),
             target_pos: N::zero(),
             target_vel: N::zero(),
+            min_impulse: N::zero(),
             max_impulse: N::zero(),
         }
     }

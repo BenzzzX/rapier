@@ -27,6 +27,22 @@ impl SoftBodySet {
     ) {
         // The colliders' shapes say which surfaces are oriented (the user may have changed them).
         for (_, sb) in self.bodies.iter_mut() {
+            // A moving experimental cell target is time-dependent even when
+            // the body's velocity temporarily falls below the sleep threshold.
+            // Wake it until the target reaches its limit; frozen/disabled
+            // bodies retain their target and resume on reactivation.
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            if sb.enabled && !sb.uses_fem() && !sb.material.tears() && sb.material.plastic_yield <= 0.0
+                && sb.material.young_modulus.is_finite() && sb.material.young_modulus > 0.0
+                && sb.cell_model != crate::dynamics::SoftBodyCellModel::Volume
+                && sb.particles.iter().any(|p| p.inv_mass > 0.0)
+                && sb.cell_muscle_clock.is_some_and(|(clock_version, elapsed)|
+                    clock_version == sb.topology_version && sb.cells.iter().any(|cell| cell.stiffness_scale > 0.0 &&
+                        cell.muscles.iter().flatten().any(|(muscle, version, path)| *version == clock_version &&
+                            muscle.target_is_moving(*path, elapsed))))
+            {
+                sb.modified = true;
+            }
             for mesh in sb.meshes_mut() {
                 mesh.read_orientation(colliders);
             }

@@ -111,6 +111,8 @@ mod tests {
             vertices: core::array::from_fn(|k| k as u32),
             rest_volume: volume,
             inv_rest_matrix: SoftBody::cell_edge_matrix(rest0).inverse(),
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            muscles: [None; crate::dynamics::SOFT_CELL_MUSCLE_DIRECTIONS],
             plastic_stretch: Matrix::IDENTITY,
             impulses: [1.0; STRAIN_ROWS + 1],
             rotation: Rotation::IDENTITY,

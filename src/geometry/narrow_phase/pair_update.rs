@@ -527,6 +527,10 @@ pub(super) fn process_pair(
             manifold.data.rigid_body1 = rb_handle1;
             manifold.data.rigid_body2 = rb_handle2;
             manifold.data.solver_flags = solver_flags;
+            #[cfg(feature = "dim2")]
+            { manifold.data.soft_sliding_vertices = 0; }
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+            { manifold.data.soft_conveyor = None; }
             manifold.data.friction = friction;
             manifold.data.restitution = restitution;
             manifold.data.relative_dominance =
@@ -634,6 +638,10 @@ pub(super) fn process_pair(
                     contact_ids[index] = (sc.contact_id[0] & !crate::geometry::contact_pair::NEW_CONTACT_BIT) as usize;
                 }
                 let mut contact_friction_overrides = [None; MAX_MANIFOLD_POINTS];
+                #[cfg(feature = "dim2")]
+                let mut soft_sliding_vertices = 0u8;
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                let mut soft_conveyor = None;
                 let mut modifiable_user_data = manifold.data.user_data;
                 let mut modifiable_normal = manifold.data.normal;
                 let mut modifiable_friction = manifold.data.friction;
@@ -650,6 +658,10 @@ pub(super) fn process_pair(
                         manifold,
                         solver_contacts: &mut modifiable_solver_contacts,
                         contact_friction_overrides: &mut contact_friction_overrides,
+                        #[cfg(feature = "dim2")]
+                        soft_sliding_vertices: &mut soft_sliding_vertices,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        soft_conveyor: &mut soft_conveyor,
                         normal: &mut modifiable_normal,
                         friction: &mut modifiable_friction,
                         restitution: &mut modifiable_restitution,
@@ -663,6 +675,13 @@ pub(super) fn process_pair(
                     manifold.points[cid].data.friction_override = contact_friction_overrides[index];
                 }
                 manifold.data.solver_contacts = modifiable_solver_contacts;
+                #[cfg(feature = "dim2")]
+                { manifold.data.soft_sliding_vertices = soft_sliding_vertices; }
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                { manifold.data.soft_conveyor = soft_conveyor.filter(|c| c.group != 0 &&
+                    c.maximum_force.is_finite() && c.maximum_force >= 0.0 && c.target_velocity.is_finite() &&
+                    c.vertex_activation.is_none_or(|v| v.iter().all(|a| a.is_finite() && (0.0..=1.0).contains(a))) &&
+                    c.material_interval.is_none_or(|[a, b]| a.is_finite() && b.is_finite() && a >= 0.0 && a <= b && b <= 1.0)); }
                 manifold.data.normal = modifiable_normal;
                 manifold.data.friction = modifiable_friction;
                 manifold.data.restitution = modifiable_restitution;

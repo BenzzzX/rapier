@@ -324,7 +324,7 @@ impl<N: ScalarType> JointConstraintHelper<N> {
 
         constraint.cfm_coeff = motor_params.cfm_coeff;
         constraint.cfm_gain = motor_params.cfm_gain;
-        constraint.impulse_bounds = [-motor_params.max_impulse, motor_params.max_impulse];
+        constraint.impulse_bounds = [motor_params.min_impulse, motor_params.max_impulse];
         constraint.rhs = rhs_wo_bias;
         constraint.rhs_wo_bias = rhs_wo_bias;
         constraint
@@ -393,7 +393,7 @@ impl<N: ScalarType> JointConstraintHelper<N> {
             im1: body1.im,
             im2: body2.im,
             impulse: N::zero(),
-            impulse_bounds: [-motor_params.max_impulse, motor_params.max_impulse],
+            impulse_bounds: [motor_params.min_impulse, motor_params.max_impulse],
             lin_jac,
             ang_jac1,
             ang_jac2,
@@ -610,7 +610,7 @@ impl<N: ScalarType> JointConstraintHelper<N> {
             im1: body1.im,
             im2: body2.im,
             impulse: N::zero(),
-            impulse_bounds: [-motor_params.max_impulse, motor_params.max_impulse],
+            impulse_bounds: [motor_params.min_impulse, motor_params.max_impulse],
             lin_jac: Default::default(),
             ang_jac1: ang_jac,
             ang_jac2: ang_jac,

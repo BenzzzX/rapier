@@ -192,6 +192,8 @@ struct SharedCtx<'a> {
 
     velocity_solver: *mut VelocitySolver,
     joint_constraints: *mut JointConstraintsSet,
+    joint_motor_history: *mut Vec<crate::pipeline::JointLinearMotorObservation>,
+    joint_motor_history_valid: *const AtomicBool,
     contact_constraints: *mut ContactConstraintsSet,
     /// The soft-body constraints of the awake soft bodies (empty when the step has none: every soft
     /// stage is then skipped, identically on every worker).
@@ -231,6 +233,9 @@ unsafe impl Sync for SharedCtx<'_> {}
 pub(crate) struct StagedIslandSolver {
     pub contact_constraints: ContactConstraintsSet,
     pub joint_constraints: JointConstraintsSet,
+    pub joint_motor_history_enabled: bool,
+    pub joint_motor_history: Vec<crate::pipeline::JointLinearMotorObservation>,
+    pub joint_motor_history_valid: AtomicBool,
     pub soft_constraints: SoftConstraintsSet,
     #[cfg(feature = "fem")]
     pub soft_fem: crate::dynamics::solver::soft_fem::SoftFemSet,
@@ -309,10 +314,23 @@ pub(crate) struct StagedIslandSolver {
 }
 
 impl StagedIslandSolver {
+    /// Preserve the gather/scatter accounting across CCD passes, but only for
+    /// groups that ran at least one joint/cluster solve pass.
+    pub(crate) fn acknowledge_ccd_cluster_scatter(&mut self, bodies: &RigidBodySet, stabilization_iterations: usize) {
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.num_pgs_iterations > 0 || stabilization_iterations > 0 {
+                self.soft_constraints.acknowledge_scattered_clusters(index, bodies);
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             contact_constraints: ContactConstraintsSet::new(),
             joint_constraints: JointConstraintsSet::new(),
+            joint_motor_history_enabled: false,
+            joint_motor_history: Vec::new(),
+            joint_motor_history_valid: AtomicBool::new(true),
             soft_constraints: SoftConstraintsSet::new(),
             #[cfg(feature = "fem")]
             soft_fem: crate::dynamics::solver::soft_fem::SoftFemSet::new(),

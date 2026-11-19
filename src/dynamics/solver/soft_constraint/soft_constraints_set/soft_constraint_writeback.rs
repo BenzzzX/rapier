@@ -38,6 +38,11 @@ impl SoftConstraintsSet {
                         };
                         let edge = &mut sb.edges[constraint.element as usize];
                         edge.impulse = impulse;
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                        {
+                            edge.muscle_last_solve = constraint.muscle.map_or([0.0; 2], |muscle|
+                                [muscle.impulse, awake.substep_dt]);
+                        }
                         // Length as seen at the last substep's update.
                         let len = (constraint.pos[1] - constraint.pos[0]).length();
                         if edge.plastic_flow(len, &material, dt) {
@@ -134,6 +139,20 @@ impl SoftConstraintsSet {
     pub unsafe fn writeback_particles(&self, ai: usize, bodies: &SolverBodies, step_dt: Real) {
         let awake = &self.awake[ai];
         let sb = unsafe { &mut *awake.ptr };
+        // This stage can run concurrently with element writeback: only touch
+        // the body-owned clock, never the individual cells. Fully frozen or
+        // incompatible bodies keep their command time until reactivated.
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        if !awake.frozen && !sb.uses_fem() && !sb.material.tears() && sb.material.plastic_yield <= 0.0
+            && sb.material.young_modulus.is_finite() && sb.material.young_modulus > 0.0
+            && sb.cell_model != crate::dynamics::SoftBodyCellModel::Volume
+        {
+            if let Some((version, elapsed)) = sb.cell_muscle_clock.as_mut() {
+                if *version == sb.topology_version {
+                    *elapsed += step_dt as f64;
+                }
+            }
+        }
         let slots = &self.slots[awake.slot_start..awake.slot_start + awake.num_particles];
         let damping = crate::utils::inv(1.0 + step_dt * sb.particle_settings.linear_damping);
         for (p, &slot) in sb.particles.iter_mut().zip(slots) {
@@ -161,6 +180,7 @@ impl SoftConstraintsSet {
             let sb = unsafe { &mut *ptr };
             if let Some(a) = sb.attachments.get_mut(constraint.attachment as usize) {
                 a.impulse = constraint.impulse;
+                a.impulse_dt = constraint.dt;
             }
         }
         for awake in &self.awake {

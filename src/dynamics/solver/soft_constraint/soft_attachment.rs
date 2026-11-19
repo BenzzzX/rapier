@@ -29,6 +29,8 @@ pub(crate) struct SoftAttachmentConstraint {
     /// Joint softness.
     pub erp_inv_dt: Real,
     pub cfm_coeff: Real,
+    /// Duration of this constraint's internal solver substep.
+    pub dt: Real,
     // Solve state.
     pub body_im: Vector,
     pub body_ii: AngularInertia,

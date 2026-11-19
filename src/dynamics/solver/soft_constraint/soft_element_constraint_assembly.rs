@@ -656,6 +656,8 @@ impl SoftConstraintsSet {
                 impulse,
                 peak_impulse: 0.0,
                 impulse_bounds: [-Real::MAX, Real::MAX],
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                muscle: None,
             }
         };
 
@@ -683,6 +685,18 @@ impl SoftConstraintsSet {
                 cfm,
                 e.impulse,
             );
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            if let Some((command, _)) = e.muscle.filter(|(_, v)| *v == sb.topology_version) {
+                constraint.muscle = Some(super::soft_element_constraint::SoftEdgeMuscleConstraint {
+                    command,
+                    dt,
+                    inverse_mass: 0.0,
+                    gain: 0.0,
+                    bias: 0.0,
+                    limit: 0.0,
+                    impulse: 0.0,
+                });
+            }
             if e.tension_only {
                 constraint.impulse_bounds = [0.0, Real::MAX];
                 constraint.impulse = constraint.impulse.max(0.0);
@@ -861,6 +875,16 @@ impl SoftConstraintsSet {
                         strain_per_impulse,
                         vol_impulse,
                         model,
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                        muscles: c.muscles.map(|muscle| muscle.filter(|(_, version, _)|
+                            *version == sb.topology_version && !material.tears() && material.plastic_yield <= 0.0 &&
+                            sb.cell_muscle_clock.is_some_and(|(clock_version, _)| clock_version == *version))
+                            .map(|(command, _, target_path)| super::soft_element_constraint::SoftCellMuscleConstraint {
+                                command, area: vol, dt, grad: [Vector::ZERO; MAX_CONSTRAINT_PARTICLES],
+                                inverse_mass: 0.0, gain: 0.0, bias: 0.0, limit: 0.0,
+                                impulse: 0.0, valid: false,
+                                target_path, elapsed: sb.cell_muscle_clock.unwrap().1,
+                            })),
                     };
                     out.push_elastic_constraint(c.color, constraint);
                 }

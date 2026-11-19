@@ -49,6 +49,8 @@ fn gradients_match_finite_differences() {
         impulse: 0.0,
         peak_impulse: 0.0,
         impulse_bounds: [-Real::MAX, Real::MAX],
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        muscle: None,
     };
     #[cfg(feature = "dim2")]
     let kinds = [
@@ -114,6 +116,8 @@ fn elastic_cell_gradients_match_finite_differences() {
         strain_impulse: StrainVector::zeros(),
         strain_per_impulse: StrainVector::zeros(),
         vol_impulse: 0.0,
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        muscles: [None; crate::dynamics::SOFT_CELL_MUSCLE_DIRECTIONS],
         model: SoftElasticModel::Corotational(CorotationalConstraint {
             erp_strain: StrainVector::zeros(),
             cfm_strain: StrainVector::zeros(),

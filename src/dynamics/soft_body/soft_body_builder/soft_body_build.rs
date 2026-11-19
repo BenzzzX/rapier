@@ -95,6 +95,8 @@ impl SoftBodyBuilder {
                 vertices,
                 rest_volume,
                 inv_rest_matrix,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                muscles: [None; super::super::SOFT_CELL_MUSCLE_DIRECTIONS],
                 plastic_stretch: Matrix::IDENTITY,
                 impulses: [0.0; super::super::CELL_IMPULSES],
                 rotation: Rotation::IDENTITY,
@@ -151,6 +153,10 @@ impl SoftBodyBuilder {
                 kind: *kind,
                 tension_only: false,
                 softness: None,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                muscle: None,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+                muscle_last_solve: [0.0; 2],
                 tear_resistance: 1.0,
                 impulse: 0.0,
                 plastic_strain: 0.0,
@@ -221,6 +227,7 @@ impl SoftBodyBuilder {
             #[cfg(feature = "dim3")]
             dihedrals,
             cells,
+            ignore_inverted_cells_for_self_contacts: false,
             volume_preservation: self.volume_preservation,
             boundary: surface,
             boundary_closed,
@@ -242,6 +249,10 @@ impl SoftBodyBuilder {
             sleep_speed: 0.0,
             tearing_pending: false,
             topology_version: 0,
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            cell_muscle_clock: None,
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            cell_muscle_revision: 0,
             contact_approach_speeds: [None; 2],
             contact_approach_step_open: false,
             contact_load: 0.0,

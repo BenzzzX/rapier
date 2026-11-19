@@ -11,7 +11,7 @@ use crate::geometry::{
     BroadPhaseBvh, BroadPhasePairEvent, ColliderHandle, ColliderSet, ContactManifoldIndex,
     NarrowPhase,
 };
-use crate::math::Vector;
+use crate::math::{DIM, Real, Vector};
 use crate::pipeline::{EventHandler, PhysicsHooks};
 
 mod quarantine;
@@ -22,6 +22,94 @@ mod substep;
 mod test;
 #[cfg(test)]
 mod test_staged;
+
+/// One soft-surface/rigid contact constraint from the last solver pass.
+/// This is a solver observation, not proof of a continuous contact band.
+#[derive(Copy, Clone, Debug)]
+pub struct SoftRigidContactObservation {
+    /// The soft body whose particles receive the impulse.
+    pub soft_body: crate::dynamics::SoftBodyHandle,
+    /// Contact pair handles, in narrow-phase order.
+    pub colliders: [ColliderHandle; 2],
+    /// The rigid collider's subshape as identified at constraint assembly.
+    pub other_subshape: u32,
+    /// Material particle indices and their interpolation weights.
+    pub particles: [u32; DIM + 1],
+    /// Weights correspond to `particles`; zero-weight entries are unused.
+    pub weights: [Real; DIM + 1],
+    /// Constraint anchors at assembly, not post-step material positions.
+    pub surface_point: Vector,
+    /// Other side's constraint anchor at assembly.
+    pub other_point: Vector,
+    /// Normal points in the direction of the impulse on the soft body.
+    pub normal: Vector,
+    /// Separation at assembly, with the contact skins subtracted.
+    pub separation: Real,
+    /// Total impulse from this solver pass, including its substeps.
+    pub impulse: Vector,
+    /// Friction coefficient used when assembling this particular constraint.
+    pub friction: Real,
+    /// True for predictive vertex contacts, false for manifold constraints.
+    pub predictive_vertex: bool,
+    /// Conveyor group selected for this actual solver contact, when enabled.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_group: Option<u64>,
+    /// Last solver substep's signed active tangential impulse. This excludes
+    /// passive friction and is not a whole-step or all-CCD-passes total.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_motor_impulse: Real,
+    /// World-space impulses on the soft surface for the final substep only.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub conveyor_motor_impulse_world: Vector,
+    /// Total soft-rigid contact impulse on the soft surface in the final substep.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub last_substep_impulse_world: Vector,
+    /// Normal component of that same final-substep impulse.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub last_substep_normal_impulse_world: Vector,
+    /// Original narrow-phase material coordinates before endpoint expansion;
+    /// unavailable for predictive vertex constraints.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub source_material_weights: [Real; 2],
+    /// Original narrow-phase separation, or NaN when unavailable.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    pub source_separation: Real,
+}
+
+/// Soft-contact observations collected after one CCD solver pass.
+///
+/// The ranges index the buffers returned by [`PhysicsPipeline::soft_contact_history`]
+/// and [`PhysicsPipeline::soft_contact_history_bodies`]. They remain valid until
+/// the next pipeline step or until recording is toggled.
+#[derive(Clone, Debug)]
+pub struct SoftContactSolvePass {
+    /// Duration integrated by this pass, including its internal solver substeps.
+    pub dt: Real,
+    /// Range of soft/rigid contact rows from this pass.
+    pub contacts: core::ops::Range<usize>,
+    /// Range of soft bodies present in the solver workspace for this pass.
+    pub solved_bodies: core::ops::Range<usize>,
+    /// Linear motor rows sampled after each internal solver substep.
+    pub joint_motors: core::ops::Range<usize>,
+    /// Whether scalar motor sampling was valid for the solve groups in this pass.
+    /// Generic multibody motor rows remain excluded.
+    pub joint_motors_valid: bool,
+}
+
+/// A scalar rigid-joint linear motor row after an internal solver substep.
+/// The world-space impulse is on the joint's second body; it includes warmstart
+/// and relaxation. Generic multibody and angular motor rows are excluded.
+#[derive(Copy, Clone, Debug)]
+pub struct JointLinearMotorObservation {
+    /// The active scalar joint whose row was solved.
+    pub joint: crate::dynamics::ImpulseJointHandle,
+    /// Joint-local linear motor axis index.
+    pub axis: usize,
+    /// Duration of the internal solver substep.
+    pub dt: Real,
+    /// World-space impulse applied to the second solver body in this substep.
+    pub impulse_on_body2: Vector,
+}
 
 /// The main physics simulation engine that runs your physics world forward in time.
 ///
@@ -72,6 +160,13 @@ pub struct PhysicsPipeline {
     /// staged workers. On a non-parallel (or wasm) build it runs with one worker
     /// inline on the calling thread.
     staged_solver: crate::dynamics::StagedIslandSolver,
+    /// The workspace contains contacts from this step's last solver pass.
+    last_soft_contact_solve: bool,
+    soft_contact_history_enabled: bool,
+    soft_contact_history: Vec<SoftRigidContactObservation>,
+    soft_contact_history_bodies: Vec<crate::dynamics::SoftBodyHandle>,
+    soft_contact_history_motors: Vec<JointLinearMotorObservation>,
+    soft_contact_passes: Vec<SoftContactSolvePass>,
     /// Handle on the BVH optimization pass running concurrently with the narrow
     /// phase and solver (the `Mutex` only exists to keep the pipeline `Sync`; it is
     /// never contended).
@@ -112,6 +207,12 @@ impl PhysicsPipeline {
             active_body_handles: vec![],
             sleep_observations: Vec::new(),
             staged_solver: crate::dynamics::StagedIslandSolver::new(),
+            last_soft_contact_solve: false,
+            soft_contact_history_enabled: false,
+            soft_contact_history: Vec::new(),
+            soft_contact_history_bodies: Vec::new(),
+            soft_contact_history_motors: Vec::new(),
+            soft_contact_passes: Vec::new(),
             #[cfg(feature = "parallel")]
             deferred_bvh: std::sync::Mutex::new(None),
             deferred_bvh_inline: None,
@@ -124,6 +225,129 @@ impl PhysicsPipeline {
             soft_synced_colliders: vec![],
             quarantine: Quarantine::default(),
         }
+    }
+
+    /// Whether this body was included in the last pass's soft solver workspace.
+    /// The result is invalidated by the next physics step.
+    pub fn has_last_soft_body_solve(&self, body: crate::dynamics::SoftBodyHandle) -> bool {
+        self.last_soft_contact_solve && self.staged_solver.soft_constraints.awake.iter().any(|a| a.handle == body)
+    }
+
+    /// Enables optional recording for each CCD pass of the next pipeline step.
+    /// Toggling recording invalidates any previously recorded history.
+    pub fn set_soft_contact_history_enabled(&mut self, enabled: bool) {
+        self.soft_contact_history_enabled = enabled;
+        self.staged_solver.joint_motor_history_enabled = enabled;
+        self.clear_soft_contact_history();
+    }
+
+    /// Solver passes from the most recent pipeline step while recording was enabled.
+    pub fn soft_contact_passes(&self) -> &[SoftContactSolvePass] {
+        &self.soft_contact_passes
+    }
+
+    /// Contact rows referenced by [`Self::soft_contact_passes`]. These have the
+    /// same exclusions and assembly-frame semantics as `last_soft_rigid_contacts`.
+    pub fn soft_contact_history(&self) -> &[SoftRigidContactObservation] {
+        &self.soft_contact_history
+    }
+
+    /// Soft bodies that participated in each recorded pass. Absence is not proof
+    /// of separation, for example a sleeping body may not have been solved.
+    pub fn soft_contact_history_bodies(&self) -> &[crate::dynamics::SoftBodyHandle] {
+        &self.soft_contact_history_bodies
+    }
+
+    /// Scalar linear motor observations referenced by the recorded pass ranges.
+    /// Missing rows do not imply that a sleeping or generic joint carried no load.
+    pub fn soft_contact_history_motors(&self) -> &[JointLinearMotorObservation] {
+        &self.soft_contact_history_motors
+    }
+
+    fn clear_soft_contact_history(&mut self) {
+        self.soft_contact_history.clear();
+        self.soft_contact_history_bodies.clear();
+        self.soft_contact_history_motors.clear();
+        self.soft_contact_passes.clear();
+    }
+
+    fn record_soft_contact_pass(&mut self, dt: Real) {
+        if !self.soft_contact_history_enabled {
+            return;
+        }
+        // Temporarily take the reused buffer so the iterator can borrow the
+        // solver workspace without an allocation on every pass.
+        let mut contacts = core::mem::take(&mut self.soft_contact_history);
+        let contact_start = contacts.len();
+        contacts.extend(self.last_soft_rigid_contacts());
+        let contact_end = contacts.len();
+        self.soft_contact_history = contacts;
+        let body_start = self.soft_contact_history_bodies.len();
+        if self.last_soft_contact_solve {
+            self.soft_contact_history_bodies.extend(
+                self.staged_solver.soft_constraints.awake.iter().map(|body| body.handle),
+            );
+        }
+        let motor_start = self.soft_contact_history_motors.len();
+        if self.last_soft_contact_solve {
+            self.soft_contact_history_motors.extend_from_slice(&self.staged_solver.joint_motor_history);
+        }
+        self.soft_contact_passes.push(SoftContactSolvePass {
+            dt,
+            contacts: contact_start..contact_end,
+            solved_bodies: body_start..self.soft_contact_history_bodies.len(),
+            joint_motors: motor_start..self.soft_contact_history_motors.len(),
+            joint_motors_valid: self.last_soft_contact_solve && self.staged_solver.joint_motor_history_valid.load(core::sync::atomic::Ordering::Relaxed),
+        });
+    }
+
+    /// Iterates the last solver pass's soft-surface/rigid constraints.
+    ///
+    /// The workspace is replaced on the next physics step. Contacts may be
+    /// speculative; sleeping bodies, other CCD passes, volume constraints and
+    /// soft/soft contacts are not represented. An empty iterator does not prove
+    /// separation. Anchors and directions describe assembly, not current pose.
+    pub fn last_soft_rigid_contacts(&self) -> impl Iterator<Item = SoftRigidContactObservation> + '_ {
+        let set = &self.staged_solver.soft_constraints;
+        set.contacts.iter().filter_map(move |contact| {
+            if !self.last_soft_contact_solve || contact.soft_other || contact.element.is_some() {
+                return None;
+            }
+            let body = set.awake.get(contact.support_body as usize)?;
+            let impulse = contact.reported_impulse();
+            Some(SoftRigidContactObservation {
+                soft_body: body.handle,
+                colliders: [contact.source.collider1, contact.source.collider2],
+                other_subshape: contact.source.slot,
+                particles: contact.support_particle,
+                weights: contact.weights,
+                surface_point: contact.surface_point0,
+                other_point: contact.body_point0,
+                normal: contact.assembly_normal(),
+                separation: contact.dist0,
+                impulse,
+                friction: contact.friction,
+                predictive_vertex: contact.source.manifold == u32::MAX - 2,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                conveyor_group: contact.conveyor.map(|request| request.group),
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                conveyor_motor_impulse: if contact.conveyor.is_some() {
+                    contact.impulse_tangent[0] - contact.conveyor_passive_impulse
+                } else { 0.0 },
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                conveyor_motor_impulse_world: contact.tangents[0] * if contact.conveyor.is_some() {
+                    contact.impulse_tangent[0] - contact.conveyor_passive_impulse
+                } else { 0.0 },
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                last_substep_impulse_world: contact.dir * contact.impulse_normal + contact.tangents[0] * contact.impulse_tangent[0],
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                last_substep_normal_impulse_world: contact.dir * contact.impulse_normal,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                source_material_weights: contact.source_material_weights,
+                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                source_separation: contact.source_separation,
+            })
+        })
     }
 
     /// Completes the BVH optimization pass deferred by the last broad-phase update (if

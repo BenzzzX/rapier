@@ -322,6 +322,8 @@ impl PhysicsPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
+        self.last_soft_contact_solve = false;
+        self.clear_soft_contact_history();
         self.counters.reset();
         self.counters.step_started();
         self.quarantine.clear();
@@ -578,6 +580,7 @@ impl PhysicsPipeline {
                 soft_bodies,
                 events,
             );
+            self.record_soft_contact_pass(integration_parameters.dt);
 
             // If CCD is enabled, execute the CCD motion clamping.
             if ccd_is_enabled {
@@ -625,6 +628,12 @@ impl PhysicsPipeline {
             self.counters.stages.update_time.pause();
 
             if remaining_substeps > 0 {
+                if self.last_soft_contact_solve {
+                    self.staged_solver.acknowledge_ccd_cluster_scatter(
+                        bodies,
+                        integration_parameters.num_internal_stabilization_iterations,
+                    );
+                }
                 // Feed the just-moved colliders' AABBs to the broad-phase before
                 // re-running collision detection for the next CCD substep.
                 self.counters.stages.collision_detection_time.resume();

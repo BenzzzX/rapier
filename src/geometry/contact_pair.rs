@@ -685,6 +685,70 @@ impl ContactPair {
     }
 }
 
+/// One-step material-surface conveyor request. Group IDs are scoped to one
+/// soft body; all rows in a group share `maximum_force` conservatively.
+/// The target is the world velocity of the soft surface relative to its
+/// support, expressed as a world vector and projected onto the contact tangent.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
+pub struct SoftConveyor {
+    /// Nonzero identity shared by all contacts spending the same force budget.
+    pub group: u64,
+    /// Selected endpoint bits in this manifold's soft element. Contact actuation
+    /// is weighted by the selected material's share of the contact; the rest
+    /// retains passive friction.
+    pub vertex_mask: u8,
+    /// Optional activation sampled at the material endpoints. When absent,
+    /// `vertex_mask` retains its binary endpoint meaning.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub vertex_activation: Option<[Real; 2]>,
+    /// Optional closed interval in this element's material coordinate. Only
+    /// actual contact points in this interval can be driven; it does not
+    /// establish geometric coverage, contact persistence, or load capacity.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub material_interval: Option<[Real; 2]>,
+    /// Desired soft-surface velocity relative to the support in world coordinates.
+    pub target_velocity: Vector,
+    /// Maximum combined tangential force for this group on one soft body.
+    pub maximum_force: Real,
+    /// Combined normal adhesive stiffness of the selected contacts.
+    pub adhesive_stiffness: Real,
+    /// Maximum combined tensile force for the selected contacts.
+    pub maximum_adhesive_force: Real,
+    /// Combined shear cohesion available without normal compression.
+    pub maximum_cohesive_shear: Real,
+}
+
+#[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+impl SoftConveyor {
+    /// Activation at an actual contact's element weights. An absent or invalid
+    /// result must not generate a drive or an adhesive bond.
+    pub fn activation_at(&self, weights: &[Real; 2]) -> Option<Real> {
+        if weights.iter().any(|v| !v.is_finite() || *v < 0.0) { return None; }
+        let total = weights[0] + weights[1];
+        if !total.is_finite() || total <= 0.0 { return None; }
+        let t = weights[1] / total;
+        if let Some([first, last]) = self.material_interval {
+            // Coverage is conservatively shrunk at finite face boundaries.
+            // Admit only a small coordinate-roundoff neighborhood of that
+            // boundary; the solver still requires an actual contact row.
+            let tolerance = 32.0 * Real::EPSILON;
+            if !first.is_finite() || !last.is_finite() || first < 0.0 || last > 1.0 || first > last ||
+                t < first - tolerance || t > last + tolerance {
+                return None;
+            }
+        }
+        let activation = self.vertex_activation.unwrap_or([
+            if self.vertex_mask & 1 != 0 { 1.0 } else { 0.0 },
+            if self.vertex_mask & 2 != 0 { 1.0 } else { 0.0 },
+        ]);
+        if activation.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) { return None; }
+        let value = (weights[0] * activation[0] + weights[1] * activation[1]) / total;
+        value.is_finite().then_some(value.clamp(0.0, 1.0))
+    }
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 /// A contact manifold between two colliders.
@@ -706,6 +770,15 @@ pub struct ContactManifoldData {
     /// color since they share their bodies).
     #[cfg_attr(feature = "serde-serialize", serde(default = "default_solver_color"))]
     pub(crate) solver_color: u8,
+    /// Soft-mesh element vertices whose point contacts use the active sliding
+    /// mode for this contact update. This does not modify an entire edge.
+    #[cfg(feature = "dim2")]
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub soft_sliding_vertices: u8,
+    /// Optional material conveyor for the current contact update only.
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub soft_conveyor: Option<SoftConveyor>,
     /// The solver-body index (`active_set_id`) of each rigid-body, or `u32::MAX` for a
     /// world-attached side (fixed, sleeping, no body). Stamped by constraint selection so
     /// the assembly never re-reads the rigid-body set.
@@ -964,6 +1037,10 @@ impl ContactManifoldData {
             rigid_body2,
             solver_flags,
             solver_color: SOLVER_COLOR_UNCOLORED,
+            #[cfg(feature = "dim2")]
+            soft_sliding_vertices: 0,
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+            soft_conveyor: None,
             solver_body_ids: [u32::MAX; 2],
             graph_pos: crate::dynamics::solver::solver_contact_graph::GraphPos::NONE,
             normal: Vector::ZERO,

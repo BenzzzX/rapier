@@ -53,6 +53,8 @@ impl StagedIslandSolver {
         // used to color the joints in the same color space as the contacts.
         contact_color_masks: &[u128],
     ) {
+        self.joint_motor_history.clear();
+        self.joint_motor_history_valid.store(true, Ordering::Relaxed);
         counters.solver.velocity_assembly_time.resume();
         // Substep solve-groups: each group (contiguous constraint-closed awake-body range, keyed
         // by max `additional_solver_iterations`) runs `base + extra` substeps at smaller dt —
@@ -634,6 +636,12 @@ impl StagedIslandSolver {
             num_joints: impulse_joints.len(),
             velocity_solver: &mut self.velocity_solver as *mut _,
             joint_constraints: &mut self.joint_constraints as *mut _,
+            joint_motor_history: if self.joint_motor_history_enabled {
+                &mut self.joint_motor_history as *mut _
+            } else {
+                core::ptr::null_mut()
+            },
+            joint_motor_history_valid: &self.joint_motor_history_valid as *const _,
             contact_constraints: set as *mut _,
             soft_constraints: &mut self.soft_constraints as *mut _,
             #[cfg(feature = "fem")]

@@ -33,6 +33,20 @@ pub(crate) enum SoftScalarConstraintWriteback {
     CellVolume,
 }
 
+/// State of an independently bounded active spring on an existing passive
+/// distance row. Its impulse is reset at each solver substep, not each sweep.
+#[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SoftEdgeMuscleConstraint {
+    pub command: crate::dynamics::SoftEdgeMuscle,
+    pub dt: Real,
+    pub inverse_mass: Real,
+    pub gain: Real,
+    pub bias: Real,
+    pub limit: Real,
+    pub impulse: Real,
+}
+
 /// One scalar constraint over up to `MAX_CONSTRAINT_PARTICLES` particles.
 ///
 /// Solved like a joint constraint: `Δλ = inv_lhs · (Ċ + rhs - cfm_gain·λ)`, clamped to the impulse
@@ -66,6 +80,8 @@ pub(crate) struct SoftScalarConstraint {
     /// force tear criterion reads the step's peak, not its last substep).
     pub peak_impulse: Real,
     pub impulse_bounds: [Real; 2],
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+    pub muscle: Option<SoftEdgeMuscleConstraint>,
 }
 
 /// Gradients of the dihedral angle between the triangles `(p0, p1, p2)` and `(p0, p1, p3)`
@@ -143,6 +159,21 @@ impl SoftScalarConstraint {
         // No corrective-velocity cap: the bias is the spring force itself, and capping it would
         // make the material's response depend on the substep count.
         self.rhs = c * self.erp_inv_dt;
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        if let Some(mut muscle) = self.muscle {
+            muscle.inverse_mass = w;
+            muscle.gain = muscle.dt * (muscle.command.damping + muscle.dt * muscle.command.stiffness);
+            muscle.bias = muscle.dt * muscle.command.stiffness *
+                (c + self.rest - muscle.command.target_length);
+            muscle.limit = muscle.dt * muscle.command.maximum_force;
+            muscle.impulse = 0.0;
+            self.muscle = if muscle.gain.is_finite() && muscle.bias.is_finite() &&
+                muscle.limit.is_finite() && (1.0 + muscle.gain * w).is_finite() {
+                Some(muscle)
+            } else {
+                None
+            };
+        }
     }
 
     /// Recomputes the gradients from `self.pos`; returns the constraint value.
@@ -202,6 +233,25 @@ impl SoftScalarConstraint {
         let delta = total - self.impulse;
         self.impulse = total;
         self.apply_impulse(bodies, delta);
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+        if let Some(mut muscle) = self.muscle {
+            let mut velocity = 0.0;
+            for k in 0..n {
+                let id = self.solver_ids[k];
+                if id != u32::MAX {
+                    velocity += self.grad[k].gdot(bodies.get_vel(id).linear);
+                }
+            }
+            let next = ((muscle.bias + muscle.gain *
+                (velocity + muscle.inverse_mass * muscle.impulse)) /
+                (1.0 + muscle.gain * muscle.inverse_mass)).clamp(-muscle.limit, muscle.limit);
+            if next.is_finite() {
+                let delta = next - muscle.impulse;
+                muscle.impulse = next;
+                self.apply_impulse(bodies, delta);
+                self.muscle = Some(muscle);
+            }
+        }
     }
 
     #[inline]

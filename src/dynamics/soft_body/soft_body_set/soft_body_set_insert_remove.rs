@@ -41,6 +41,7 @@ impl SoftBodySet {
             #[cfg(feature = "dim3")]
             dihedrals: Vec::new(),
             cells: Vec::new(),
+            ignore_inverted_cells_for_self_contacts: false,
             boundary: Vec::new(),
             boundary_closed: false,
             boundary_element_cells: Vec::new(),
@@ -62,6 +63,10 @@ impl SoftBodySet {
             sleep_speed: 0.0,
             tearing_pending: false,
             topology_version: 0,
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            cell_muscle_clock: None,
+            #[cfg(all(feature = "dim2", feature = "experimental-soft-muscles"))]
+            cell_muscle_revision: 0,
             contact_approach_speeds: [None; 2],
             contact_approach_step_open: false,
             contact_load: 0.0,

@@ -350,6 +350,12 @@ impl SoftConstraintsSet {
                         // An element contact's point: weights, point, rigid anchor, separation,
                         // warm-start share. A segment's interior contact on a smooth rigid surface
                         // splits into one per endpoint, in the tangent plane, so it cannot rock.
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        let select_conveyor = |weights: &[Real; DIM]| {
+                            let request = manifold.data.soft_conveyor?;
+                            let activation = request.activation_at(weights)?;
+                            (activation > 0.0).then_some((request, activation))
+                        };
                         let contact_points = |sc: &crate::geometry::SolverContact| {
                             let (positions, weights, other_anchor) =
                                 contact_geometry(element, manifold, sc);
@@ -365,6 +371,28 @@ impl SoftConstraintsSet {
                                 && weights[1] > 0.02
                                 && (positions[1] - positions[0]).gdot(dir).abs()
                                     < 0.5 * (positions[1] - positions[0]).length();
+                            // A conveyor acts at the actual barycentric point.
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            let split = split && select_conveyor(&weights).is_none();
+                            // Each synthetic endpoint anchor must project to
+                            // the actual rigid surface along the contact normal.
+                            // The narrow phase may offset anchors along that
+                            // normal by the contact skin; an infinite tangent
+                            // plane would invent support past a finite face.
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-finite-support"))]
+                            let split = split && positions.iter().all(|position| {
+                                let offset = *position - surface_point0;
+                                let candidate = other_anchor + offset - dir * offset.gdot(dir);
+                                if !candidate.is_finite() { return false; }
+                                let projection = other_co.shape().project_point(other_co.position(), candidate, false);
+                                let origin = other_co.translation();
+                                let scale = (1.0 as Real).max(candidate.x.abs()).max(candidate.y.abs())
+                                    .max(origin.x.abs()).max(origin.y.abs());
+                                let tolerance = 32.0 * Real::EPSILON * scale;
+                                let delta = candidate - projection.point;
+                                let tangent_delta = delta - dir * delta.gdot(dir);
+                                projection.point.is_finite() && tangent_delta.length() <= tolerance
+                            });
                             let mut points = [(
                                 positions,
                                 weights,
@@ -400,6 +428,12 @@ impl SoftConstraintsSet {
                             .iter()
                             .flat_map(|sc| contact_points(sc).map(move |p| (sc, p)))
                         {
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            let (_, source_material_weights, _) = contact_geometry(element, manifold, sc);
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            let selected_conveyor = if manifold.data.soft_conveyor.is_some() {
+                                select_conveyor(&source_material_weights)
+                            } else { None };
                             let point_id = (sc.contact_id[0] & !NEW_CONTACT_BIT) as usize;
                             let (
                                 positions,
@@ -537,9 +571,25 @@ impl SoftConstraintsSet {
                             // Warm start from the manifold point (world-space friction impulse
                             // projected on the fresh tangent basis).
                             let data = &manifold.points[point_id].data;
+                            // The material mode is defined at mesh vertices. A contact near a
+                            // band boundary inherits both modes in its barycentric proportions.
+                            // This prevents an infinitesimal unselected weight from producing a
+                            // full static-friction constraint against the driven vertex.
+                            #[cfg(feature = "dim2")]
+                            let passive_fraction = if manifold.data.soft_sliding_vertices == 0 {
+                                1.0
+                            } else {
+                                weights[..element.len()].iter().enumerate()
+                                    .filter(|(k, _)| manifold.data.soft_sliding_vertices & (1u8 << k) == 0)
+                                    .map(|(_, weight)| *weight)
+                                    .sum::<Real>()
+                                    .clamp(0.0, 1.0)
+                            };
+                            #[cfg(not(feature = "dim2"))]
+                            let passive_fraction = 1.0;
                             let warm_normal = data.warmstart_impulse * warm_share;
                             #[cfg(feature = "dim2")]
-                            let warm_tangent = [data.warmstart_tangent_impulse[0] * warm_share];
+                            let warm_tangent = [data.warmstart_tangent_impulse[0] * warm_share * passive_fraction];
                             #[cfg(feature = "dim3")]
                             let warm_tangent = [
                                 data.warmstart_tangent_world.dot(tangents[0]) * warm_share,
@@ -551,7 +601,7 @@ impl SoftConstraintsSet {
                                     collider2: pair.collider2,
                                     manifold: mi as u32,
                                     point: point_id as u32,
-                                    slot: u32::MAX,
+                                    slot: if surface_first { manifold.subshape2 } else { manifold.subshape1 },
                                 },
                                 support_body: ai as u32,
                                 support_particle: anchors,
@@ -571,7 +621,31 @@ impl SoftConstraintsSet {
                                 dir,
                                 tangents,
                                 dist0: dist,
-                                friction: manifold.data.friction,
+                                friction: data.friction_override.unwrap_or(manifold.data.friction) * passive_fraction,
+                                tangent_velocity: if surface_first { sc.tangent_velocity } else { -sc.tangent_velocity },
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor: selected_conveyor.map(|(request, _)| request),
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor_fraction: selected_conveyor.map_or(0.0, |(_, fraction)| fraction),
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor_force: 0.0,
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor_impulse_limit: 0.0,
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                // The shared manifold cache has no separate motor history.
+                                // Split it by material share and clamp both parts before warm-starting.
+                                conveyor_passive_impulse: selected_conveyor.map_or(0.0, |(_, fraction)| warm_tangent[0] * (1.0 - fraction)),
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor_passive_rhs: 0.0,
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                source_material_weights,
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                source_separation: sc.dist,
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                                conveyor_adhesion: Default::default(),
+                                #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+                                corotating_frame: other_com_pose.map(|pose|
+                                    super::super::soft_contact::CorotatingSoftContactFrame::new(pose, dir, tangents[0])),
                                 soft_other: false,
                                 fem: [None, None],
                                 erp_inv_dt,
@@ -684,8 +758,27 @@ impl SoftConstraintsSet {
                             None => (other_anchor, Vector::ZERO),
                         };
                         let tangents = SoftContact::tangent_basis(dir);
-                        let warm_tangent: [Real; DIM - 1] =
-                            core::array::from_fn(|k| vc.tangent_impulse.gdot(tangents[k]));
+                        #[cfg(feature = "dim2")]
+                        let sliding_vertex = manifold_element(manifold).and_then(|(_, element)|
+                            element.iter().position(|&v| v == vc.vertex))
+                            .is_some_and(|k| manifold.data.soft_sliding_vertices & (1u8 << k) != 0)
+                            && dir.gdot(if surface_first { -manifold.data.normal } else { manifold.data.normal }) >= 0.9999;
+                        #[cfg(not(feature = "dim2"))]
+                        let sliding_vertex = false;
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        let selected_conveyor = manifold.data.soft_conveyor.and_then(|request| {
+                            if dir.gdot(if surface_first { -manifold.data.normal } else { manifold.data.normal }) < 0.9999 { return None; }
+                            let k = manifold_element(manifold).and_then(|(_, element)| element.iter().position(|&v| v == vc.vertex))?;
+                            let mut weights = [0.0; 2];
+                            *weights.get_mut(k)? = 1.0;
+                            let activation = request.activation_at(&weights)?;
+                            (activation > 0.0).then_some((request, activation))
+                        });
+                        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                        let conveyor = selected_conveyor.map(|(request, _)| request);
+                        let warm_tangent: [Real; DIM - 1] = core::array::from_fn(|k| {
+                            if sliding_vertex { 0.0 } else { vc.tangent_impulse.gdot(tangents[k]) }
+                        });
                         let mut weights = [0.0; DIM];
                         weights[0] = 1.0;
                         out.max_approach_speed = out.max_approach_speed.max(approach_speed(
@@ -700,7 +793,7 @@ impl SoftConstraintsSet {
                                 collider2: pair.collider2,
                                 manifold: SOURCE_RIGID_VERTEX,
                                 point: index as u32,
-                                slot: u32::MAX,
+                                slot: if surface_first { manifold.subshape2 } else { manifold.subshape1 },
                             },
                             support_body: ai as u32,
                             support_particle: anchors,
@@ -720,7 +813,29 @@ impl SoftConstraintsSet {
                             dir,
                             tangents,
                             dist0: vc.dist,
-                            friction: manifold.data.friction,
+                            friction: if sliding_vertex { 0.0 } else { manifold.data.friction },
+                            tangent_velocity: Vector::ZERO,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_fraction: selected_conveyor.map_or(0.0, |(_, fraction)| fraction),
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_force: 0.0,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_impulse_limit: 0.0,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_passive_impulse: selected_conveyor.map_or(0.0, |(_, fraction)| warm_tangent[0] * (1.0 - fraction)),
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_passive_rhs: 0.0,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            source_material_weights: [0.0; 2],
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            source_separation: Real::NAN,
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+                            conveyor_adhesion: Default::default(),
+                            #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+                            corotating_frame: other_com_pose.map(|pose|
+                                super::super::soft_contact::CorotatingSoftContactFrame::new(pose, dir, tangents[0])),
                             soft_other: false,
                             fem: [None, None],
                             erp_inv_dt,
@@ -800,6 +915,46 @@ impl SoftConstraintsSet {
                         detected,
                         out,
                     );
+                }
+            }
+        }
+        #[cfg(all(feature = "dim2", feature = "experimental-soft-conveyor"))]
+        {
+            out.conveyor_groups.clear();
+            for contact in &out.contacts {
+                let Some(request) = contact.conveyor else { continue; };
+                let valid = |value: Real| if value.is_finite() && value >= 0.0 { value } else { 0.0 };
+                let fraction = f64::from(contact.conveyor_fraction.clamp(0.0, 1.0));
+                if let Some(group) = out.conveyor_groups.iter_mut().find(|g| g.0 == request.group) {
+                    group.1 += fraction;
+                    group.2 = group.2.min(valid(request.maximum_force));
+                    group.3 = group.3.min(valid(request.adhesive_stiffness));
+                    group.4 = group.4.min(valid(request.maximum_adhesive_force));
+                    group.5 = group.5.min(valid(request.maximum_cohesive_shear));
+                } else {
+                    out.conveyor_groups.push((request.group, fraction, valid(request.maximum_force),
+                        valid(request.adhesive_stiffness), valid(request.maximum_adhesive_force), valid(request.maximum_cohesive_shear)));
+                }
+            }
+            for contact in &mut out.contacts {
+                let Some(request) = contact.conveyor else { continue; };
+                if let Some(group) = out.conveyor_groups.iter().find(|g| g.0 == request.group) {
+                    // Round toward zero so summing the f32 row limits cannot
+                    // exceed the group limit due to individual rounding.
+                    let share = f64::from(contact.conveyor_fraction.clamp(0.0, 1.0)) / group.1.max(1.0);
+                    let exact = f64::from(group.2) * share;
+                    let mut force = exact as Real;
+                    if f64::from(force) > exact { force = Real::from_bits(force.to_bits() - 1); }
+                    contact.conveyor_force = force;
+                    let split = |total: Real| {
+                        let exact = f64::from(total) * share;
+                        let mut result = exact as Real;
+                        if f64::from(result) > exact { result = Real::from_bits(result.to_bits() - 1); }
+                        result
+                    };
+                    contact.conveyor_adhesion.stiffness = split(group.3);
+                    contact.conveyor_adhesion.pull_force = split(group.4);
+                    contact.conveyor_adhesion.shear_force = split(group.5);
                 }
             }
         }

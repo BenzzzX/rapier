@@ -349,7 +349,7 @@ pub(super) fn update_self(
     // healthy, so the healthy path allocates and scans nothing downstream.
     out.inverted_cells.clear();
     out.inverted_particles.clear();
-    if recovery.inverted_cell_detection && !sb.cells.is_empty() {
+    if recovery.inverted_cell_detection && !sb.ignore_inverted_cells_for_self_contacts && !sb.cells.is_empty() {
         for (ci, cell) in sb.cells.iter().enumerate() {
             let x: [Vector; DIM + 1] =
                 core::array::from_fn(|k| sb.particles[cell.vertices[k] as usize].position);

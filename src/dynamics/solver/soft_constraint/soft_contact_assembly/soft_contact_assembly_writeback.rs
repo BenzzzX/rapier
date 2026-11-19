@@ -18,27 +18,34 @@ use crate::math::{AngVector, DIM, Vector};
 /// before its pair's constraints report; a point split into endpoint constraints sums them):
 /// the step's total for the events, the last substep's for the warm start.
 fn report_impulses(data: &mut crate::geometry::ContactData, c: &SoftContact) {
+    let (last_normal, last_tangent) = c.last_impulse_components();
+    #[cfg(all(feature = "dim2", feature = "experimental-soft-contact-frame"))]
+    let warm_normal = if c.corotating_frame.is_some_and(|frame| frame.active) {
+        last_normal.max(0.0)
+    } else { last_normal };
+    #[cfg(not(all(feature = "dim2", feature = "experimental-soft-contact-frame")))]
+    let warm_normal = last_normal;
     data.impulse =
-        crate::utils::canonicalize_zero(data.impulse + c.impulse_normal_acc + c.impulse_normal);
+        crate::utils::canonicalize_zero(data.impulse + c.impulse_normal_acc + last_normal);
     data.warmstart_impulse =
-        crate::utils::canonicalize_zero(data.warmstart_impulse + c.impulse_normal);
+        crate::utils::canonicalize_zero(data.warmstart_impulse + warm_normal);
     #[cfg(feature = "dim2")]
     {
         data.tangent_impulse[0] = crate::utils::canonicalize_zero(
-            data.tangent_impulse[0] + c.impulse_tangent_acc[0] + c.impulse_tangent[0],
+            data.tangent_impulse[0] + c.impulse_tangent_acc[0] + last_tangent[0],
         );
         data.warmstart_tangent_impulse[0] = crate::utils::canonicalize_zero(
-            data.warmstart_tangent_impulse[0] + c.impulse_tangent[0],
+            data.warmstart_tangent_impulse[0] + last_tangent[0],
         );
     }
     #[cfg(feature = "dim3")]
     {
         for j in 0..2 {
             data.tangent_impulse[j] = crate::utils::canonicalize_zero(
-                data.tangent_impulse[j] + c.impulse_tangent_acc[j] + c.impulse_tangent[j],
+                data.tangent_impulse[j] + c.impulse_tangent_acc[j] + last_tangent[j],
             );
             data.warmstart_tangent_impulse[j] = crate::utils::canonicalize_zero(
-                data.warmstart_tangent_impulse[j] + c.impulse_tangent[j],
+                data.warmstart_tangent_impulse[j] + last_tangent[j],
             );
         }
         data.warmstart_tangent_world = crate::utils::canonicalize_zero(
@@ -131,7 +138,7 @@ impl SoftConstraintsSet {
                 // SAFETY: the writeback stage is serial and owns the soft bodies.
                 let ptr = self.awake[c.support_body as usize].ptr;
                 let sb = unsafe { &mut *ptr };
-                sb.contact_load += (c.impulse_normal_acc + c.impulse_normal).abs();
+                sb.contact_load += (c.impulse_normal_acc + c.last_impulse_components().0).abs();
             }
             if c.source.manifold == SOURCE_EDGE_CONTACT
                 || c.source.manifold == SOURCE_VERTEX_CONTACT

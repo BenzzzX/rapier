@@ -301,6 +301,7 @@ pub(super) unsafe fn solve_pass(
                         solver_bodies,
                         params,
                         wo_bias,
+                        solved_dt,
                         soft_update,
                         soft_warmstart.is_some(),
                     );
@@ -330,6 +331,7 @@ pub(super) unsafe fn solve_pass(
                     solver_bodies,
                     params,
                     wo_bias,
+                    solved_dt,
                     soft_update,
                     soft_warmstart.is_some(),
                 );
